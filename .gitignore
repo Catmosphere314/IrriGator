@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_metadata/
+
+# Data — track metadata only, not the actual rasters/netcdf
+data/raw/
+data/processed/
+data/static/*.tif
+data/static/*.nc
+data/static/*.grib
+data/sensors/
+
+# API keys and credentials
+.cdsapirc
+.env
+secrets.yaml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/

@@ -1,0 +1,116 @@
+# =============================================================================
+# IrriGator — Crop Parameters: Grain Maize
+# =============================================================================
+# Reference: FAO Irrigation & Drainage Paper No. 56 (Allen et al., 1998)
+# Adjusted for French maturity groups following Arvalis guidance.
+#
+# These are DEFAULT values. Per-parcel overrides go in the parcel config.
+
+grain_maize:
+
+  # Base temperature for GDD accumulation
+  t_base_c: 10.0
+  # Upper cutoff — GDD contribution capped above this
+  t_upper_c: 30.0
+
+  # =========================================================================
+  # Crop coefficients (Kc) by stage — FAO-56 Table 12
+  # =========================================================================
+  kc:
+    initial: 0.30
+    mid: 1.20
+    end: 0.35
+
+  # =========================================================================
+  # GDD thresholds by maturity group
+  # =========================================================================
+  # Maturity groups follow Arvalis French classification:
+  #   A  = very early    (~1400 GDD to maturity)
+  #   B  = early         (~1550 GDD)
+  #   C1 = mid-early     (~1700 GDD)
+  #   C2 = mid-late      (~1850 GDD)
+  #   D1 = late           (~2000 GDD)
+  #   D2 = very late      (~2150 GDD)
+  #
+  # Stage boundaries (cumulative GDD from emergence):
+  #   - end_initial:     ~6 visible leaves
+  #   - end_development: tasseling (VT)
+  #   - end_midseason:   end of effective grain fill
+  #   - maturity:        physiological maturity (black layer)
+
+  gdd_by_maturity_group:
+    A:
+      end_initial: 250
+      end_development: 580
+      end_midseason: 1050
+      maturity: 1400
+    B:
+      end_initial: 270
+      end_development: 640
+      end_midseason: 1170
+      maturity: 1550
+    C1:
+      end_initial: 300
+      end_development: 700
+      end_midseason: 1300
+      maturity: 1700
+    C2:
+      end_initial: 320
+      end_development: 760
+      end_midseason: 1420
+      maturity: 1850
+    D1:
+      end_initial: 340
+      end_development: 830
+      end_midseason: 1540
+      maturity: 2000
+    D2:
+      end_initial: 360
+      end_development: 900
+      end_midseason: 1660
+      maturity: 2150
+
+  # =========================================================================
+  # Rooting depth
+  # =========================================================================
+  rooting_depth:
+    at_emergence_m: 0.15
+    max_m: 1.20
+    # Root depth increases linearly from emergence to end of development stage,
+    # then stays constant.
+    reaches_max_at_stage: "end_development"
+
+  # =========================================================================
+  # Water stress parameters — FAO-56 Table 22
+  # =========================================================================
+  stress:
+    # Depletion fraction for no stress (p)
+    # Crop tolerates depletion of p × TAW before ETc starts reducing
+    p: 0.55
+    # p adjustment for high ET0 days (FAO-56 eq. 84):
+    #   p_adj = p + 0.04 × (5 - ET0)
+    # Clamped to [0.1, 0.8]
+    p_adjust_for_et0: true
+
+  # =========================================================================
+  # Yield response factor — FAO-33
+  # =========================================================================
+  # Ky: relative yield decrease per unit of relative ET deficit
+  # Ky = 1.25 means 10% ET deficit → 12.5% yield loss
+  # Values by stage (FAO-33 Table 2, maize):
+  yield_response_ky:
+    initial: 0.40
+    development: 0.40
+    mid: 1.25       # flowering is the most sensitive stage
+    late: 0.50
+    seasonal: 1.25
+
+  # =========================================================================
+  # Critical stages for irrigation priority
+  # =========================================================================
+  # During these GDD windows, maintaining soil water above stress threshold
+  # is highest priority. Corresponds to tasseling + early grain fill.
+  critical_window:
+    start_stage: "end_development"       # tasseling
+    end_gdd_offset: 300                  # ~300 GDD after tasseling
+    description: "Flowering to early grain fill — most sensitive to water stress"

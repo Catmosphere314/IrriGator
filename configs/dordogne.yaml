@@ -1,0 +1,158 @@
+# =============================================================================
+# IrriGator — Region Configuration: Dordogne (24)
+# =============================================================================
+# All coordinates in Lambert-93 (EPSG:2154) unless noted otherwise.
+# WGS84 bounds provided for CDS API queries (ERA5-Land, SEAS5).
+
+region:
+  name: "Dordogne"
+  code_departement: "24"
+  code_region: "75"  # Nouvelle-Aquitaine
+
+  # WGS84 bounding box (for CDS API and Météo-France queries)
+  bbox_wgs84:
+    north: 45.72
+    south: 44.57
+    west: 0.04
+    east: 1.45
+
+  # Lambert-93 bounding box (for raster operations)
+  bbox_l93:
+    xmin: 462000
+    ymin: 6408000
+    xmax: 570000
+    ymax: 6540000
+
+  crs: "EPSG:2154"
+
+# =============================================================================
+# Grid resolution
+# =============================================================================
+grid:
+  # Target resolution in meters — matches EU-SoilHydroGrids
+  resolution_m: 250
+
+  # Aggregation strategy when source is finer (e.g., DEM at 5 m)
+  dem_aggregation: "mean"    # mean elevation per grid cell
+  slope_aggregation: "mean"  # mean slope per grid cell
+
+# =============================================================================
+# Data sources — paths and API configuration
+# =============================================================================
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  static_dir: "data/static"
+
+  era5_land:
+    product: "reanalysis-era5-land"
+    variables:
+      - "2m_temperature"
+      - "2m_dewpoint_temperature"
+      - "10m_u_component_of_wind"
+      - "10m_v_component_of_wind"
+      - "surface_pressure"
+      - "surface_solar_radiation_downwards"
+      - "total_precipitation"
+    # Additional variables for validation
+    validation_variables:
+      - "volumetric_soil_water_layer_1"   # 0-7 cm
+      - "volumetric_soil_water_layer_2"   # 7-28 cm
+      - "volumetric_soil_water_layer_3"   # 28-100 cm
+      - "volumetric_soil_water_layer_4"   # 100-289 cm
+    temporal_resolution: "hourly"
+    # Historical period for calibration/bias correction
+    calibration_period:
+      start: "2010-01-01"
+      end: "2023-12-31"
+
+  comephore:
+    # Météo-France radar-gauge precipitation
+    # Access via Données Publiques API
+    api_base_url: "https://public-api.meteofrance.fr/public"
+    product: "COMEPHORE"
+    resolution_km: 1.0
+
+  seas5:
+    product: "seasonal-monthly-single-levels"
+    system: 51  # ECMWF SEAS5 system version
+    variables:
+      - "2m_temperature"
+      - "total_precipitation"
+    ensemble_members: 51
+    leadtime_months: [1, 2, 3, 4, 5, 6]
+
+  arome:
+    api_base_url: "https://public-api.meteofrance.fr/public"
+    model: "AROME"
+    resolution_km: 1.3
+    forecast_horizon_h: 48
+
+  arpege:
+    api_base_url: "https://public-api.meteofrance.fr/public"
+    model: "ARPEGE"
+    resolution_km: 10.0
+    forecast_horizon_h: 96
+
+  eu_soilhydrogrids:
+    # Downloaded from ESDAC, stored locally
+    variables:
+      - "FC"      # field capacity [cm³/cm³]
+      - "WP"      # wilting point [cm³/cm³]
+      - "KS"      # saturated hydraulic conductivity [cm/day]
+      - "AWC"     # available water capacity
+    depths_cm: [0, 5, 15, 30, 60, 100, 200]
+
+  ign:
+    dem_product: "RGE ALTI 5m"
+    admin_product: "ADMIN EXPRESS"
+    # Download from https://geoservices.ign.fr/
+
+  brgm:
+    wfs_url: "https://geoservices.brgm.fr/geologie"
+    layer: "GEO1M_LITHOLOGY"
+
+  theia:
+    stac_url: "https://theia.cnes.fr/atdistrib/rocket/api/stac"
+    collection: "SENTINEL2"
+    processing_level: "L2A"
+    max_cloud_cover: 20  # percent
+
+# =============================================================================
+# Downscaling parameters
+# =============================================================================
+downscaling:
+  temperature:
+    method: "lapse_rate"
+    lapse_rate_c_per_km: -6.5
+
+  precipitation:
+    method: "cdf_t"  # or "quantile_mapping"
+    # Calibration against COMEPHORE
+    calibration_period:
+      start: "2010-01-01"
+      end: "2020-12-31"
+    validation_period:
+      start: "2021-01-01"
+      end: "2023-12-31"
+
+  radiation:
+    terrain_correction: true
+    # Apply slope/aspect correction to incoming solar radiation
+
+# =============================================================================
+# Validation stations (Météo-France synoptic stations in/near Dordogne)
+# =============================================================================
+validation_stations:
+  - name: "Bergerac"
+    id: "24037001"
+    lat: 44.853
+    lon: 0.52
+  - name: "Sarlat"
+    id: "24520001"
+    lat: 44.89
+    lon: 1.22
+  - name: "Brive-la-Gaillarde"
+    id: "19031002"
+    lat: 45.15
+    lon: 1.47

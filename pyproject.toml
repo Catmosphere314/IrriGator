@@ -1,0 +1,99 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "irrigator"
+version = "0.1.0"
+description = "Open-source irrigation decision support for maize — soil water balance, crop modeling, and forecast integration"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+keywords = ["irrigation", "agriculture", "hydrology", "maize", "water-balance", "FAO-56", "evapotranspiration"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+    "Topic :: Scientific/Engineering :: Hydrology",
+]
+
+dependencies = [
+    # Core scientific
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "xarray>=2023.6",
+    "scipy>=1.11",
+    "dask[complete]>=2023.6",
+
+    # Geospatial
+    "rasterio>=1.3",
+    "geopandas>=0.13",
+    "pyproj>=3.6",
+    "shapely>=2.0",
+    "fiona>=1.9",
+    "rioxarray>=0.15",
+
+    # Climate and meteorology
+    "cdsapi>=0.6",
+    "pyet>=1.3",
+    "netcdf4>=1.6",
+
+    # Remote sensing
+    "pystac-client>=0.7",
+
+    # Utilities
+    "requests>=2.31",
+    "pyyaml>=6.0",
+    "owslib>=0.29",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.4",
+    "mypy>=1.5",
+    "pre-commit>=3.4",
+]
+viz = [
+    "matplotlib>=3.7",
+    "cartopy>=0.22",
+    "folium>=0.14",
+]
+notebooks = [
+    "jupyterlab>=4.0",
+    "ipywidgets>=8.1",
+]
+all = ["irrigator[dev,viz,notebooks]"]
+
+[project.scripts]
+irrigator = "irrigator.cli:main"
+
+[project.urls]
+Repository = "https://github.com/YOURUSER/irrigator"
+Issues = "https://github.com/YOURUSER/irrigator/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/irrigator"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true

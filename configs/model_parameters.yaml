@@ -1,0 +1,144 @@
+# =============================================================================
+# IrriGator — Model & Decision Parameters
+# =============================================================================
+
+# =============================================================================
+# ET0 computation
+# =============================================================================
+et0:
+  method: "penman_monteith_fao56"
+  # Wind speed height conversion (ERA5-Land gives 10m, FAO-56 needs 2m)
+  wind_measurement_height_m: 10.0
+  wind_target_height_m: 2.0
+  # Assumes logarithmic wind profile; conversion factor ≈ 0.748 for 10m → 2m
+
+# =============================================================================
+# Soil water balance model
+# =============================================================================
+water_balance:
+  timestep: "daily"
+
+  # Initial condition strategy at start of simulation
+  # "field_capacity": assume soil starts at FC (conservative)
+  # "fraction_awc": start at a specified fraction of available water
+  initial_condition:
+    method: "field_capacity"
+    # fraction: 0.8  # only used if method = "fraction_awc"
+
+  # Runoff model
+  runoff:
+    method: "scs_curve_number"
+    # Default curve numbers by geology class (AMC-II, fallow → crop adjustment applied)
+    # These are rough starting points — calibrate against local data
+    curve_numbers:
+      alluvium: 65         # well-drained sandy-loam
+      clay_limestone: 78   # moderate drainage
+      limestone_plateau: 72  # variable, karstic features help drainage
+
+  # Deep drainage: water above field capacity drains within one timestep
+  drainage:
+    method: "tipping_bucket"
+    # Fraction of excess that drains per day (1.0 = instant, <1.0 = delayed)
+    drain_fraction: 1.0
+
+  # Capillary rise from shallow water table (set to 0 if water table is deep)
+  capillary_rise:
+    enabled: false
+    # If enabled, requires water table depth data
+    # max_rate_mm_day: 2.0
+
+# =============================================================================
+# Forecast integration
+# =============================================================================
+forecasts:
+  short_term:
+    # Use AROME up to 48h, ARPEGE from 48-96h
+    arome_horizon_h: 48
+    arpege_horizon_h: 96
+    # Blend strategy at overlap
+    blend: "arome_priority"  # use AROME where available, ARPEGE beyond
+
+    # Precipitation bias correction for forecasts
+    # Separate from reanalysis bias correction — forecast biases differ
+    precip_correction:
+      enabled: true
+      method: "multiplicative"  # simple multiplicative bias per lead time
+      # Calibrate monthly from AROME/ARPEGE archives vs COMEPHORE
+
+  seasonal:
+    ensemble_size: 51
+    # Method to generate daily sequences from monthly SEAS5 anomalies
+    disaggregation_method: "delta"  # "delta" | "weather_generator"
+    # How many years of climatology to use as base
+    climatology_period:
+      start: 2010
+      end: 2023
+
+# =============================================================================
+# Decision logic
+# =============================================================================
+decision:
+  # Depletion threshold triggering irrigation consideration
+  # Expressed as fraction of TAW (Total Available Water)
+  # Default uses crop p value (0.55 for maize) — override here if needed
+  trigger_threshold: null  # null = use crop p value
+
+  # Forecast rain discount factor
+  # Multiply forecast precipitation by this factor for irrigation planning
+  # Accounts for forecast uncertainty — don't count on 100% of predicted rain
+  rain_confidence:
+    arome_0_24h: 0.85
+    arome_24_48h: 0.70
+    arpege_48_96h: 0.50
+
+  # Target soil water after irrigation
+  # Fraction of TAW — don't refill to FC if rain is possible
+  refill_target:
+    rain_unlikely: 0.95    # forecast < 5mm in 4 days
+    rain_possible: 0.80    # forecast 5-15mm
+    rain_likely: 0.65      # forecast > 15mm
+
+  # During critical crop window (flowering), tighten thresholds
+  critical_window_adjustment:
+    trigger_reduction: 0.10  # trigger 10% earlier (p - 0.10)
+    refill_increase: 0.05   # refill 5% higher
+
+  # Output confidence labels
+  confidence_levels:
+    high:
+      description: "Short-term forecast agrees, soil state well-constrained"
+      forecast_horizon_h: 48
+    medium:
+      description: "Based on ARPEGE 2-4 day forecast"
+      forecast_horizon_h: 96
+    low:
+      description: "Beyond reliable forecast range or high uncertainty"
+
+# =============================================================================
+# Validation
+# =============================================================================
+validation:
+  # Compare model soil moisture against ERA5-Land soil layers
+  era5_soil_moisture:
+    enabled: true
+    # ERA5-Land layers to compare (approximate depth correspondence)
+    layers:
+      - era5_layer: 1  # 0-7 cm
+        model_depth_cm: [0, 10]
+      - era5_layer: 2  # 7-28 cm
+        model_depth_cm: [10, 30]
+      - era5_layer: 3  # 28-100 cm
+        model_depth_cm: [30, 100]
+
+  # Sentinel-2 NDVI cross-check on crop development
+  sentinel_ndvi:
+    enabled: true
+    # Flag if observed NDVI deviates more than this from expected curve
+    anomaly_threshold: 0.15
+
+  # Metrics to compute
+  metrics:
+    - "rmse"
+    - "bias"
+    - "correlation"
+    - "nash_sutcliffe"

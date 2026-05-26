@@ -57,7 +57,11 @@ def fetch():
 @click.option("--validation/--no-validation", default=False, help="Include soil moisture layers")
 @click.option("--overwrite", is_flag=True)
 def fetch_era5(region: str, start: str, end: str, validation: bool, overwrite: bool) -> None:
-    """Download ERA5-Land reanalysis data from CDS."""
+    """Download ERA5-Land reanalysis data from CDS (monthly bulk files).
+
+    This is the preferred method for historical data: one API request per month,
+    each file containing all 24 hourly timesteps for every day in that month.
+    """
     from irrigator.ingestion.cds_client import fetch_era5_land_range
 
     cfg = load_region_config(region)
@@ -68,7 +72,32 @@ def fetch_era5(region: str, start: str, end: str, validation: bool, overwrite: b
         include_validation=validation,
         overwrite=overwrite,
     )
-    click.echo(f"Downloaded {len(paths)} ERA5-Land files.")
+    click.echo(f"Downloaded {len(paths)} ERA5-Land monthly files.")
+
+
+@fetch.command("era5-daily")
+@click.option("--region", default="configs/dordogne.yaml", type=click.Path(exists=True))
+@click.option("--start", required=True, help="Start date YYYY-MM-DD")
+@click.option("--end", required=True, help="End date YYYY-MM-DD")
+@click.option("--validation/--no-validation", default=False, help="Include soil moisture layers")
+@click.option("--overwrite", is_flag=True)
+def fetch_era5_daily(region: str, start: str, end: str, validation: bool, overwrite: bool) -> None:
+    """Download ERA5-Land day by day (for operational updates).
+
+    Slower than 'era5' (one API call per day vs per month) but useful for
+    fetching a few recent days to update the water balance operationally.
+    """
+    from irrigator.ingestion.cds_client import fetch_era5_land_days
+
+    cfg = load_region_config(region)
+    paths = fetch_era5_land_days(
+        cfg,
+        _parse_date(start),
+        _parse_date(end),
+        include_validation=validation,
+        overwrite=overwrite,
+    )
+    click.echo(f"Downloaded {len(paths)} ERA5-Land daily files.")
 
 
 @fetch.command("seas5")
@@ -161,6 +190,49 @@ def build_static(region: str) -> None:
     )
 
     click.echo("Static layers built successfully.")
+
+
+# -----------------------------------------------------------------------
+# Region config generation
+# -----------------------------------------------------------------------
+
+
+@main.command("init-region")
+@click.option("--dept", required=True, help="Département code, e.g. '24' for Dordogne")
+@click.option(
+    "--output", "-o", default=None, help="Output YAML path (default: configs/<name>.yaml)"
+)
+@click.option("--admin-shp", default=None, help="Path to ADMIN EXPRESS DEPARTEMENT.shp")
+@click.option("--resolution", default=250, type=int, help="Grid resolution in meters")
+def init_region(dept: str, output: str | None, admin_shp: str | None, resolution: int) -> None:
+    """Generate a region config from a French département code.
+
+    Requires ADMIN EXPRESS DEPARTEMENT.shp from IGN (free download).
+    """
+    from irrigator.region_builder import build_region_config
+
+    config = build_region_config(dept_code=dept, admin_shp=admin_shp, resolution_m=resolution)
+    dept_name = config["region"]["name"]
+
+    if not output:
+        slug = dept_name.lower().replace(" ", "_").replace("-", "_")
+        output = f"configs/{slug}.yaml"
+
+    build_region_config(
+        dept_code=dept, output_path=output, admin_shp=admin_shp, resolution_m=resolution
+    )
+
+    click.echo(f"Region config for {dept_name} ({dept}) → {output}")
+    bbox = config["region"]["bbox_wgs84"]
+    click.echo(
+        f"WGS84 bbox: N={bbox['north']}, S={bbox['south']}, W={bbox['west']}, E={bbox['east']}"
+    )
+
+    stations = config.get("validation_stations", [])
+    if stations:
+        click.echo(f"Validation stations: {', '.join(s['name'] for s in stations)}")
+    else:
+        click.echo("No validation stations configured — add them manually to the YAML.")
 
 
 # -----------------------------------------------------------------------

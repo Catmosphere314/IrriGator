@@ -1,187 +1,161 @@
-"""IrriGator CLI — entry point for pipeline execution."""
+"""Configuration loader for IrriGator.
+
+Loads YAML configs and provides typed accessors so the rest of the codebase
+doesn't scatter dict-key lookups everywhere.
+"""
 
 from __future__ import annotations
 
-import logging
-from datetime import date, datetime
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
-import click
-
-from irrigator.config import load_region_config
-
-logger = logging.getLogger("irrigator")
+import yaml
 
 
-def _setup_logging(verbose: bool) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+# ---------------------------------------------------------------------------
+# Lightweight typed wrappers — intentionally flat, no over-engineering
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BBoxWGS84:
+    north: float
+    south: float
+    west: float
+    east: float
+
+    def as_cds_area(self) -> list[float]:
+        """CDS API expects [N, W, S, E]."""
+        return [self.north, self.west, self.south, self.east]
+
+    def as_tuple(self) -> tuple[float, float, float, float]:
+        """(west, south, east, north) — standard for rasterio/shapely."""
+        return (self.west, self.south, self.east, self.north)
+
+
+@dataclass(frozen=True)
+class BBoxL93:
+    xmin: float
+    ymin: float
+    xmax: float
+    ymax: float
+
+    def as_tuple(self) -> tuple[float, float, float, float]:
+        return (self.xmin, self.ymin, self.xmax, self.ymax)
+
+
+@dataclass(frozen=True)
+class GridConfig:
+    resolution_m: int
+    dem_aggregation: str
+    slope_aggregation: str
+
+
+@dataclass(frozen=True)
+class RegionConfig:
+    """Fully parsed region configuration."""
+
+    name: str
+    code_departement: str
+    crs: str
+    bbox_wgs84: BBoxWGS84
+    bbox_l93: BBoxL93
+    grid: GridConfig
+    data: dict[str, Any]
+    downscaling: dict[str, Any]
+    validation_stations: list[dict[str, Any]]
+    raw: dict[str, Any] = field(repr=False)
+
+    # Convenience paths -------------------------------------------------
+    # All data directories are namespaced by region slug so that multiple
+    # regions can coexist without file collisions.
+
+    @property
+    def _slug(self) -> str:
+        """Filesystem-safe region identifier."""
+        return self.name.lower().replace(" ", "_").replace("-", "_")
+
+    @property
+    def raw_dir(self) -> Path:
+        return Path(self.data["raw_dir"]) / self._slug
+
+    @property
+    def processed_dir(self) -> Path:
+        return Path(self.data["processed_dir"]) / self._slug
+
+    @property
+    def static_dir(self) -> Path:
+        return Path(self.data["static_dir"]) / self._slug
+
+
+def load_region_config(path: str | Path) -> RegionConfig:
+    """Load and parse a region YAML config file."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Region config not found: {path}")
+
+    with open(path) as f:
+        raw = yaml.safe_load(f)
+
+    region = raw["region"]
+    return RegionConfig(
+        name=region["name"],
+        code_departement=region["code_departement"],
+        crs=region["crs"],
+        bbox_wgs84=BBoxWGS84(**region["bbox_wgs84"]),
+        bbox_l93=BBoxL93(**region["bbox_l93"]),
+        grid=GridConfig(**raw["grid"]),
+        data=raw["data"],
+        downscaling=raw.get("downscaling", {}),
+        validation_stations=raw.get("validation_stations", []),
+        raw=raw,
     )
 
 
-def _parse_date(s: str) -> date:
-    return datetime.strptime(s, "%Y-%m-%d").date()
+@dataclass(frozen=True)
+class ParcelConfig:
+    """Parsed parcel configuration."""
+
+    id: str
+    name: str
+    farmer: str
+    lat: float
+    lon: float
+    area_ha: float
+    soil: dict[str, Any]
+    crop: dict[str, Any]
+    irrigation: dict[str, Any]
+    sensors: dict[str, Any]
+    raw: dict[str, Any] = field(repr=False)
+
+    @property
+    def polygon_file(self) -> Path | None:
+        pf = self.raw.get("parcel", {}).get("location", {}).get("polygon_file")
+        return Path(pf) if pf else None
 
 
-# -----------------------------------------------------------------------
-# Root group
-# -----------------------------------------------------------------------
+def load_parcel_config(path: str | Path) -> ParcelConfig:
+    """Load and parse a parcel YAML config file."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Parcel config not found: {path}")
 
+    with open(path) as f:
+        raw = yaml.safe_load(f)
 
-@click.group()
-@click.option("-v", "--verbose", is_flag=True, help="Debug logging")
-@click.version_option()
-def main(verbose: bool) -> None:
-    """IrriGator — Irrigation decision support for maize."""
-    _setup_logging(verbose)
-
-
-# -----------------------------------------------------------------------
-# Block 0 — Data ingestion commands
-# -----------------------------------------------------------------------
-
-
-@main.group()
-def fetch():
-    """Download external datasets (Block 0)."""
-    pass
-
-
-@fetch.command("era5")
-@click.option("--region", default="configs/dordogne.yaml", type=click.Path(exists=True))
-@click.option("--start", required=True, help="Start date YYYY-MM-DD")
-@click.option("--end", required=True, help="End date YYYY-MM-DD")
-@click.option("--validation/--no-validation", default=False, help="Include soil moisture layers")
-@click.option("--overwrite", is_flag=True)
-def fetch_era5(region: str, start: str, end: str, validation: bool, overwrite: bool) -> None:
-    """Download ERA5-Land reanalysis data from CDS."""
-    from irrigator.ingestion.cds_client import fetch_era5_land_range
-
-    cfg = load_region_config(region)
-    paths = fetch_era5_land_range(
-        cfg,
-        _parse_date(start),
-        _parse_date(end),
-        include_validation=validation,
-        overwrite=overwrite,
+    parcel = raw["parcel"]
+    loc = parcel["location"]
+    return ParcelConfig(
+        id=parcel["id"],
+        name=parcel["name"],
+        farmer=parcel["farmer"],
+        lat=loc["lat"],
+        lon=loc["lon"],
+        area_ha=parcel["area_ha"],
+        soil=raw.get("soil", {}),
+        crop=raw.get("crop", {}),
+        irrigation=raw.get("irrigation", {}),
+        sensors=raw.get("sensors", {}),
+        raw=raw,
     )
-    click.echo(f"Downloaded {len(paths)} ERA5-Land files.")
-
-
-@fetch.command("seas5")
-@click.option("--region", default="configs/dordogne.yaml", type=click.Path(exists=True))
-@click.option("--year", required=True, type=int)
-@click.option("--month", required=True, type=int)
-@click.option("--overwrite", is_flag=True)
-def fetch_seas5(region: str, year: int, month: int, overwrite: bool) -> None:
-    """Download SEAS5 seasonal forecast from CDS."""
-    from irrigator.ingestion.cds_client import fetch_seas5
-
-    cfg = load_region_config(region)
-    path = fetch_seas5(cfg, year, month, overwrite=overwrite)
-    click.echo(f"SEAS5 saved: {path}")
-
-
-@fetch.command("forecasts")
-@click.option("--region", default="configs/dordogne.yaml", type=click.Path(exists=True))
-def fetch_forecasts(region: str) -> None:
-    """Download latest AROME + ARPEGE forecasts from Météo-France."""
-    from irrigator.ingestion.meteofrance_client import fetch_latest_forecasts
-
-    cfg = load_region_config(region)
-    results = fetch_latest_forecasts(cfg)
-    for model, path in results.items():
-        click.echo(f"{model.upper()}: {path}")
-    if not results:
-        click.echo("No forecasts retrieved. Check METEOFRANCE_API_KEY.")
-
-
-@fetch.command("comephore")
-@click.option("--region", default="configs/dordogne.yaml", type=click.Path(exists=True))
-@click.option("--start", required=True, help="Start date YYYY-MM-DD")
-@click.option("--end", required=True, help="End date YYYY-MM-DD")
-@click.option("--overwrite", is_flag=True)
-def fetch_comephore(region: str, start: str, end: str, overwrite: bool) -> None:
-    """Download COMEPHORE radar-gauge precipitation from Météo-France."""
-    from irrigator.ingestion.meteofrance_client import fetch_comephore_range
-
-    cfg = load_region_config(region)
-    paths = fetch_comephore_range(cfg, _parse_date(start), _parse_date(end), overwrite=overwrite)
-    click.echo(f"Downloaded {len(paths)} COMEPHORE files.")
-
-
-@fetch.command("ndvi")
-@click.option("--region", default="configs/dordogne.yaml", type=click.Path(exists=True))
-@click.option("--date", "target_date", required=True, help="Target date YYYY-MM-DD")
-@click.option("--window", default=10, help="Search ±N days around target date")
-def fetch_ndvi(region: str, target_date: str, window: int) -> None:
-    """Fetch and process Sentinel-2 NDVI from THEIA."""
-    from irrigator.ingestion.grid import build_grid
-    from irrigator.ingestion.theia_client import fetch_and_process_ndvi
-
-    cfg = load_region_config(region)
-    grid = build_grid(cfg)
-    result = fetch_and_process_ndvi(cfg, grid, _parse_date(target_date), search_window_days=window)
-    if result is not None:
-        click.echo(f"NDVI retrieved: median={float(result.median()):.2f}")
-    else:
-        click.echo("No usable Sentinel-2 scene found.")
-
-
-# -----------------------------------------------------------------------
-# Static layer processing
-# -----------------------------------------------------------------------
-
-
-@main.command("build-static")
-@click.option("--region", default="configs/dordogne.yaml", type=click.Path(exists=True))
-def build_static(region: str) -> None:
-    """Process static layers (soil + DEM) onto the target grid."""
-    from irrigator.ingestion.esdac_loader import load_soil_hydro, save_soil_hydro
-    from irrigator.ingestion.grid import build_grid
-    from irrigator.ingestion.ign_loader import load_terrain, save_terrain
-
-    cfg = load_region_config(region)
-    grid = build_grid(cfg)
-
-    click.echo("Processing soil hydraulic properties...")
-    soil = load_soil_hydro(cfg, grid)
-    save_soil_hydro(soil, cfg.processed_dir / "static")
-    click.echo(f"Soil: median AWC = {float(soil.total_awc_mm.median()):.0f} mm")
-
-    click.echo("Processing terrain (DEM, slope, aspect)...")
-    terrain = load_terrain(cfg, grid)
-    save_terrain(terrain, cfg.processed_dir / "static")
-    click.echo(
-        f"Terrain: elevation range [{float(terrain.elevation.min()):.0f}, "
-        f"{float(terrain.elevation.max()):.0f}] m"
-    )
-
-    click.echo("Static layers built successfully.")
-
-
-# -----------------------------------------------------------------------
-# Full pipeline (placeholder for later blocks)
-# -----------------------------------------------------------------------
-
-
-@main.command("run")
-@click.option("--region", default="configs/dordogne.yaml", type=click.Path(exists=True))
-@click.option("--parcel", required=True, type=click.Path(exists=True), help="Parcel config file")
-@click.option(
-    "--date", "target_date", default=None, help="Target date (YYYY-MM-DD). Default: today."
-)
-def run(region: str, parcel: str, target_date: str | None) -> None:
-    """Run the full pipeline for a parcel and produce an irrigation recommendation."""
-    cfg = load_region_config(region)
-    click.echo(f"Region: {cfg.name}")
-    click.echo(f"Parcel: {parcel}")
-    click.echo(f"Date:   {target_date or 'today'}")
-    click.echo("Full pipeline not yet implemented — build blocks 1-6 progressively.")
-
-
-if __name__ == "__main__":
-    main()

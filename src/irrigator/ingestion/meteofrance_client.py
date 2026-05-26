@@ -25,6 +25,8 @@ COMEPHORE historical archives may require a separate bulk-download
 procedure (HTTPS or FTP).  This module handles the API-based access
 for recent/rolling data.  For the full 2010-2023 calibration archive,
 check https://donneespubliques.meteofrance.fr/ for direct file access.
+
+Note that COMEPHORE data has been downloaded directly, so no need to use API.
 """
 
 from __future__ import annotations
@@ -87,15 +89,23 @@ def _get_api_key() -> str:
     return key
 
 
-def _api_session() -> requests.Session:
+def _api_session(api_key : str | None = None) -> requests.Session:
     """Build a requests session with auth headers."""
     session = requests.Session()
-    session.headers.update(
-        {
-            "apikey": _get_api_key(),
-            "Accept": "application/json",
-        }
-    )
+    if api_key is None:
+        session.headers.update(
+            {
+                "apikey": _get_api_key(),
+                "Accept": "application/json",
+            }
+        )
+    else:
+        session.headers.update(
+            {
+                "apikey": api_key,
+                "Accept": "application/json",
+            }
+        )
     return session
 
 

@@ -256,9 +256,7 @@ def build_region_config(
                 "admin_product": "ADMIN EXPRESS",
             },
             "theia": {
-                "stac_url": "https://theia.cnes.fr/atdistrib/rocket/api/stac",
-                "collection": "SENTINEL2",
-                "processing_level": "L2A",
+                "collection": "THEIA_REFLECTANCE_SENTINEL2_L2A",
                 "max_cloud_cover": 20,
             },
         },

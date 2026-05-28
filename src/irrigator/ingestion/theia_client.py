@@ -363,8 +363,90 @@ def aggregate_ndvi_to_grid(
 
 
 # ---------------------------------------------------------------------------
-# End-to-end pipeline
+# End-to-end pipeline — multi-tile
 # ---------------------------------------------------------------------------
+
+
+def _group_scenes_by_date(
+    scenes: list[dict[str, Any]],
+) -> dict[date, list[dict[str, Any]]]:
+    """Group scenes by acquisition date (ignoring time)."""
+    groups: dict[date, list[dict[str, Any]]] = {}
+    for s in scenes:
+        dt = s.get("datetime")
+        if dt is None:
+            continue
+        d = dt.date()
+        groups.setdefault(d, []).append(s)
+    return groups
+
+
+def _pick_best_date(
+    groups: dict[date, list[dict[str, Any]]],
+    target_date: date,
+) -> date | None:
+    """Pick the acquisition date with best coverage and lowest cloud.
+
+    Scoring:  primary = closeness to target_date
+              secondary = number of tiles (more = better coverage)
+              tertiary = mean cloud cover (lower = better)
+    """
+    if not groups:
+        return None
+
+    def score(d: date) -> tuple:
+        tiles = groups[d]
+        day_distance = abs((d - target_date).days)
+        n_tiles = len(tiles)
+        mean_cloud = np.mean([t.get("cloud_cover") or 100 for t in tiles])
+        # Sort: closest date first, then most tiles, then least cloud
+        return (day_distance, -n_tiles, mean_cloud)
+
+    return min(groups.keys(), key=score)
+
+
+def _mosaic_ndvi_tiles(
+    ndvi_arrays: list[tuple[np.ndarray, rasterio.Affine, Any]],
+    target_grid: TargetGrid,
+) -> xr.DataArray:
+    """Mosaic multiple NDVI tiles onto the target grid.
+
+    Each tile is reprojected to the target grid independently, then
+    combined by nanmean (for overlapping areas between tiles).
+    """
+    ny, nx = target_grid.shape
+    stack = []
+
+    for ndvi, transform, crs in ndvi_arrays:
+        dst = np.full((ny, nx), np.nan, dtype=np.float32)
+        reproject(
+            source=ndvi,
+            destination=dst,
+            src_transform=transform,
+            src_crs=crs,
+            dst_transform=target_grid.transform,
+            dst_crs=target_grid.crs,
+            resampling=Resampling.average,
+            src_nodata=np.nan,
+            dst_nodata=np.nan,
+        )
+        stack.append(dst)
+
+    # Combine: nanmean handles overlaps and preserves single-tile areas
+    mosaic = np.nanmean(np.stack(stack, axis=0), axis=0)
+
+    return xr.DataArray(
+        mosaic,
+        dims=["y", "x"],
+        coords={"y": target_grid.ys, "x": target_grid.xs},
+        name="ndvi",
+        attrs={
+            "units": "dimensionless",
+            "long_name": "NDVI",
+            "source": "Sentinel-2 L2A via GEODES/THEIA",
+            "n_tiles": len(ndvi_arrays),
+        },
+    )
 
 
 def fetch_and_process_ndvi(
@@ -374,7 +456,12 @@ def fetch_and_process_ndvi(
     *,
     search_window_days: int = 10,
 ) -> xr.DataArray | None:
-    """End-to-end: search, download, compute NDVI, aggregate to grid.
+    """End-to-end: search, download ALL tiles for best date, mosaic NDVI.
+
+    Unlike a single-tile approach, this downloads every tile from the
+    selected acquisition date so the NDVI covers the full region.
+    Sentinel-2 tiles are ~110 × 110 km; a département like Dordogne
+    spans 4+ tiles.
 
     Parameters
     ----------
@@ -390,58 +477,87 @@ def fetch_and_process_ndvi(
     start = target_date - timedelta(days=search_window_days)
     end = target_date + timedelta(days=search_window_days)
 
-    scenes = search_scenes(cfg, start, end, max_results=20)
+    scenes = search_scenes(cfg, start, end, max_results=100)
     if not scenes:
         logger.warning("No Sentinel-2 scenes found near %s", target_date)
         return None
 
-    # Sort by distance to target date, then cloud cover
-    scenes.sort(
-        key=lambda s: (
-            abs((s["datetime"].date() - target_date).days) if s["datetime"] else 999,
-            s.get("cloud_cover") or 100,
-        )
-    )
+    # Group by date and pick the best one
+    groups = _group_scenes_by_date(scenes)
+    best_date = _pick_best_date(groups, target_date)
+    if best_date is None:
+        logger.warning("No valid dates found")
+        return None
 
-    best = scenes[0]
+    tiles = groups[best_date]
+    tile_codes = [t.get("grid_code", "?") for t in tiles]
+    mean_cloud = np.mean([t.get("cloud_cover") or 0 for t in tiles])
+
     logger.info(
-        "Selected scene %s (%s, cloud %.0f%%, tile %s)",
-        best["id"],
-        best["datetime"],
-        best.get("cloud_cover") or -1,
-        best.get("grid_code", "?"),
+        "Selected date %s: %d tiles (%s), mean cloud %.0f%%",
+        best_date,
+        len(tiles),
+        ", ".join(tile_codes),
+        mean_cloud,
     )
 
-    # Download and extract
+    # Download and process each tile
     s2_dir = cfg.raw_dir / "sentinel2"
-    scene_dir = download_scene(best, s2_dir)
-    if scene_dir is None:
+    ndvi_arrays = []
+
+    for tile in tiles:
+        tile_code = tile.get("grid_code", "?")
+        logger.info("Processing tile %s...", tile_code)
+
+        scene_dir = download_scene(tile, s2_dir)
+        if scene_dir is None:
+            logger.warning("Skipping tile %s — download failed", tile_code)
+            continue
+
+        red_path = find_band_file(scene_dir, _BAND_RED)
+        nir_path = find_band_file(scene_dir, _BAND_NIR)
+
+        if red_path is None or nir_path is None:
+            logger.warning(
+                "Skipping tile %s — B4/B8 not found. Files: %s",
+                tile_code,
+                [p.name for p in scene_dir.rglob("*.tif")][:10],
+            )
+            continue
+
+        ndvi, transform, crs = compute_ndvi(red_path, nir_path)
+        ndvi_arrays.append((ndvi, transform, crs))
+        logger.info("Tile %s: NDVI median=%.2f", tile_code, float(np.nanmedian(ndvi)))
+
+    if not ndvi_arrays:
+        logger.warning("No tiles could be processed for %s", best_date)
         return None
 
-    # Find band files in extracted archive
-    red_path = find_band_file(scene_dir, _BAND_RED)
-    nir_path = find_band_file(scene_dir, _BAND_NIR)
+    # Mosaic all tiles onto the target grid
+    logger.info("Mosaicking %d tiles onto target grid...", len(ndvi_arrays))
+    ndvi_grid = _mosaic_ndvi_tiles(ndvi_arrays, target_grid)
 
-    if red_path is None or nir_path is None:
+    # Coverage check
+    valid_frac = float((~np.isnan(ndvi_grid.values)).mean())
+    logger.info(
+        "NDVI mosaic: %d tiles, coverage=%.0f%%, median=%.2f, range=[%.2f, %.2f]",
+        len(ndvi_arrays),
+        valid_frac * 100,
+        float(ndvi_grid.median()),
+        float(np.nanmin(ndvi_grid.values)),
+        float(np.nanmax(ndvi_grid.values)),
+    )
+
+    if valid_frac < 0.5:
         logger.warning(
-            "Could not find B4/B8 bands in %s. Contents: %s",
-            scene_dir,
-            [p.name for p in scene_dir.rglob("*.tif")][:10],
+            "Low coverage (%.0f%%) — some tiles may be missing. "
+            "Consider widening the search window.",
+            valid_frac * 100,
         )
-        return None
-
-    # Compute NDVI and aggregate
-    ndvi, transform, crs = compute_ndvi(red_path, nir_path)
-    ndvi_grid = aggregate_ndvi_to_grid(ndvi, transform, crs, target_grid)
 
     # Attach time coordinate
-    if best["datetime"]:
-        ndvi_grid = ndvi_grid.expand_dims(time=[best["datetime"]])
-
-    logger.info(
-        "NDVI processed: median=%.2f, range=[%.2f, %.2f]",
-        float(ndvi_grid.median()),
-        float(ndvi_grid.min()),
-        float(ndvi_grid.max()),
+    ndvi_grid = ndvi_grid.expand_dims(
+        time=[datetime(best_date.year, best_date.month, best_date.day)]
     )
+
     return ndvi_grid

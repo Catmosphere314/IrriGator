@@ -98,7 +98,7 @@ src/
    - Slope and aspect from RGE ALTI at 5 m, aggregate statistics to 250 m grid.
    - Compute terrain-based radiation correction factors (important for ET0 spatial variation).
 
-3. **Load BRGM geology and classify.**
+3. **Load BRGM geology and classify. - TO REMOVE ??**
    - Map geological units to broad drainage classes: alluvium (high storage, good drainage), limestone plateau (shallow soil, karstic drainage), clay-limestone (low permeability).
    - Use as a stratification layer: within each geology class, EU-SoilHydroGrids values should be more homogeneous.
 

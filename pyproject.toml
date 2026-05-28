@@ -44,7 +44,7 @@ dependencies = [
     "netcdf4>=1.6",
 
     # Remote sensing
-    "pystac-client>=0.7",
+    "pygeodes>=0.1.7",
 
     # Utilities
     "requests>=2.31",

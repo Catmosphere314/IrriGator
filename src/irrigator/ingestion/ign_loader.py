@@ -67,12 +67,16 @@ def _find_dem_dir(cfg: RegionConfig) -> Path:
     return dem_dir
 
 
-def _mosaic_dem_tiles(dem_dir: Path) -> tuple[np.ndarray, rasterio.Affine, rasterio.crs.CRS]:
+def _mosaic_dem_tiles(dem_dir: Path, cfg_code : str | int) -> tuple[np.ndarray, rasterio.Affine, rasterio.crs.CRS]:
     """Mosaic all DEM tiles in the directory into a single array.
 
     Supports .tif, .tiff, and .asc (ESRI ASCII Grid) files.
     """
-    patterns = ("*.tif", "*.tiff", "*.asc")
+    patterns = (
+        f"*_D{int(cfg_code):03d}/*.tif",
+        f"*_D{int(cfg_code):03d}/*.tiff",
+        f"*_D{int(cfg_code):03d}/*.asc",
+    )
     tile_paths = []
     for pat in patterns:
         tile_paths.extend(dem_dir.glob(pat))
@@ -84,7 +88,7 @@ def _mosaic_dem_tiles(dem_dir: Path) -> tuple[np.ndarray, rasterio.Affine, raste
 
     datasets = [rasterio.open(p) for p in tile_paths]
     mosaic, transform = merge(datasets)
-    crs = datasets[0].crs
+    crs = "EPSG:5698" # datasets[0].crs 
 
     for ds in datasets:
         ds.close()
@@ -167,7 +171,9 @@ def load_terrain(
     dem_dir = _find_dem_dir(cfg)
 
     # Step 1: mosaic
-    elev_native, transform_native, crs_native = _mosaic_dem_tiles(dem_dir)
+    elev_native, transform_native, crs_native = _mosaic_dem_tiles(
+        dem_dir=dem_dir, cfg_code=cfg.code_departement
+    )
     cell_size = abs(transform_native.a)  # pixel size in meters (assuming square)
     logger.info(
         "DEM mosaic: %d × %d at %.1f m, CRS %s",

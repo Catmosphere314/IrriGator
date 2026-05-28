@@ -141,6 +141,7 @@ def build_region_config(
     dept_code: str,
     output_path: str | Path | None = None,
     admin_shp: str | None = None,
+    parent_path: str = "",
     resolution_m: int = 250,
 ) -> dict:
     """Generate a region config dict from a département code.
@@ -150,6 +151,7 @@ def build_region_config(
     dept_code : French département code, e.g. "24" for Dordogne
     output_path : if provided, write YAML to this path
     admin_shp : explicit path to ADMIN EXPRESS DEPARTEMENT.shp
+    parent_path : cleaner to indicate the exact path (fails otherwise)
     resolution_m : target grid resolution in meters
 
     Returns
@@ -195,9 +197,9 @@ def build_region_config(
             "slope_aggregation": "mean",
         },
         "data": {
-            "raw_dir": "data/raw",
-            "processed_dir": "data/processed",
-            "static_dir": "data/static",
+            "raw_dir": parent_path + "/" + "data/raw",
+            "processed_dir": parent_path + "/" + "data/processed",
+            "static_dir": parent_path + "/" + "data/static",
             "era5_land": {
                 "product": "reanalysis-era5-land",
                 "variables": [

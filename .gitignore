@@ -26,6 +26,7 @@ env/
 # Data — track metadata only, not the actual rasters/netcdf
 data/raw/
 data/processed/
+data/static/
 data/static/*.tif
 data/static/*.nc
 data/static/*.grib

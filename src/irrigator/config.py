@@ -25,9 +25,19 @@ class BBoxWGS84:
     west: float
     east: float
 
-    def as_cds_area(self) -> list[float]:
-        """CDS API expects [N, W, S, E]."""
-        return [self.north, self.west, self.south, self.east]
+    def as_cds_area(self, grid_step: float = 0.1) -> list[float]:
+        """CDS API expects [N, W, S, E], snapped outward to grid_step.
+
+        ERA5-Land uses a 0.1° grid.  Rounding outward ensures the entire
+        region of interest is covered and no edge cells are missed.
+        """
+        import math
+
+        n = math.ceil(self.north / grid_step) * grid_step
+        s = math.floor(self.south / grid_step) * grid_step
+        w = math.floor(self.west / grid_step) * grid_step
+        e = math.ceil(self.east / grid_step) * grid_step
+        return [round(n, 4), round(w, 4), round(s, 4), round(e, 4)]
 
     def as_tuple(self) -> tuple[float, float, float, float]:
         """(west, south, east, north) — standard for rasterio/shapely."""
@@ -86,7 +96,7 @@ class RegionConfig:
 
     @property
     def static_dir(self) -> Path:
-        return Path(self.data["static_dir"]) / self._slug
+        return Path(self.data["static_dir"])
 
 
 def load_region_config(path: str | Path) -> RegionConfig:

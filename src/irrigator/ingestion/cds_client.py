@@ -59,7 +59,7 @@ SEAS5_VARIABLES = [
 def _init_cds_client() -> cdsapi.Client:
     """Initialise CDS API client with quiet logging."""
     try:
-        client = cdsapi.Client(quiet=True)
+        client = cdsapi.Client(quiet=False)
     except Exception as exc:
         raise RuntimeError(
             "CDS API client failed to initialise. "
@@ -74,11 +74,17 @@ def _init_cds_client() -> cdsapi.Client:
 # ---------------------------------------------------------------------------
 
 
-def _era5_output_path(raw_dir: Path, year: int, month: int) -> Path:
+def _era5_output_path(raw_dir: Path, year: int, month: int,*, validation : bool = False) -> Path:
     """Consistent file naming: era5land_YYYY_MM.nc"""
     out_dir = raw_dir / "era5_land"
     out_dir.mkdir(parents=True, exist_ok=True)
-    return out_dir / f"era5land_{year:04d}_{month:02d}.nc"
+
+    output_path = (
+        out_dir / f"era5land_{year:04d}_{month:02d}.nc"
+        if not validation
+        else out_dir / f"era5land_validation_{year:04d}_{month:02d}.nc"
+    )
+    return output_path
 
 
 def fetch_era5_land_month(
@@ -103,14 +109,19 @@ def fetch_era5_land_month(
     Path to the downloaded NetCDF file.
     """
     out_path = _era5_output_path(cfg.raw_dir, year, month)
+    out_path_validation = (
+        _era5_output_path(cfg.raw_dir, year, month, validation=True) if include_validation else None
+    )
 
-    if out_path.exists() and not overwrite:
+    if (
+        out_path.exists()
+        and (out_path_validation is None or out_path_validation.exists())
+        and not overwrite
+    ):
         logger.info("ERA5-Land %04d-%02d already exists: %s", year, month, out_path)
         return out_path
 
     variables = list(ERA5_LAND_VARIABLES)
-    if include_validation:
-        variables.extend(ERA5_LAND_VALIDATION_VARIABLES)
 
     # Build day list for the month
     first_day = date(year, month, 1)
@@ -128,12 +139,38 @@ def fetch_era5_land_month(
         "time": [f"{h:02d}:00" for h in range(24)],
         "area": cfg.bbox_wgs84.as_cds_area(),
         "data_format": "netcdf",
+        "download_format": "unarchived",
     }
+
+    print(request)
 
     logger.info("Requesting ERA5-Land %04d-%02d from CDS...", year, month)
     client = _init_cds_client()
     client.retrieve("reanalysis-era5-land", request, str(out_path))
     logger.info("Downloaded: %s (%.1f MB)", out_path, out_path.stat().st_size / 1e6)
+
+    if include_validation and out_path_validation is not None:
+        variables = ERA5_LAND_VALIDATION_VARIABLES
+
+        request = {
+            "variable": variables,
+            "year": str(year),
+            "month": f"{month:02d}",
+            "day": days,
+            "time": [f"{h:02d}:00" for h in range(24)],
+            "area": cfg.bbox_wgs84.as_cds_area(),
+            "data_format": "netcdf",
+            "download_format": "unarchived",
+        }
+
+        logger.info("Requesting ERA5-Land %04d-%02d from CDS...", year, month)
+        client = _init_cds_client()
+        client.retrieve("reanalysis-era5-land", request, str(out_path_validation))
+        logger.info(
+            "Downloaded: %s (%.1f MB)",
+            out_path_validation,
+            out_path_validation.stat().st_size / 1e6,
+        )
 
     return out_path
 
@@ -168,6 +205,7 @@ def open_era5_land(
     cfg: RegionConfig,
     start: date | None = None,
     end: date | None = None,
+    parent_path : str | None = None,
 ) -> xr.Dataset:
     """Open downloaded ERA5-Land files as a single lazy xarray Dataset.
 

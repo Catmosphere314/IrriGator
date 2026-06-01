@@ -26,6 +26,7 @@ import logging
 
 import numpy as np
 import xarray as xr
+import pandas as pd
 
 from irrigator.config import RegionConfig
 
@@ -96,16 +97,22 @@ def process_era5_to_daily(ds: xr.Dataset) -> xr.Dataset:
     del(pres_ds)
 
     # Solar radiation: J/m² (accumulated per hour) → MJ/m²/day
-    # Sum hourly values, convert J → MJ
-    rad_ds = ds[ssrd].resample(valid_time="1D")
-    rs = rad_ds.sum() / 1e6
-    del(rad_ds)
+    # Accumulated values, convert J → MJ
+    # Daily total = value at 00UTC of d+1, which holds the previous day's accumulation
+    rad_00utc = ds[ssrd].sel(valid_time=ds.valid_time.dt.hour == 0)
+    # Shift back by one day so it aligns with the correct date
+    rs = rad_00utc.assign_coords(valid_time=rad_00utc.valid_time - pd.Timedelta("1D")) / 1e6
+    del rad_00utc
 
     # Precipitation: m (accumulated per hour) → mm/day
     # Sum hourly values, convert m → mm
-    precip_ds = ds[tp].resample(valid_time='1D')
-    precip = precip_ds.sum() * 1000.0
-    del(precip_ds)
+    # Daily total = value at 00UTC of d+1, which holds the previous day's accumulation
+    tp_00utc = ds[tp].sel(valid_time=ds.valid_time.dt.hour == 0)
+    # Shift back by one day so it aligns with the correct date
+    precip = tp_00utc.assign_coords(
+        valid_time=tp_00utc.valid_time - pd.Timedelta("1D")
+    ) * 1000.0
+    del(tp_00utc)
     # ERA5-Land can have tiny negative values from numerical noise
     precip = precip.clip(min=0)
 

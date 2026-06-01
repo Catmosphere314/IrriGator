@@ -5,7 +5,7 @@ It relies on the FAO-56 Penman-Monteith model using pyet.
 """
 
 #TO CLEAN 
-from irrigator.water_balance import SoilProfile, get_soil_profile
-from irrigator.water_balance import TerrainParams, get_terrain_params
+from irrigator.water_balance.et0 import compute_et0
+from irrigator.water_balance.state import WaterBalanceState
 
-__all__ = ["SoilProfile", "get_soil_profile", "TerrainParams", "get_terrain_params"]
+__all__ = ["compute_et0", "WaterBalanceState"]

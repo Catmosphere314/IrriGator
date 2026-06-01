@@ -74,30 +74,38 @@ def process_era5_to_daily(ds: xr.Dataset) -> xr.Dataset:
     ssrd = _find_var(ds, ["ssrd", "surface_solar_radiation_downwards"])
     tp = _find_var(ds, ["tp", "total_precipitation"])
 
-    daily = ds.resample(time="1D")
-
     # Temperature: K → °C
-    t_min = daily[t2m].min() - 273.15
-    t_max = daily[t2m].max() - 273.15
-    t_mean = daily[t2m].mean() - 273.15
+    temp_ds = ds[t2m].resample(valid_time="1D")
+    t_min = temp_ds.min() - 273.15
+    t_max = temp_ds.max() - 273.15
+    t_mean = temp_ds.mean() - 273.15
+    del(temp_ds)
 
     # Dewpoint: K → °C
-    dewpoint = daily[d2m].mean() - 273.15
+    dew_ds = ds[d2m].resample(valid_time="1D")
+    dewpoint = dew_ds.mean() - 273.15
+    del(dew_ds)
 
     # Wind speed at 10m: combine u and v components
     wind_speed = np.sqrt(ds[u10] ** 2 + ds[v10] ** 2)
-    wind_10m = wind_speed.resample(time="1D").mean()
+    wind_10m = wind_speed.resample(valid_time="1D").mean()
 
     # Pressure: Pa → kPa
-    pressure = daily[sp].mean() / 1000.0
+    pres_ds = ds[sp].resample(valid_time='1D')
+    pressure = pres_ds.mean() / 1000.0
+    del(pres_ds)
 
     # Solar radiation: J/m² (accumulated per hour) → MJ/m²/day
     # Sum hourly values, convert J → MJ
-    rs = daily[ssrd].sum() / 1e6
+    rad_ds = ds[ssrd].resample(valid_time="1D")
+    rs = rad_ds.sum() / 1e6
+    del(rad_ds)
 
     # Precipitation: m (accumulated per hour) → mm/day
     # Sum hourly values, convert m → mm
-    precip = daily[tp].sum() * 1000.0
+    precip_ds = ds[tp].resample(valid_time='1D')
+    precip = precip_ds.sum() * 1000.0
+    del(precip_ds)
     # ERA5-Land can have tiny negative values from numerical noise
     precip = precip.clip(min=0)
 
@@ -122,7 +130,7 @@ def process_era5_to_daily(ds: xr.Dataset) -> xr.Dataset:
 
     logger.info(
         "Daily aggregation: %d days, T range [%.1f, %.1f] °C",
-        len(result.time),
+        len(result.valid_time),
         float(result.t_min.min()),
         float(result.t_max.max()),
     )

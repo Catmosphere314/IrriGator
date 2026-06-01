@@ -150,8 +150,8 @@ def extract_parcel_forcing(
     px, py = _TO_L93.transform(parcel.lon, parcel.lat)
 
     # Step 1: extract at nearest grid cell
-    cell = era5_daily.sel(x=px, y=py, method="nearest")
-    dates = cell.time.values
+    cell = era5_daily.sel(longitude=px, latitude=py, method="nearest")
+    dates = cell.valid_time.values
     n = len(dates)
 
     t_min = cell["t_min"].values.astype(np.float64)

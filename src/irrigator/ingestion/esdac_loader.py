@@ -452,21 +452,21 @@ def load_soil_hydro(
     }
 
     fc = xr.DataArray(
-        arrays["FC"],
+        arrays["FC"] / 100,
         dims=dims,
         coords=coords,
         name="fc",
         attrs={"units": "cm3/cm3", "long_name": "field capacity"},
     )
     wp = xr.DataArray(
-        arrays["WP"],
+        arrays["WP"] / 100,
         dims=dims,
         coords=coords,
         name="wp",
         attrs={"units": "cm3/cm3", "long_name": "wilting point"},
     )
     ks = xr.DataArray(
-        arrays["KS"],
+        arrays["KS"] / 100,
         dims=dims,
         coords=coords,
         name="ks",

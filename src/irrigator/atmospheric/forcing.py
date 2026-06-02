@@ -147,10 +147,10 @@ def extract_parcel_forcing(
     -------
     DailyForcing time series for the parcel.
     """
-    px, py = _TO_L93.transform(parcel.lon, parcel.lat)
+    
 
     # Step 1: extract at nearest grid cell
-    cell = era5_daily.sel(longitude=px, latitude=py, method="nearest")
+    cell = era5_daily.sel(longitude=parcel.lon, latitude=parcel.lat, method="nearest")
     dates = cell.valid_time.values
     n = len(dates)
 
@@ -167,8 +167,8 @@ def extract_parcel_forcing(
         "Parcel %s: extracted %d days from ERA5-Land at grid cell (%.0f, %.0f)",
         parcel.id,
         n,
-        px,
-        py,
+        parcel.lon,
+        parcel.lat,
     )
 
     # Step 2: temperature lapse-rate correction

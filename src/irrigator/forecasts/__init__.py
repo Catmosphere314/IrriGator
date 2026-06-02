@@ -1,16 +1,13 @@
-"""Block 5 - Forecast Integration.
+"""IrriGator Block 5 — Forecast integration.
 
-It extends the water balance forward in time using NWP forecasts to 
-anticipate irrigation needs.
+Short-term (AROME/ARPEGE, 2-4 days):
+    Forward water balance to detect imminent stress.
 
-It combines short term (ST) and mid term (MT) as follows:
-
-ST -- AROME (0-48h, 1.3km resolution) + ARPEGE (48-96h, 10km) from
-      MeteoFrance
-
-MT -- SEAS5 (0-6 months, 32km) ensemble monthly anomalies for temperature and 
-      precipitation
-
-Both are accessed through APIs and downscaled/bias corrected based on Quantile
-Mapping.      
+Seasonal (SEAS5, 1-6 months):
+    Analog-based disaggregation of ensemble members into daily scenarios.
+    Probabilistic irrigation demand over the season.
 """
+
+from irrigator.forecasts.short_term import run_forward_balance, will_stress_occur
+
+__all__ = ["run_forward_balance", "will_stress_occur"]

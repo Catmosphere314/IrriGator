@@ -11,7 +11,7 @@ domain, which is what IrriGator's water balance was calibrated on.
 
 For irrigation use we need: 2m temperature, total precipitation,
 surface solar radiation, 10m wind, dewpoint, surface pressure.
-SEAS5 provides these at ~36 km monthly resolution.
+SEAS5 provides these at ~130 km monthly resolution. (1 degree)
 """
 
 from __future__ import annotations

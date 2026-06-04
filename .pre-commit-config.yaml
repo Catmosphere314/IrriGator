@@ -1,0 +1,47 @@
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-warning
+        name: ruff warning only
+        entry: bash -c 'ruff check "$@" --exit-zero || true' --
+        language: python
+        types: [python]
+        additional_dependencies:
+          - ruff==0.8.0
+        verbose: true
+
+      - id: ruff-format-warning
+        name: ruff format warning only
+        entry: bash -c 'ruff format "$@" --check || true' --
+        language: python
+        types: [python]
+        additional_dependencies:
+          - ruff==0.8.0
+        verbose: true
+
+      - id: check-yaml-warning
+        name: check yaml warning only
+        entry: bash -c 'check-yaml "$@" || true' --
+        language: python
+        types: [yaml]
+        additional_dependencies:
+          - pre-commit-hooks==5.0.0
+        verbose: true
+
+      - id: check-toml-warning
+        name: check toml warning only
+        entry: bash -c 'check-toml "$@" || true' --
+        language: python
+        types: [toml]
+        additional_dependencies:
+          - pre-commit-hooks==5.0.0
+        verbose: true
+
+      - id: check-added-large-files-warning
+        name: check added large files warning only
+        entry: bash -c 'check-added-large-files "$@" || true' --
+        language: python
+        pass_filenames: true
+        additional_dependencies:
+          - pre-commit-hooks==5.0.0
+        verbose: true

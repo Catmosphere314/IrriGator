@@ -28,7 +28,6 @@ Prerequisites
 
 from __future__ import annotations
 
-import glob
 import logging
 import os
 import zipfile
@@ -65,7 +64,7 @@ def _get_geodes_client():
     Search works without an API key.  Download requires one.
     """
     try:
-        from pygeodes import Geodes, Config
+        from pygeodes import Config, Geodes
     except ImportError:
         raise ImportError(
             "Install pygeodes: pip install pygeodes\n"
@@ -204,7 +203,7 @@ def download_scene(
     -------
     Path to the extracted scene directory, or None on failure.
     """
-    from pygeodes import Geodes, Config
+    from pygeodes import Config, Geodes
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -19,4 +19,4 @@ Typical usage::
 from irrigator.water_balance.et0 import compute_et0
 from irrigator.water_balance.state import WaterBalanceState
 
-__all__ = ["compute_et0", "WaterBalanceState"]
+__all__ = ["WaterBalanceState", "compute_et0"]

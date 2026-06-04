@@ -12,7 +12,6 @@ from typing import Any
 
 import yaml
 
-
 # ---------------------------------------------------------------------------
 # Lightweight typed wrappers — intentionally flat, no over-engineering
 # ---------------------------------------------------------------------------

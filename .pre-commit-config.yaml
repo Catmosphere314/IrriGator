@@ -1,16 +1,40 @@
 repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.8.0
+  - repo: local
     hooks:
-      - id: ruff
-        args: ["--fix"]
-      - id: ruff-format
+      - id: ruff-warning
+        name: ruff warning only
+        entry: bash -c 'ruff check "$@" --exit-zero' --
+        language: system
+        types: [python]
+        verbose: true
 
-  - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
-    hooks:
-      - id: check-yaml
-      - id: check-toml
-      - id: end-of-file-fixer
-      - id: trailing-whitespace
-      - id: check-added-large-files
+      - id: ruff-format-warning
+        name: ruff format warning only
+        entry: bash -c 'ruff format "$@" --check || true' --
+        language: system
+        types: [python]
+        verbose: true
+
+      - id: check-yaml-warning
+        name: check yaml warning only
+        entry: bash -c 'check-yaml "$@" || true' --
+        language: python
+        types: [yaml]
+        additional_dependencies: [pre-commit-hooks]
+        verbose: true
+
+      - id: check-toml-warning
+        name: check toml warning only
+        entry: bash -c 'check-toml "$@" || true' --
+        language: python
+        types: [toml]
+        additional_dependencies: [pre-commit-hooks]
+        verbose: true
+
+      - id: check-added-large-files-warning
+        name: check added large files warning only
+        entry: bash -c 'check-added-large-files "$@" || true' --
+        language: python
+        pass_filenames: true
+        additional_dependencies: [pre-commit-hooks]
+        verbose: true

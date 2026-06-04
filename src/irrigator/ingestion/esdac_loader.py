@@ -48,7 +48,6 @@ import geopandas as gpd
 import numpy as np
 import rasterio
 import xarray as xr
-from rasterio.crs import CRS
 from rasterio.merge import merge
 from rasterio.warp import Resampling, reproject
 from shapely.geometry import box

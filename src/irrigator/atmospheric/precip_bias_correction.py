@@ -17,11 +17,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 import xarray as xr
-from scipy import interpolate, stats
 
 from irrigator.config import RegionConfig
 

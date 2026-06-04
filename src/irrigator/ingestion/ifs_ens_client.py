@@ -30,7 +30,7 @@ Azure, or via Open-Meteo.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np

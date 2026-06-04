@@ -74,7 +74,7 @@ def _init_cds_client() -> cdsapi.Client:
 # ---------------------------------------------------------------------------
 
 
-def _era5_output_path(raw_dir: Path, year: int, month: int,*, validation : bool = False) -> Path:
+def _era5_output_path(raw_dir: Path, year: int, month: int, *, validation: bool = False) -> Path:
     """Consistent file naming: era5land_YYYY_MM.nc"""
     out_dir = raw_dir / "era5_land"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -205,7 +205,7 @@ def open_era5_land(
     cfg: RegionConfig,
     start: date | None = None,
     end: date | None = None,
-    parent_path : str | None = None,
+    parent_path: str | None = None,
 ) -> xr.Dataset:
     """Open downloaded ERA5-Land files as a single lazy xarray Dataset.
 

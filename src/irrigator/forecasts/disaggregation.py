@@ -28,22 +28,18 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date
-from sklearn.decomposition import PCA
-from irrigator.forecasts.pca_framework import (
-    select_candidate,
-    mahalanobis_candidates,
-    fit_monthly_gridcell_pca,
-    transform_to_pca,
-    GriddedPCA,
-)
 
-import numpy as np
 import pandas as pd
 import xarray as xr
 
-
 from irrigator.config import RegionConfig
+from irrigator.forecasts.pca_framework import (
+    GriddedPCA,
+    fit_monthly_gridcell_pca,
+    mahalanobis_candidates,
+    select_candidate,
+    transform_to_pca,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -483,7 +479,11 @@ def generate_seasonal_scenarios(
                 continue
 
             # best_year, best_month, similarity = analogs[0]
-            best_year, best_month, similarity = analogs[1]["best_year"], analogs[1]["best_month"], analogs[1]["best_score"]
+            best_year, best_month, similarity = (
+                analogs[1]["best_year"],
+                analogs[1]["best_month"],
+                analogs[1]["best_score"],
+            )
 
             member_analogs.append(
                 AnalogMatch(
@@ -500,7 +500,7 @@ def generate_seasonal_scenarios(
                 era5_daily=era5_daily,
                 analog_year=best_year,
                 analog_month=best_month,
-                #seas5_monthly_target=target_values, TO DO : CHECK IF NECESSARY TO SCALE
+                # seas5_monthly_target=target_values, TO DO : CHECK IF NECESSARY TO SCALE
             )
             monthly_datasets.append(month_ds)
 

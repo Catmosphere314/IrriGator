@@ -17,9 +17,7 @@ SEAS5 provides these at ~130 km monthly resolution. (1 degree)
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
-import numpy as np
 import xarray as xr
 
 from irrigator.config import RegionConfig

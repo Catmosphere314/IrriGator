@@ -25,8 +25,8 @@ from __future__ import annotations
 import logging
 
 import numpy as np
-import xarray as xr
 import pandas as pd
+import xarray as xr
 
 from irrigator.config import RegionConfig
 
@@ -80,21 +80,21 @@ def process_era5_to_daily(ds: xr.Dataset) -> xr.Dataset:
     t_min = temp_ds.min() - 273.15
     t_max = temp_ds.max() - 273.15
     t_mean = temp_ds.mean() - 273.15
-    del(temp_ds)
+    del temp_ds
 
     # Dewpoint: K → °C
     dew_ds = ds[d2m].resample(valid_time="1D")
     dewpoint = dew_ds.mean() - 273.15
-    del(dew_ds)
+    del dew_ds
 
     # Wind speed at 10m: combine u and v components
     wind_speed = np.sqrt(ds[u10] ** 2 + ds[v10] ** 2)
     wind_10m = wind_speed.resample(valid_time="1D").mean()
 
     # Pressure: Pa → kPa
-    pres_ds = ds[sp].resample(valid_time='1D')
+    pres_ds = ds[sp].resample(valid_time="1D")
     pressure = pres_ds.mean() / 1000.0
-    del(pres_ds)
+    del pres_ds
 
     # Solar radiation: J/m² (accumulated per hour) → MJ/m²/day
     # Accumulated values, convert J → MJ
@@ -109,10 +109,8 @@ def process_era5_to_daily(ds: xr.Dataset) -> xr.Dataset:
     # Daily total = value at 00UTC of d+1, which holds the previous day's accumulation
     tp_00utc = ds[tp].sel(valid_time=ds.valid_time.dt.hour == 0)
     # Shift back by one day so it aligns with the correct date
-    precip = tp_00utc.assign_coords(
-        valid_time=tp_00utc.valid_time - pd.Timedelta("1D")
-    ) * 1000.0
-    del(tp_00utc)
+    precip = tp_00utc.assign_coords(valid_time=tp_00utc.valid_time - pd.Timedelta("1D")) * 1000.0
+    del tp_00utc
     # ERA5-Land can have tiny negative values from numerical noise
     precip = precip.clip(min=0)
 

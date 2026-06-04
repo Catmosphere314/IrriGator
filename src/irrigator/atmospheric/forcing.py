@@ -26,7 +26,7 @@ from pyproj import Transformer
 from irrigator.atmospheric.precip_bias_correction import BiasCorrection
 from irrigator.atmospheric.radiation_correction import correct_radiation
 from irrigator.atmospheric.temperature_downscale import correct_temperature
-from irrigator.config import ParcelConfig, RegionConfig
+from irrigator.config import ParcelConfig
 from irrigator.static_layers.terrain import TerrainParams
 
 logger = logging.getLogger(__name__)
@@ -147,7 +147,6 @@ def extract_parcel_forcing(
     -------
     DailyForcing time series for the parcel.
     """
-    
 
     # Step 1: extract at nearest grid cell
     cell = era5_daily.sel(longitude=parcel.lon, latitude=parcel.lat, method="nearest")

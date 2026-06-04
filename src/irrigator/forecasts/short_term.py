@@ -19,13 +19,12 @@ DailyForcing to predict stress within the forecast horizon.
 from __future__ import annotations
 
 import logging
-from datetime import date
 
 import numpy as np
 import pandas as pd
 import xarray as xr
 
-from irrigator.atmospheric.forcing import DailyForcing, extract_parcel_forcing
+from irrigator.atmospheric.forcing import DailyForcing
 from irrigator.config import ParcelConfig
 from irrigator.crop.phenology import CropParams, advance_crop
 from irrigator.static_layers.soil import SoilProfile

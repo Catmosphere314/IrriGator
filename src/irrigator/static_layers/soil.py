@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 import xarray as xr
@@ -193,7 +192,7 @@ def extract_soil_from_grid(
     ds = _load_soil_netcdf(cfg)
     x, y = _parcel_to_l93(parcel)
 
-    fc = _extract_grid_values(ds, x, y, "fc") 
+    fc = _extract_grid_values(ds, x, y, "fc")
     wp = _extract_grid_values(ds, x, y, "wp")
     ks = _extract_grid_values(ds, x, y, "ks")
     total_awc = float(ds["total_awc_mm"].sel(x=x, y=y, method="nearest"))

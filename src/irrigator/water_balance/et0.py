@@ -3,17 +3,17 @@
 Ref:pyet
 """
 
-import pyet
 import numpy as np
 import pandas as pd
+import pyet
 
 from irrigator.atmospheric import DailyForcing
 from irrigator.static_layers import TerrainParams
 
 
-def compute_et0(daily_forcing: DailyForcing, terrain: TerrainParams, lat_deg : float):
+def compute_et0(daily_forcing: DailyForcing, terrain: TerrainParams, lat_deg: float):
     """Compute the FAO-56 Penman-Monteith reference ET.
-    
+
     Parameters
     ---------
     daily_forcing : DailyForcing from Block 2 (Atmospheric)

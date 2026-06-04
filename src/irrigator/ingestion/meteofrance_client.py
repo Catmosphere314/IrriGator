@@ -33,9 +33,8 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
-from typing import Any
 
 import requests
 import xarray as xr
@@ -89,7 +88,7 @@ def _get_api_key() -> str:
     return key
 
 
-def _api_session(api_key : str | None = None) -> requests.Session:
+def _api_session(api_key: str | None = None) -> requests.Session:
     """Build a requests session with auth headers."""
     session = requests.Session()
     if api_key is None:

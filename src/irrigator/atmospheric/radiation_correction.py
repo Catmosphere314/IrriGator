@@ -15,7 +15,6 @@ surface to radiation on a horizontal surface, averaged over the day.
 from __future__ import annotations
 
 import logging
-from datetime import date
 
 import numpy as np
 

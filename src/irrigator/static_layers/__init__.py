@@ -19,4 +19,4 @@ Typical usage::
 from irrigator.static_layers.soil import SoilProfile, get_soil_profile
 from irrigator.static_layers.terrain import TerrainParams, get_terrain_params
 
-__all__ = ["SoilProfile", "get_soil_profile", "TerrainParams", "get_terrain_params"]
+__all__ = ["SoilProfile", "TerrainParams", "get_soil_profile", "get_terrain_params"]

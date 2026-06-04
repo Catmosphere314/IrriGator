@@ -67,7 +67,9 @@ def _find_dem_dir(cfg: RegionConfig) -> Path:
     return dem_dir
 
 
-def _mosaic_dem_tiles(dem_dir: Path, cfg_code : str | int) -> tuple[np.ndarray, rasterio.Affine, rasterio.crs.CRS]:
+def _mosaic_dem_tiles(
+    dem_dir: Path, cfg_code: str | int
+) -> tuple[np.ndarray, rasterio.Affine, rasterio.crs.CRS]:
     """Mosaic all DEM tiles in the directory into a single array.
 
     Supports .tif, .tiff, and .asc (ESRI ASCII Grid) files.
@@ -88,7 +90,7 @@ def _mosaic_dem_tiles(dem_dir: Path, cfg_code : str | int) -> tuple[np.ndarray, 
 
     datasets = [rasterio.open(p) for p in tile_paths]
     mosaic, transform = merge(datasets)
-    crs = "EPSG:5698" # datasets[0].crs 
+    crs = "EPSG:5698"  # datasets[0].crs
 
     for ds in datasets:
         ds.close()

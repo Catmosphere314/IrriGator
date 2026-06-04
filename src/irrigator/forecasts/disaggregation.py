@@ -30,7 +30,13 @@ import logging
 from dataclasses import dataclass
 from datetime import date
 from sklearn.decomposition import PCA
-from scipy.spatial.distance import mahalanobis
+from irrigator.forecasts.pca_framework import (
+    select_candidate,
+    mahalanobis_candidates,
+    fit_monthly_gridcell_pca,
+    transform_to_pca,
+    GriddedPCA,
+)
 
 import numpy as np
 import pandas as pd
@@ -42,7 +48,15 @@ from irrigator.config import RegionConfig
 logger = logging.getLogger(__name__)
 
 # Variables used for analog matching
-MATCHING_VARIABLES = ["t_mean", "precip_mm", "rs_mj"]
+MATCHING_VARIABLES = [
+    "t_mean",  # thermal regime
+    "t_max",  # heat extremes (drives ET peaks)
+    "dewpoint",  # humidity — critical for VPD and ETc
+    "precip_mm",  # water supply
+    "rs_mj",  # radiation budget
+    "wind_speed_10m",  # wind regime
+    "soil_moisture_l1",  # antecedent conditions
+]
 
 SEAS5_RESOLUTION_DEG = 1.0  # ~1° grid for matching
 
@@ -121,77 +135,78 @@ def _coarsen_to_seas5(
 # ---------------------------------------------------------------------------
 
 
-def build_historical_monthly_stats(
+# def build_historical_monthly_stats(
+#     era5_daily: xr.Dataset,
+#     bbox_wgs84: tuple[float, float, float, float] | None = None,
+#     variables: list[str] = MATCHING_VARIABLES,
+# ) -> tuple[pd.DataFrame, xr.Dataset]:
+#     """Build monthly statistics at SEAS5 resolution for analog matching.
+
+#     Also returns the coarsened monthly dataset for spatial matching.
+
+#     Parameters
+#     ----------
+#     era5_daily : ERA5-Land daily at native resolution
+#     bbox_wgs84 : optional (west, south, east, north) to clip
+#     variables : which variables to use
+
+#     Returns
+#     -------
+#     (stats_df, coarse_monthly)
+#         stats_df: DataFrame indexed by (year, month) with spatial-mean values
+#         coarse_monthly: xr.Dataset at ~1° monthly resolution (for spatial matching)
+#     """
+#     ds = era5_daily
+#     if bbox_wgs84:
+#         w, s, e, n = bbox_wgs84
+#         lat_name = "latitude" if "latitude" in ds.dims else "y"
+#         lon_name = "longitude" if "longitude" in ds.dims else "x"
+#         ds = ds.sel({lat_name: slice(n, s), lon_name: slice(w, e)})
+
+#     # Coarsen to SEAS5 resolution
+#     coarse = _coarsen_to_seas5(ds)
+
+#     # Monthly aggregation
+#     monthly_parts = {}
+#     for var in variables:
+#         if var not in coarse.data_vars:
+#             continue
+#         if "precip" in var:
+#             monthly_parts[var] = coarse[var].resample(valid_time="1ME").sum()
+#         else:
+#             monthly_parts[var] = coarse[var].resample(valid_time="1ME").mean()
+
+#     coarse_monthly = xr.Dataset(monthly_parts)
+
+#     # Spatial mean for the d-sphere matching
+#     lat_dim = "latitude" if "latitude" in coarse_monthly.dims else "y"
+#     lon_dim = "longitude" if "longitude" in coarse_monthly.dims else "x"
+#     spatial_mean = coarse_monthly.mean(dim=[lat_dim, lon_dim])
+
+#     records = []
+#     for t in spatial_mean.valid_time.values:
+#         ts = pd.Timestamp(t)
+#         row = {"year": ts.year, "month": ts.month}
+#         for var in variables:
+#             if var in spatial_mean.data_vars:
+#                 row[var] = float(spatial_mean[var].sel(valid_time=t))
+#         records.append(row)
+
+#     stats_df = pd.DataFrame(records).set_index(["year", "month"])
+
+#     logger.info(
+#         "Historical stats at 1°: %d months, %d variables",
+#         len(stats_df),
+#         len([v for v in variables if v in stats_df.columns]),
+#     )
+#     return stats_df, coarse_monthly
+
+
+def build_historical_pca(
     era5_daily: xr.Dataset,
     bbox_wgs84: tuple[float, float, float, float] | None = None,
     variables: list[str] = MATCHING_VARIABLES,
-) -> tuple[pd.DataFrame, xr.Dataset]:
-    """Build monthly statistics at SEAS5 resolution for analog matching.
-
-    Also returns the coarsened monthly dataset for spatial matching.
-
-    Parameters
-    ----------
-    era5_daily : ERA5-Land daily at native resolution
-    bbox_wgs84 : optional (west, south, east, north) to clip
-    variables : which variables to use
-
-    Returns
-    -------
-    (stats_df, coarse_monthly)
-        stats_df: DataFrame indexed by (year, month) with spatial-mean values
-        coarse_monthly: xr.Dataset at ~1° monthly resolution (for spatial matching)
-    """
-    ds = era5_daily
-    if bbox_wgs84:
-        w, s, e, n = bbox_wgs84
-        lat_name = "latitude" if "latitude" in ds.dims else "y"
-        lon_name = "longitude" if "longitude" in ds.dims else "x"
-        ds = ds.sel({lat_name: slice(n, s), lon_name: slice(w, e)})
-
-    # Coarsen to SEAS5 resolution
-    coarse = _coarsen_to_seas5(ds)
-
-    # Monthly aggregation
-    monthly_parts = {}
-    for var in variables:
-        if var not in coarse.data_vars:
-            continue
-        if "precip" in var:
-            monthly_parts[var] = coarse[var].resample(valid_time="1ME").sum()
-        else:
-            monthly_parts[var] = coarse[var].resample(valid_time="1ME").mean()
-
-    coarse_monthly = xr.Dataset(monthly_parts)
-
-    # Spatial mean for the d-sphere matching
-    lat_dim = "latitude" if "latitude" in coarse_monthly.dims else "y"
-    lon_dim = "longitude" if "longitude" in coarse_monthly.dims else "x"
-    spatial_mean = coarse_monthly.mean(dim=[lat_dim, lon_dim])
-
-    records = []
-    for t in spatial_mean.valid_time.values:
-        ts = pd.Timestamp(t)
-        row = {"year": ts.year, "month": ts.month}
-        for var in variables:
-            if var in spatial_mean.data_vars:
-                row[var] = float(spatial_mean[var].sel(valid_time=t))
-        records.append(row)
-
-    stats_df = pd.DataFrame(records).set_index(["year", "month"])
-
-    logger.info(
-        "Historical stats at 1°: %d months, %d variables",
-        len(stats_df),
-        len([v for v in variables if v in stats_df.columns]),
-    )
-    return stats_df, coarse_monthly
-
-def build_historical_pca(
-        era5_daily: xr.Dataset,
-        bbox_wgs84: tuple[float, float, float, float] | None = None,
-        variables: list[str] = MATCHING_VARIABLES,
-        ):
+):
     """Perform a PCA on historical observation."""
 
     ds = era5_daily
@@ -215,29 +230,13 @@ def build_historical_pca(
             monthly_parts[var] = coarse[var].resample(valid_time="1ME").mean()
 
     coarse_monthly = xr.Dataset(monthly_parts)
-
-    # Find a way to filter month and then scale on that + PCA
-    lat_vals = coarse_monthly.coords.latitude.values
-    lon_vals = coarse_monthly.coords.longitude.values
-
-    for lat,lon, month in zip(lat_vals, lon_vals, range(12)):
-        cell_ij = coarse_monthly.sel(latitude = lat, longitude = lon)
-        # Standardize
-        grid_mu = cell_ij.mean(["valid_time"])
-        grid_std = cell_ij.std(["valid_time"])
-        # grid_std = grid_std.clip()
-
-        # convert to numpy array
-
-        # PCA TIME
-        pca = PCA()
-        pca.fit(cell_array)
-
-        
-
-
-
-
+    monthly_pca = fit_monthly_gridcell_pca(
+        ds=coarse_monthly,
+        variables=variables,
+        n_components=None,
+        standardize=True,
+    )
+    return monthly_pca
 
 
 # ---------------------------------------------------------------------------
@@ -245,92 +244,88 @@ def build_historical_pca(
 # ---------------------------------------------------------------------------
 
 
-def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Cosine similarity between two vectors."""
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    if norm_a < 1e-12 or norm_b < 1e-12:
-        return 0.0
-    return float(np.dot(a, b) / (norm_a * norm_b))
+# def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+#     """Cosine similarity between two vectors."""
+#     norm_a = np.linalg.norm(a)
+#     norm_b = np.linalg.norm(b)
+#     if norm_a < 1e-12 or norm_b < 1e-12:
+#         return 0.0
+#     return float(np.dot(a, b) / (norm_a * norm_b))
 
 
-def find_analogs(
-    historical_stats: pd.DataFrame,
-    target_values: dict[str, float],
-    target_month: int,
-    variables: list[str] = MATCHING_VARIABLES,
-    k: int = 5,
-) -> list[tuple[int, int, float]]:
-    """Find k most similar historical months on the d-sphere.
+# def find_analogs(
+#     historical_stats: pd.DataFrame,
+#     target_values: dict[str, float],
+#     target_month: int,
+#     variables: list[str] = MATCHING_VARIABLES,
+#     k: int = 5,
+# ) -> list[tuple[int, int, float]]:
+#     """Find k most similar historical months on the d-sphere.
 
-    Matching is at SEAS5 resolution (spatial means at 1°).
+#     Matching is at SEAS5 resolution (spatial means at 1°).
 
-    Parameters
-    ----------
-    historical_stats : from build_historical_monthly_stats
-    target_values : SEAS5 corrected monthly values (spatial mean)
-    target_month : calendar month to match
-    variables : matching variables
-    k : number of analogs
+#     Parameters
+#     ----------
+#     historical_stats : from build_historical_monthly_stats
+#     target_values : SEAS5 corrected monthly values (spatial mean)
+#     target_month : calendar month to match
+#     variables : matching variables
+#     k : number of analogs
 
-    Returns
-    -------
-    List of (year, month, cosine_similarity), best first.
-    """
-    candidates = historical_stats.loc[
-        historical_stats.index.get_level_values("month") == target_month
-    ]
+#     Returns
+#     -------
+#     List of (year, month, cosine_similarity), best first.
+#     """
+#     candidates = historical_stats.loc[
+#         historical_stats.index.get_level_values("month") == target_month
+#     ]
 
-    available_vars = [v for v in variables if v in candidates.columns and v in target_values]
-    if not available_vars:
-        return []
+#     available_vars = [v for v in variables if v in candidates.columns and v in target_values]
+#     if not available_vars:
+#         return []
 
-    # Standardize using historical distribution
-    hist_matrix = candidates[available_vars].values
-    target_vec = np.array([target_values[v] for v in available_vars])
+#     # Standardize using historical distribution
+#     hist_matrix = candidates[available_vars].values
+#     target_vec = np.array([target_values[v] for v in available_vars])
 
-    mu = hist_matrix.mean(axis=0)
-    sigma = hist_matrix.std(axis=0)
-    sigma[sigma < 1e-12] = 1.0
+#     mu = hist_matrix.mean(axis=0)
+#     sigma = hist_matrix.std(axis=0)
+#     sigma[sigma < 1e-12] = 1.0
 
-    hist_std = (hist_matrix - mu) / sigma
-    target_std = (target_vec - mu) / sigma
+#     hist_std = (hist_matrix - mu) / sigma
+#     target_std = (target_vec - mu) / sigma
 
-    # Normalize to unit sphere
-    target_unit = target_std / (np.linalg.norm(target_std) + 1e-12)
+#     # Normalize to unit sphere
+#     target_unit = target_std / (np.linalg.norm(target_std) + 1e-12)
 
-    similarities = []
-    for i, (idx, _) in enumerate(candidates.iterrows()):
-        hist_unit = hist_std[i] / (np.linalg.norm(hist_std[i]) + 1e-12)
-        sim = _cosine_similarity(target_unit, hist_unit)
-        year, month = idx
-        similarities.append((year, month, sim))
+#     similarities = []
+#     for i, (idx, _) in enumerate(candidates.iterrows()):
+#         hist_unit = hist_std[i] / (np.linalg.norm(hist_std[i]) + 1e-12)
+#         sim = _cosine_similarity(target_unit, hist_unit)
+#         year, month = idx
+#         similarities.append((year, month, sim))
 
-    similarities.sort(key=lambda x: x[2], reverse=True)
-    return similarities[:k]
-
-
+#     similarities.sort(key=lambda x: x[2], reverse=True)
+#     return similarities[:k]
 
 
-def mahalanobis():
-
-
-
-
-def find_analog_cell():
-    # 1 - get candidates (month x cell)
-
-    # 2 - Normalize Covariates
-
-    # 3 - perform PCA over all candidates for each cell
-
-    # 4 - Mahalanobis distance between PCA-transformed Forecast and Historic
-
-    # 5 - Soft vote based decision 
-
-
-
-
+def find_analogs_pca(
+    pca_model: GriddedPCA,
+    new_ds: xr.Dataset,
+    variables: list[str],
+    method: str = "soft",
+) -> tuple[pd.Timestamp, dict]:
+    """Determine the best candidate for a given month."""
+    new_pca = transform_to_pca(new_ds=new_ds, pca_model=pca_model, variables=variables)
+    mahalanobis_dist, mahalanobis_score = mahalanobis_candidates(
+        pca_model=pca_model,
+        new_pc_scores=new_pca,
+    )
+    candidate = select_candidate(
+        mahalanobis_score=mahalanobis_score,
+        method=method,
+    )
+    return candidate
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +399,7 @@ def generate_seasonal_scenarios(
     init_month: int,
     n_leads: int = 6,
     variables: list[str] = MATCHING_VARIABLES,
+    method: str = "soft",
 ) -> list[SeasonalScenario]:
     """Generate gridded daily scenarios from SEAS5 ensemble.
 
@@ -419,6 +415,7 @@ def generate_seasonal_scenarios(
     init_month : SEAS5 initialization month
     n_leads : number of lead months
     variables : variables for analog matching
+    method : method to use for candidate selection ["hard","soft"]
 
     Returns
     -------
@@ -428,7 +425,6 @@ def generate_seasonal_scenarios(
     bbox = cfg.bbox_wgs84.as_tuple()
     # hist_stats, _ = build_historical_monthly_stats(era5_daily, bbox, variables)
     hist_pca = build_historical_pca(era5_daily, bbox, variables)
-    
 
     # Identify dimensions
     member_dim = None
@@ -443,11 +439,11 @@ def generate_seasonal_scenarios(
             lead_dim = cand
             break
 
-    n_members = seas5_corrected.sizes.get(member_dim, 1) if member_dim else 1
+    # n_members = seas5_corrected.sizes.get(member_dim, 1) if member_dim else 1
     member_ids = seas5_corrected[member_dim].values if member_dim else [0]
 
-    lat_dim = "latitude" if "latitude" in seas5_corrected.dims else "lat"
-    lon_dim = "longitude" if "longitude" in seas5_corrected.dims else "lon"
+    # lat_dim = "latitude" if "latitude" in seas5_corrected.dims else "lat"
+    # lon_dim = "longitude" if "longitude" in seas5_corrected.dims else "lon"
     time_dim = "valid_time" if "valid_time" in era5_daily.dims else "time"
 
     scenarios = []
@@ -466,7 +462,7 @@ def generate_seasonal_scenarios(
             if lead_dim:
                 sel[lead_dim] = lead
 
-            cell = seas5_corrected.sel(**sel)#.mean(dim=[lat_dim, lon_dim])
+            cell = seas5_corrected.sel(**sel)  # .mean(dim=[lat_dim, lon_dim])
             # target_values = {}
             # for var in variables:
             #     if var in cell.data_vars:
@@ -477,11 +473,17 @@ def generate_seasonal_scenarios(
 
             # Match at 1° resolution
             # analogs = find_analogs(hist_stats, target_values, valid_month, variables, k=3)
-            analogs = find_analogs(hist_pca, cell, valid_month, variables)
+            analogs = find_analogs_pca(
+                pca_model=hist_pca,
+                new_ds=cell,
+                variables=variables,
+                method=method,
+            )
             if not analogs:
                 continue
 
-            best_year, best_month, similarity = analogs[0]
+            # best_year, best_month, similarity = analogs[0]
+            best_year, best_month, similarity = analogs[1]["best_year"], analogs[1]["best_month"], analogs[1]["best_score"]
 
             member_analogs.append(
                 AnalogMatch(
@@ -495,10 +497,10 @@ def generate_seasonal_scenarios(
 
             # Extract at ERA5-Land native resolution
             month_ds = extract_analog_daily_gridded(
-                era5_daily,
-                best_year,
-                best_month,
-                target_values,
+                era5_daily=era5_daily,
+                analog_year=best_year,
+                analog_month=best_month,
+                #seas5_monthly_target=target_values, TO DO : CHECK IF NECESSARY TO SCALE
             )
             monthly_datasets.append(month_ds)
 

@@ -251,7 +251,6 @@ def run_simulation(
     dr = initial_depletion_frac * taw_init
     taw_prev = taw_init
     gdd_prev = 0.0
-    print(taw_prev)
 
     states: list[WaterBalanceState] = []
 
@@ -265,7 +264,6 @@ def run_simulation(
         irrigation = irrigation_schedule.get(current_date, 0.0)
 
         # Step 1: advance crop
-        print(gdd_prev)
         crop = advance_crop(current_date, t_min, t_max, gdd_prev, crop_params)
 
         # Step 2: water balance

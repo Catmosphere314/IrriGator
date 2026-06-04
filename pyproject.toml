@@ -9,7 +9,7 @@ description = "Open project irrigation decision support for maize — soil water
 readme = "README.md"
 license = "PolyForm-Noncommercial-1.0.0"
 license-files = [
-    "PolyForm-Noncommercial-1.0.0.md",
+    "LICENSE",
     "COMMERCIAL.md",
     "DATA_SOURCES.md",
 ]

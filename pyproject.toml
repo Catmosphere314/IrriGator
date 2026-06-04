@@ -81,9 +81,9 @@ all = ["irrigator[dev,viz,notebooks]"]
 irrigator = "irrigator.cli:main"
 
 [project.urls]
-Repository = "https://github.com/Catmosphere314/irrigator"
+Repository = "https://github.com/Catmosphere314/Irrigator"
 "Commercial Licensing" = "mailto:mathys.baldacchino@catmosphere.fr"
-Issues = "https://github.com/Catmosphere314/irrigator/issues"
+Issues = "https://github.com/Catmosphere314/Irrigator/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/irrigator"]

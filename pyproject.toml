@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling >= 1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -7,7 +7,12 @@ name = "irrigator"
 version = "0.1.0"
 description = "Open-source irrigation decision support for maize — soil water balance, crop modeling, and forecast integration"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = [
+    "LICENSE",
+    "COMMERCIAL.md",
+    "DATA_SOURCES.md",
+]
 requires-python = ">=3.10"
 keywords = ["irrigation", "agriculture", "hydrology", "maize", "water-balance", "FAO-56", "evapotranspiration"]
 classifiers = [
@@ -76,8 +81,9 @@ all = ["irrigator[dev,viz,notebooks]"]
 irrigator = "irrigator.cli:main"
 
 [project.urls]
-Repository = "https://github.com/YOURUSER/irrigator"
-Issues = "https://github.com/YOURUSER/irrigator/issues"
+Repository = "https://github.com/Catmosphere314/irrigator"
+"Commercial Licensing" = "mailto:mathys.baldacchino@catmosphere.fr"
+Issues = "https://github.com/Catmosphere314/irrigator/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/irrigator"]

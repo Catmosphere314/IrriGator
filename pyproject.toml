@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "irrigator"
 version = "0.1.0"
-description = "Open-source irrigation decision support for maize — soil water balance, crop modeling, and forecast integration"
+description = "Open project irrigation decision support for maize — soil water balance, crop modeling, and forecast integration"
 readme = "README.md"
 license = "PolyForm-Noncommercial-1.0.0"
 license-files = [

@@ -83,17 +83,39 @@ Issues = "https://github.com/YOURUSER/irrigator/issues"
 packages = ["src/irrigator"]
 
 [tool.ruff]
-target-version = "py310"
 line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM"]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # import sorting
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "SIM",  # simplify
+    "C4",   # comprehensions
+    "RUF",  # Ruff-specific rules
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short"
 
 [tool.mypy]
-python_version = "3.10"
-warn_return_any = true
+python_version = "3.12"
+strict = true
 warn_unused_configs = true
+warn_return_any = true
+warn_unreachable = true
+exclude = [
+    "^build/",
+    "^dist/",
+    "^.venv/",
+]

@@ -29,10 +29,13 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import date
+from sklearn.decomposition import PCA
+from scipy.spatial.distance import mahalanobis
 
 import numpy as np
 import pandas as pd
 import xarray as xr
+
 
 from irrigator.config import RegionConfig
 
@@ -184,6 +187,58 @@ def build_historical_monthly_stats(
     )
     return stats_df, coarse_monthly
 
+def build_historical_pca(
+        era5_daily: xr.Dataset,
+        bbox_wgs84: tuple[float, float, float, float] | None = None,
+        variables: list[str] = MATCHING_VARIABLES,
+        ):
+    """Perform a PCA on historical observation."""
+
+    ds = era5_daily
+    if bbox_wgs84:
+        w, s, e, n = bbox_wgs84
+        lat_name = "latitude" if "latitude" in ds.dims else "y"
+        lon_name = "longitude" if "longitude" in ds.dims else "x"
+        ds = ds.sel({lat_name: slice(n, s), lon_name: slice(w, e)})
+
+    # Coarsen to SEAS5 resolution
+    coarse = _coarsen_to_seas5(ds)
+
+    # Monthly aggregation
+    monthly_parts = {}
+    for var in variables:
+        if var not in coarse.data_vars:
+            continue
+        if "precip" in var:
+            monthly_parts[var] = coarse[var].resample(valid_time="1ME").sum()
+        else:
+            monthly_parts[var] = coarse[var].resample(valid_time="1ME").mean()
+
+    coarse_monthly = xr.Dataset(monthly_parts)
+
+    # Find a way to filter month and then scale on that + PCA
+    lat_vals = coarse_monthly.coords.latitude.values
+    lon_vals = coarse_monthly.coords.longitude.values
+
+    for lat,lon, month in zip(lat_vals, lon_vals, range(12)):
+        cell_ij = coarse_monthly.sel(latitude = lat, longitude = lon)
+        # Standardize
+        grid_mu = cell_ij.mean(["valid_time"])
+        grid_std = cell_ij.std(["valid_time"])
+        # grid_std = grid_std.clip()
+
+        # convert to numpy array
+
+        # PCA TIME
+        pca = PCA()
+        pca.fit(cell_array)
+
+        
+
+
+
+
+
 
 # ---------------------------------------------------------------------------
 # D-sphere matching
@@ -253,6 +308,29 @@ def find_analogs(
 
     similarities.sort(key=lambda x: x[2], reverse=True)
     return similarities[:k]
+
+
+
+
+def mahalanobis():
+
+
+
+
+def find_analog_cell():
+    # 1 - get candidates (month x cell)
+
+    # 2 - Normalize Covariates
+
+    # 3 - perform PCA over all candidates for each cell
+
+    # 4 - Mahalanobis distance between PCA-transformed Forecast and Historic
+
+    # 5 - Soft vote based decision 
+
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +426,9 @@ def generate_seasonal_scenarios(
     """
     # Step 1: build historical stats at SEAS5 resolution (1°)
     bbox = cfg.bbox_wgs84.as_tuple()
-    hist_stats, _ = build_historical_monthly_stats(era5_daily, bbox, variables)
+    # hist_stats, _ = build_historical_monthly_stats(era5_daily, bbox, variables)
+    hist_pca = build_historical_pca(era5_daily, bbox, variables)
+    
 
     # Identify dimensions
     member_dim = None
@@ -386,17 +466,18 @@ def generate_seasonal_scenarios(
             if lead_dim:
                 sel[lead_dim] = lead
 
-            cell = seas5_corrected.sel(**sel).mean(dim=[lat_dim, lon_dim])
-            target_values = {}
-            for var in variables:
-                if var in cell.data_vars:
-                    target_values[var] = float(cell[var])
+            cell = seas5_corrected.sel(**sel)#.mean(dim=[lat_dim, lon_dim])
+            # target_values = {}
+            # for var in variables:
+            #     if var in cell.data_vars:
+            #         target_values[var] = float(cell[var])
 
-            if not target_values:
-                continue
+            # if not target_values:
+            #     continue
 
             # Match at 1° resolution
-            analogs = find_analogs(hist_stats, target_values, valid_month, variables, k=3)
+            # analogs = find_analogs(hist_stats, target_values, valid_month, variables, k=3)
+            analogs = find_analogs(hist_pca, cell, valid_month, variables)
             if not analogs:
                 continue
 

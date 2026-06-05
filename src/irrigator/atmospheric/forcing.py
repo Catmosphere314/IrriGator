@@ -98,6 +98,51 @@ class DailyForcing:
             precip_mm=self.precip_mm[mask],
         )
 
+    # def concat(self, other: DailyForcing) -> DailyForcing:
+    #     """Concatenate two DailyForcing objects in time.
+
+    #     If dates overlap, the OTHER (later-appended) values take precedence,
+    #     which is the right behavior for gap-filling: AROME analysis overrides
+    #     any ERA5-Land data for the same day.
+    #     """
+    #     # Find dates in self that are NOT in other (avoid duplicates)
+    #     other_dates_set = set(other.dates.astype("datetime64[D]"))
+    #     keep_mask = np.array([np.datetime64(d, "D") not in other_dates_set for d in self.dates])
+
+    #     return DailyForcing(
+    #         dates=np.concatenate([self.dates[keep_mask], other.dates]),
+    #         t_min=np.concatenate([self.t_min[keep_mask], other.t_min]),
+    #         t_max=np.concatenate([self.t_max[keep_mask], other.t_max]),
+    #         t_mean=np.concatenate([self.t_mean[keep_mask], other.t_mean]),
+    #         dewpoint=np.concatenate([self.dewpoint[keep_mask], other.dewpoint]),
+    #         wind_speed_2m=np.concatenate([self.wind_speed_2m[keep_mask], other.wind_speed_2m]),
+    #         pressure_kpa=np.concatenate([self.pressure_kpa[keep_mask], other.pressure_kpa]),
+    #         rs_mj=np.concatenate([self.rs_mj[keep_mask], other.rs_mj]),
+    #         precip_mm=np.concatenate([self.precip_mm[keep_mask], other.precip_mm]),
+    #     )
+
+    def concat(self, other: DailyForcing) -> DailyForcing:
+        """Concatenate two DailyForcing objects in time.
+
+        Self takes precedence on overlapping dates. This means:
+            era5.concat(arome)  → ERA5-Land kept, AROME fills gaps only
+            arome.concat(forecast) → AROME kept, forecast appended
+        """
+        # Keep all of self. Only add dates from other that don't exist in self.
+        self_dates_set = set(self.dates.astype("datetime64[D]"))
+        new_mask = np.array([np.datetime64(d, "D") not in self_dates_set for d in other.dates])
+
+        return DailyForcing(
+            dates=np.concatenate([self.dates, other.dates[new_mask]]),
+            t_min=np.concatenate([self.t_min, other.t_min[new_mask]]),
+            t_max=np.concatenate([self.t_max, other.t_max[new_mask]]),
+            t_mean=np.concatenate([self.t_mean, other.t_mean[new_mask]]),
+            dewpoint=np.concatenate([self.dewpoint, other.dewpoint[new_mask]]),
+            wind_speed_2m=np.concatenate([self.wind_speed_2m, other.wind_speed_2m[new_mask]]),
+            pressure_kpa=np.concatenate([self.pressure_kpa, other.pressure_kpa[new_mask]]),
+            rs_mj=np.concatenate([self.rs_mj, other.rs_mj[new_mask]]),
+            precip_mm=np.concatenate([self.precip_mm, other.precip_mm[new_mask]]),
+        )
 
 # ---------------------------------------------------------------------------
 # Wind height conversion

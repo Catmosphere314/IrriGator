@@ -1,13 +1,25 @@
 """IrriGator Block 5 — Forecast integration.
 
-Short-term (AROME/ARPEGE, 2-4 days):
-    Forward water balance to detect imminent stress.
+Short-term:
+    AROME deterministic (0-48h) + IFS ENS probabilistic (0-15 days)
+    → Blended ensemble stress report
 
-Seasonal (SEAS5, 1-6 months):
-    Analog-based disaggregation of ensemble members into daily scenarios.
-    Probabilistic irrigation demand over the season.
+Seasonal:
+    SEAS5 → PCA analog matching → daily scenarios → seasonal outlook
 """
 
-from irrigator.forecasts.short_term import run_forward_balance, will_stress_occur
+from irrigator.forecasts.short_term import (
+    DailyEnsembleStats,
+    EnsembleStressReport,
+    run_ensemble_forward_balance,
+    run_forward_balance,
+    will_stress_occur,
+)
 
-__all__ = ["run_forward_balance", "will_stress_occur"]
+__all__ = [
+    "DailyEnsembleStats",
+    "EnsembleStressReport",
+    "run_ensemble_forward_balance",
+    "run_forward_balance",
+    "will_stress_occur",
+]

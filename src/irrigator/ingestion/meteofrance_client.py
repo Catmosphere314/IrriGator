@@ -321,6 +321,17 @@ def fetch_latest_forecasts(cfg: RegionConfig) -> dict[str, Path]:
     return results
 
 
+def fetch_arome_analysis_daily(cfg, target_date, run_hour=0):
+    """Fetch AROME 00Z run for one day (steps 0-23h).
+
+    Used to bridge the ERA5-Land ~5-day latency gap.
+    Returns path to downloaded GRIB, ready for daily processing.
+
+    NEED TO CHECK HOW TO JUST SELECT THE FIRST 00-23H!!!!!!!!!!!
+    """
+    return fetch_forecast(cfg, "arome", target_date, run_hour)
+
+
 def open_forecast(path: Path) -> xr.Dataset:
     """Open a downloaded forecast file.
 

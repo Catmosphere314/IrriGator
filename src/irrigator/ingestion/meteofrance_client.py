@@ -343,3 +343,4 @@ def open_forecast(path: Path) -> xr.Dataset:
         return xr.open_dataset(path, engine="cfgrib")
     else:
         return xr.open_dataset(path)
+    

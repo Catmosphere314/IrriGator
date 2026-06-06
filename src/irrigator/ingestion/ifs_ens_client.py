@@ -35,6 +35,7 @@ from pathlib import Path
 
 import numpy as np
 import xarray as xr
+import pandas as pd
 
 from irrigator.config import RegionConfig
 
@@ -311,7 +312,7 @@ def open_ifs_ens(path: Path, cfg: RegionConfig) -> xr.Dataset:
     return ds
 
 
-def process_ifs_ens_to_daily(ds: xr.Dataset) -> xr.Dataset:
+def process_ifs_ens_to_daily(ds: xr.Dataset, shift_utc: int = 0) -> xr.Dataset:
     """Convert IFS ENS hourly/6-hourly data to daily format.
 
     Handles step-accumulation for tp and ssrd (same convention as ERA5-Land).
@@ -325,6 +326,8 @@ def process_ifs_ens_to_daily(ds: xr.Dataset) -> xr.Dataset:
         ref_time = ds.time if "time" in ds.coords else ds.coords.get("forecast_reference_time")
         if ref_time is not None:
             ds = ds.assign_coords(valid_time=ref_time + ds.step).swap_dims({"step": "valid_time"})
+
+    ds = ds.assign_coords(valid_time=ds.valid_time + pd.Timedelta(f"{shift_utc}h"))
 
     # Handle accumulated variables (tp, ssrd) — diff to get per-step values
     for acc_var in ["tp", "ssrd"]:

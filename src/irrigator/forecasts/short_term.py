@@ -38,6 +38,8 @@ logger = logging.getLogger(__name__)
 def standardize_forecast_to_era5_format(
     forecast_ds: xr.Dataset,
     source: str = "arpege",
+    shift_utc : int = 0,
+
 ) -> xr.Dataset:
     """Rename/convert a forecast dataset to match ERA5-Land daily format.
 
@@ -84,6 +86,8 @@ def standardize_forecast_to_era5_format(
     for old_time in ("time", "step", "forecast_time"):
         if old_time in result.dims and "valid_time" not in result.dims:
             result = result.rename({old_time: "valid_time"})
+    
+    result = result.assign_coords(valid_time=result.valid_time + pd.Timedelta(f"{shift_utc}h"))
 
     return result
 

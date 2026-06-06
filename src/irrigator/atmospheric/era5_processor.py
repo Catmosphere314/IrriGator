@@ -52,13 +52,15 @@ def _find_var(ds: xr.Dataset, candidates: list[str]) -> str:
     raise KeyError(f"None of {candidates} found in dataset. Available: {list(ds.data_vars)}")
 
 
-def process_era5_to_daily(ds: xr.Dataset) -> xr.Dataset:
+def process_era5_to_daily(ds: xr.Dataset, shift_utc : int = 0) -> xr.Dataset:
     """Convert ERA5-Land hourly dataset to daily aggregates.
 
     Parameters
     ----------
     ds : xr.Dataset
         Hourly ERA5-Land data (from open_era5_land or open_mfdataset).
+    shift_utc : shift to apply compared to UTC, 0 default, 
+        can be set to 1 for French time (omitting the time change)
 
     Returns
     -------
@@ -66,6 +68,8 @@ def process_era5_to_daily(ds: xr.Dataset) -> xr.Dataset:
         t_min, t_max, t_mean, dewpoint, wind_speed_10m,
         pressure_kpa, rs_mj, precip_mm
     """
+    # Shift UTC → CET before daily aggregation
+    ds = ds.assign_coords(valid_time=ds.valid_time + pd.Timedelta(f"{shift_utc}h"))
     # Identify variable names (ERA5 naming varies between CDS versions)
     t2m = _find_var(ds, ["t2m", "2m_temperature", "VAR_2T"])
     d2m = _find_var(ds, ["d2m", "2m_dewpoint_temperature", "VAR_2D"])

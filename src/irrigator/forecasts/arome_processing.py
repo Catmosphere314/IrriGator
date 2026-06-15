@@ -795,6 +795,48 @@ def sync_forecast(overwrite: bool = False, delete_raw: bool = DELETE_RAW) -> dic
     return results
 
 
+def load_arome_daily_cache(
+    start_date: date,
+    end_date: date,
+    mode: str = "static",
+) -> xr.Dataset:
+    """Load cached AROME daily grids.
+
+    Args:
+        start_date : first date of files to load
+        end_date : last date included in the loading
+        mode : ["static","dynamic", forecast"]
+
+    Notes:
+        For past-present completion, static/dynamic should be used.
+        For forecasts, use forecast mode.
+
+    """
+    files = []
+    missing = []
+    current = start_date
+
+    while current <= end_date:
+        fname = f"arome_daily_{current.isoformat()}.nc"
+        mode_dir = DAILY_DIR / mode / fname
+
+        if mode_dir.exists():
+            files.append(mode_dir)
+        else:
+            missing.append(current)
+
+        current += timedelta(days=1)
+
+    if missing:
+        logger.warning(
+            "%d missing days: %s%s", len(missing), missing[:5], "..." if len(missing) > 5 else ""
+        )
+    if not files:
+        raise FileNotFoundError(f"No AROME for {start_date} → {end_date}")
+
+    return xr.open_mfdataset(files, combine="by_coords")
+
+
 def main(overwrite, sync_mode):
     if sync_mode == "static":
         results = sync_static(overwrite=overwrite)

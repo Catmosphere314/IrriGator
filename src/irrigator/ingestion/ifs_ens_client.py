@@ -30,11 +30,12 @@ Azure, or via Open-Meteo.
 from __future__ import annotations
 
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 import xarray as xr
+import pandas as pd
 
 from irrigator.config import RegionConfig
 
@@ -51,6 +52,16 @@ IFS_ENS_PARAMS = [
     "tp",  # total precipitation [m]
     "ssrd",  # surface solar rad downward [J/m²]
 ]
+
+CFGRIB_VAR_NAMES = {
+    "2t": "t2m",
+    "2d": "d2m",
+    "10u": "u10",
+    "10v": "v10",
+    "sp": "sp",
+    "tp": "tp",
+    "ssrd": "ssrd",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -117,18 +128,12 @@ def fetch_ifs_ens(
 
     client = Client(source="ecmwf")
 
-    # Area clipping for the region
-    bbox = cfg.bbox_wgs84
-    # Add buffer for interpolation
-    area = [bbox.north + 1, bbox.west - 1, bbox.south - 1, bbox.east + 1]
-
     client.retrieve(
         type="ef",  # ensemble forecast
         date=run_date.isoformat(),
         time=run_hour,
         param=IFS_ENS_PARAMS,
         step=steps,
-        area=area,
         target=str(out_path),
     )
 
@@ -164,41 +169,150 @@ def fetch_latest_ifs_ens(cfg: RegionConfig) -> Path | None:
 # ---------------------------------------------------------------------------
 
 
-def open_ifs_ens(path: Path) -> xr.Dataset:
-    """Open IFS ENS GRIB2 file as xarray Dataset.
-
-    Requires cfgrib engine: pip install cfgrib eccodes
-
-    Returns dataset with dims (number, step, latitude, longitude)
-    where 'number' is the ensemble member (0-50, 0=control).
-    """
-    # cfgrib may split surface and pressure-level vars into separate datasets
-    # Use backend_kwargs to handle this
-    datasets = []
+def _open_cfgrib_group(path: Path, filter_by_keys: dict, bbox: BBoxWGS84) -> xr.Dataset | None:
     try:
-        # Try opening as single dataset first
-        ds = xr.open_dataset(path, engine="cfgrib")
-        datasets.append(ds)
-    except Exception:
-        # Multiple parameter types — open with filter_by_keys
-        for param_type in ["sfc", "pl"]:
-            try:
-                ds = xr.open_dataset(
-                    path,
-                    engine="cfgrib",
-                    backend_kwargs={"filter_by_keys": {"typeOfLevel": "surface"}},
+        ds = xr.open_dataset(
+            path,
+            engine="cfgrib",
+            backend_kwargs={
+                "filter_by_keys": filter_by_keys,
+                # Important while debugging / overwriting GRIB files.
+                # Prevents stale .idx files from being reused.
+                "indexpath": "",
+            },
+            decode_timedelta=True,
+        )
+
+        # Add buffer for interpolation
+        north = bbox.north + 1
+        south = bbox.south - 1
+        west = bbox.west - 1
+        east = bbox.east + 1
+
+        # ECMWF latitude is usually descending
+        ds = ds.sel(latitude=slice(north, south))
+
+        # If longitude is 0..360
+        if float(ds.longitude.max()) > 180:
+            west_360 = west % 360
+            east_360 = east % 360
+
+            if west_360 <= east_360:
+                ds = ds.sel(longitude=slice(west_360, east_360))
+            else:
+                ds = xr.concat(
+                    [
+                        ds.sel(longitude=slice(west_360, 360)),
+                        ds.sel(longitude=slice(0, east_360)),
+                    ],
+                    dim="longitude",
                 )
-                datasets.append(ds)
-            except Exception:
-                pass
+        else:
+            ds = ds.sel(longitude=slice(west, east))
+        return ds
+    except Exception:
+        return None
+
+
+def open_ifs_ens(path: Path, cfg: RegionConfig) -> xr.Dataset:
+    """Open selected IFS ENS GRIB2 variables as one xarray Dataset.
+
+    Handles:
+      - 2 m fields: t2m, d2m
+      - 10 m fields: u10, v10
+      - surface fields: sp, tp, ssrd
+
+    Returns a merged dataset, typically with dims:
+      number, time, step, latitude, longitude
+
+    Notes
+    -----
+    cfgrib cannot always open 2 m, 10 m, and surface variables in one pass
+    because their scalar GRIB coordinates differ, e.g. heightAboveGround=2
+    versus heightAboveGround=10.
+    """
+
+    groups = [
+        # 2 m fields: 2t, 2d
+        {
+            "typeOfLevel": "heightAboveGround",
+            "level": 2,
+        },
+        # 10 m fields: 10u, 10v
+        {
+            "typeOfLevel": "heightAboveGround",
+            "level": 10,
+        },
+        # Surface instantaneous fields, e.g. sp
+        {
+            "typeOfLevel": "surface",
+            "stepType": "instant",
+        },
+        # Surface accumulated fields, e.g. tp, ssrd
+        {
+            "typeOfLevel": "surface",
+            "stepType": "accum",
+        },
+    ]
+
+    datasets: list[xr.Dataset] = []
+
+    for filter_by_keys in groups:
+        ds = _open_cfgrib_group(
+            path=path,
+            filter_by_keys=filter_by_keys,
+            bbox=cfg.bbox_wgs84,
+        )
+
+        if ds is None:
+            continue
+
+        # Keep only variables we care about, if present in this group.
+        wanted = set(CFGRIB_VAR_NAMES.values())
+        present = [v for v in ds.data_vars if v in wanted]
+
+        if not present:
+            continue
+
+        ds = ds[present]
+
+        # Drop scalar GRIB coords that prevent merging:
+        # heightAboveGround=2 vs heightAboveGround=10, etc.
+        ds = ds.drop_vars(
+            [
+                "heightAboveGround",
+                "surface",
+                "stepType",
+            ],
+            errors="ignore",
+        )
+
+        datasets.append(ds)
 
     if not datasets:
-        raise RuntimeError(f"Could not open IFS ENS file: {path}")
+        raise RuntimeError(f"Could not open requested IFS ENS variables from: {path}")
 
-    return xr.merge(datasets) if len(datasets) > 1 else datasets[0]
+    ds = xr.merge(
+        datasets,
+        compat="override",
+        join="outer",
+        combine_attrs="override",
+    )
+
+    # Optional: warn if something is missing.
+    expected = set(CFGRIB_VAR_NAMES.values())
+    missing = sorted(expected - set(ds.data_vars))
+
+    if missing:
+        raise RuntimeError(
+            f"Opened file but missing variables {missing}. "
+            f"Available variables: {sorted(ds.data_vars)}"
+        )
+
+    return ds
 
 
-def process_ifs_ens_to_daily(ds: xr.Dataset) -> xr.Dataset:
+def process_ifs_ens_to_daily(ds: xr.Dataset, shift_utc: int = 0) -> xr.Dataset:
     """Convert IFS ENS hourly/6-hourly data to daily format.
 
     Handles step-accumulation for tp and ssrd (same convention as ERA5-Land).
@@ -212,6 +326,8 @@ def process_ifs_ens_to_daily(ds: xr.Dataset) -> xr.Dataset:
         ref_time = ds.time if "time" in ds.coords else ds.coords.get("forecast_reference_time")
         if ref_time is not None:
             ds = ds.assign_coords(valid_time=ref_time + ds.step).swap_dims({"step": "valid_time"})
+
+    ds = ds.assign_coords(valid_time=ds.valid_time + pd.Timedelta(f"{shift_utc}h"))
 
     # Handle accumulated variables (tp, ssrd) — diff to get per-step values
     for acc_var in ["tp", "ssrd"]:

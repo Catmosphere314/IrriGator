@@ -30,6 +30,8 @@ data/static/
 data/static/*.tif
 data/static/*.nc
 data/static/*.grib
+data/arome_raw/
+data/arome_daily/
 data/sensors/
 
 # API keys and credentials

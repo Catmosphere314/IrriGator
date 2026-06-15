@@ -17,7 +17,7 @@ import numpy as np
 
 from irrigator.config import ParcelConfig
 from irrigator.crop.phenology import CropParams
-from irrigator.forecasts.analog_disaggregation import SeasonalScenario
+from irrigator.forecasts.disaggregation import SeasonalScenario
 from irrigator.static_layers.soil import SoilProfile
 from irrigator.static_layers.terrain import TerrainParams
 from irrigator.water_balance.bucket_model import run_simulation

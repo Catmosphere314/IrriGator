@@ -159,6 +159,30 @@ def fetch_ndvi(region: str, target_date: str, window: int) -> None:
         click.echo("No usable Sentinel-2 scene found.")
 
 
+@fetch.command("ifs-ens")
+@click.option("--region", default="configs/dordogne.yaml", type=click.Path(exists=True))
+@click.option("--date", "run_date", default=None, help="Run date YYYY-MM-DD (default: today)")
+@click.option("--hour", default=0, type=int, help="Run hour (0 or 12)")
+@click.option("--overwrite", is_flag=True)
+def fetch_ifs_ens_cmd(region: str, run_date: str | None, hour: int, overwrite: bool) -> None:
+    """Download ECMWF IFS ENS ensemble forecast (51 members, 15 days).
+
+    No API key needed — uses ECMWF open data (CC-BY-4.0).
+    """
+    from irrigator.ingestion.ifs_ens_client import fetch_ifs_ens, fetch_latest_ifs_ens
+
+    cfg = load_region_config(region)
+    if run_date:
+        path = fetch_ifs_ens(cfg, _parse_date(run_date), hour, overwrite=overwrite)
+    else:
+        path = fetch_latest_ifs_ens(cfg)
+
+    if path:
+        click.echo(f"IFS ENS saved: {path} ({path.stat().st_size / 1e6:.1f} MB)")
+    else:
+        click.echo("Could not fetch IFS ENS — check network connectivity.")
+
+
 # -----------------------------------------------------------------------
 # Static layer processing
 # -----------------------------------------------------------------------

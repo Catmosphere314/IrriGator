@@ -34,12 +34,24 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
-import xarray as xr
 import pandas as pd
+import xarray as xr
 
-from irrigator.config import RegionConfig
+from irrigator.config import BBoxWGS84
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# France metropolitan bounding box (matches cds_client.FRANCE_BBOX)
+# ---------------------------------------------------------------------------
+
+FRANCE_BBOX = BBoxWGS84(north=51.5, south=41.0, west=-6.0, east=10.0)
+
+# ---------------------------------------------------------------------------
+# Default paths — relative to repo root (assumes cwd = repo root)
+# ---------------------------------------------------------------------------
+
+DEFAULT_RAW_DIR = Path("data/raw")
 
 # Variables we need for the irrigation pipeline
 # param codes: https://apps.ecmwf.int/codes/grib/param-db
@@ -69,14 +81,14 @@ CFGRIB_VAR_NAMES = {
 # ---------------------------------------------------------------------------
 
 
-def _output_dir(cfg: RegionConfig) -> Path:
-    out = cfg.raw_dir / "ifs_ens"
+def _output_dir(raw_dir: Path) -> Path:
+    out = raw_dir / "ifs_ens"
     out.mkdir(parents=True, exist_ok=True)
     return out
 
 
 def fetch_ifs_ens(
-    cfg: RegionConfig,
+    raw_dir: Path = DEFAULT_RAW_DIR,
     run_date: date | None = None,
     run_hour: int = 0,
     steps: list[int] | None = None,
@@ -86,7 +98,7 @@ def fetch_ifs_ens(
 
     Parameters
     ----------
-    cfg : RegionConfig
+    raw_dir : output directory (default: data/raw)
     run_date : forecast initialization date (default: today)
     run_hour : initialization hour (0 or 12)
     steps : forecast hours to retrieve (default: 0 to 360 by 6)
@@ -111,7 +123,7 @@ def fetch_ifs_ens(
         # 0 to 360h by 6h = 15 days
         steps = list(range(0, 366, 6))
 
-    out_dir = _output_dir(cfg)
+    out_dir = _output_dir(raw_dir)
     out_path = out_dir / f"ifs_ens_{run_date.isoformat()}_{run_hour:02d}z.grib2"
 
     if out_path.exists() and not overwrite:
@@ -145,7 +157,7 @@ def fetch_ifs_ens(
     return out_path
 
 
-def fetch_latest_ifs_ens(cfg: RegionConfig) -> Path | None:
+def fetch_latest_ifs_ens(raw_dir: Path = DEFAULT_RAW_DIR) -> Path | None:
     """Fetch the most recent available IFS ENS run.
 
     Tries today 00Z, then yesterday 12Z, then yesterday 00Z.
@@ -155,7 +167,7 @@ def fetch_latest_ifs_ens(cfg: RegionConfig) -> Path | None:
 
     for run_date, run_hour in [(today, 0), (yesterday, 12), (yesterday, 0)]:
         try:
-            return fetch_ifs_ens(cfg, run_date, run_hour)
+            return fetch_ifs_ens(raw_dir, run_date, run_hour)
         except Exception as exc:
             logger.debug("IFS ENS %s %02dZ not available: %s", run_date, run_hour, exc)
             continue
@@ -214,13 +226,16 @@ def _open_cfgrib_group(path: Path, filter_by_keys: dict, bbox: BBoxWGS84) -> xr.
         return None
 
 
-def open_ifs_ens(path: Path, cfg: RegionConfig) -> xr.Dataset:
+def open_ifs_ens(path: Path, bbox: BBoxWGS84 = FRANCE_BBOX) -> xr.Dataset:
     """Open selected IFS ENS GRIB2 variables as one xarray Dataset.
 
-    Handles:
-      - 2 m fields: t2m, d2m
-      - 10 m fields: u10, v10
-      - surface fields: sp, tp, ssrd
+    The GRIB is downloaded globally; this slices to the bounding box
+    on read to keep memory manageable.
+
+    Parameters
+    ----------
+    path : GRIB2 file from fetch_ifs_ens
+    bbox : spatial extent for slicing (default: France metropolitan)
 
     Returns a merged dataset, typically with dims:
       number, time, step, latitude, longitude
@@ -261,7 +276,7 @@ def open_ifs_ens(path: Path, cfg: RegionConfig) -> xr.Dataset:
         ds = _open_cfgrib_group(
             path=path,
             filter_by_keys=filter_by_keys,
-            bbox=cfg.bbox_wgs84,
+            bbox=bbox,
         )
 
         if ds is None:

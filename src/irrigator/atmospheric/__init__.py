@@ -13,7 +13,7 @@ Typical workflow::
     cfg = load_region_config("configs/dordogne.yaml")
     parcel = load_parcel_config("configs/parcels/example.yaml")
     terrain = get_terrain_params(cfg, parcel)
-    era5_daily = load_daily(cfg)
+    era5_daily = load_daily()  # uses default data/processed path
 
     forcing = extract_parcel_forcing(era5_daily, parcel, terrain)
     df = forcing.to_dataframe()

@@ -340,6 +340,9 @@ def open_forecast(path: Path) -> xr.Dataset:
     """
     suffix = path.suffix.lower()
     if suffix in (".grib", ".grib2", ".grb", ".grb2"):
-        return xr.open_dataset(path, engine="cfgrib", decode_timedelta=True)
+        return xr.open_dataset(path, engine="cfgrib", decode_timedelta=True,
+                               backend_kwargs={
+            "indexpath": "",
+        })
     else:
         return xr.open_dataset(path)

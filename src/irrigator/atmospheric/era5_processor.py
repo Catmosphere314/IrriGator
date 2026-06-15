@@ -28,9 +28,15 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from irrigator.config import RegionConfig
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Default paths — relative to repo root (assumes cwd = repo root)
+# ---------------------------------------------------------------------------
+
+DEFAULT_PROCESSED_DIR = Path("data/processed")
 
 # ERA5-Land variable names (may differ between CDS versions)
 _VAR_MAP = {
@@ -52,14 +58,14 @@ def _find_var(ds: xr.Dataset, candidates: list[str]) -> str:
     raise KeyError(f"None of {candidates} found in dataset. Available: {list(ds.data_vars)}")
 
 
-def process_era5_to_daily(ds: xr.Dataset, shift_utc : int = 0) -> xr.Dataset:
+def process_era5_to_daily(ds: xr.Dataset, shift_utc: int = 0) -> xr.Dataset:
     """Convert ERA5-Land hourly dataset to daily aggregates.
 
     Parameters
     ----------
     ds : xr.Dataset
         Hourly ERA5-Land data (from open_era5_land or open_mfdataset).
-    shift_utc : shift to apply compared to UTC, 0 default, 
+    shift_utc : shift to apply compared to UTC, 0 default,
         can be set to 1 for French time (omitting the time change)
 
     Returns
@@ -70,6 +76,7 @@ def process_era5_to_daily(ds: xr.Dataset, shift_utc : int = 0) -> xr.Dataset:
     """
     # Shift UTC → CET before daily aggregation
     ds = ds.assign_coords(valid_time=ds.valid_time + pd.Timedelta(f"{shift_utc}h"))
+
     # Identify variable names (ERA5 naming varies between CDS versions)
     t2m = _find_var(ds, ["t2m", "2m_temperature", "VAR_2T"])
     d2m = _find_var(ds, ["d2m", "2m_dewpoint_temperature", "VAR_2D"])
@@ -101,7 +108,6 @@ def process_era5_to_daily(ds: xr.Dataset, shift_utc : int = 0) -> xr.Dataset:
     del pres_ds
 
     # Solar radiation: J/m² (accumulated per hour) → MJ/m²/day
-    # Accumulated values, convert J → MJ
     # Daily total = value at 00UTC of d+1, which holds the previous day's accumulation
     rad_00utc = ds[ssrd].sel(valid_time=ds.valid_time.dt.hour == 0)
     # Shift back by one day so it aligns with the correct date
@@ -109,7 +115,6 @@ def process_era5_to_daily(ds: xr.Dataset, shift_utc : int = 0) -> xr.Dataset:
     del rad_00utc
 
     # Precipitation: m (accumulated per hour) → mm/day
-    # Sum hourly values, convert m → mm
     # Daily total = value at 00UTC of d+1, which holds the previous day's accumulation
     tp_00utc = ds[tp].sel(valid_time=ds.valid_time.dt.hour == 0)
     # Shift back by one day so it aligns with the correct date
@@ -147,18 +152,39 @@ def process_era5_to_daily(ds: xr.Dataset, shift_utc : int = 0) -> xr.Dataset:
     return result
 
 
-def save_daily(ds: xr.Dataset, cfg: RegionConfig) -> None:
-    """Save daily aggregated ERA5-Land data."""
-    out_dir = cfg.processed_dir / "atmospheric"
+def save_daily(ds: xr.Dataset, processed_dir: str | Path = DEFAULT_PROCESSED_DIR) -> Path:
+    """Save daily aggregated ERA5-Land data.
+
+    Parameters
+    ----------
+    ds : daily ERA5-Land dataset (from process_era5_to_daily)
+    processed_dir : output directory (default: data/processed)
+
+    Returns
+    -------
+    Path to saved file.
+    """
+    processed_dir = Path(processed_dir)
+    out_dir = processed_dir / "atmospheric"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "era5_daily.nc"
-    ds.to_netcdf(out_path)
-    logger.info("Saved daily ERA5-Land: %s", out_path)
+
+    encoding = {v: {"zlib": True, "complevel": 4} for v in ds.data_vars}
+    ds.to_netcdf(out_path, encoding=encoding)
+    size_mb = out_path.stat().st_size / 1e6
+    logger.info("Saved daily ERA5-Land: %s (%.1f MB)", out_path, size_mb)
+    return out_path
 
 
-def load_daily(cfg: RegionConfig) -> xr.Dataset:
-    """Load previously saved daily ERA5-Land data."""
-    path = cfg.processed_dir / "atmospheric" / "era5_daily.nc"
+def load_daily(processed_dir: str | Path = DEFAULT_PROCESSED_DIR) -> xr.Dataset:
+    """Load previously saved daily ERA5-Land data.
+
+    Parameters
+    ----------
+    processed_dir : directory containing atmospheric/era5_daily.nc
+    """
+    processed_dir = Path(processed_dir)
+    path = processed_dir / "atmospheric" / "era5_daily.nc"
     if not path.exists():
         raise FileNotFoundError(
             f"Daily ERA5-Land not found: {path}\nRun process_era5_to_daily first."

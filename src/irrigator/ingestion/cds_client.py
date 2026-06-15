@@ -13,6 +13,10 @@ ERA5-Land is hourly at ~9 km.  We request full days and aggregate to daily
 in the atmospheric processing step (Block 2), not here.  This module only
 handles download and raw storage.
 
+All ERA5-Land downloads use the France metropolitan bounding box by default
+(41°N–51.5°N, 6°W–10°E).  Any new parcel is immediately served from the
+same cache — no per-region download needed.
+
 SEAS5 is monthly, ~36 km, 51-member ensemble.  We download monthly means
 for temperature and total precipitation.
 """
@@ -26,9 +30,22 @@ from pathlib import Path
 import cdsapi
 import xarray as xr
 
-from irrigator.config import RegionConfig
+from irrigator.config import BBoxWGS84
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Default paths — relative to repo root (assumes cwd = repo root)
+# ---------------------------------------------------------------------------
+
+DEFAULT_RAW_DIR = Path("data/raw")
+DEFAULT_PROCESSED_DIR = Path("data/processed")
+
+# ---------------------------------------------------------------------------
+# France metropolitan bounding box (used for all downloads)
+# ---------------------------------------------------------------------------
+
+FRANCE_BBOX = BBoxWGS84(north=51.5, south=41.0, west=-6.0, east=10.0)
 
 # ERA5-Land variables needed for Penman-Monteith ET0
 ERA5_LAND_VARIABLES = [
@@ -79,28 +96,27 @@ def _era5_output_path(raw_dir: Path, year: int, month: int, *, validation: bool 
     out_dir = raw_dir / "era5_land"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    output_path = (
-        out_dir / f"era5land_{year:04d}_{month:02d}.nc"
-        if not validation
-        else out_dir / f"era5land_validation_{year:04d}_{month:02d}.nc"
-    )
-    return output_path
+    if validation:
+        return out_dir / f"era5land_validation_{year:04d}_{month:02d}.nc"
+    return out_dir / f"era5land_{year:04d}_{month:02d}.nc"
 
 
 def fetch_era5_land_month(
-    cfg: RegionConfig,
     year: int,
     month: int,
     *,
+    bounding_box: BBoxWGS84 = FRANCE_BBOX,
+    raw_dir: str | Path = DEFAULT_RAW_DIR,
     include_validation: bool = False,
     overwrite: bool = False,
 ) -> Path:
-    """Download one month of hourly ERA5-Land data for the region.
+    """Download one month of hourly ERA5-Land data.
 
     Parameters
     ----------
-    cfg : RegionConfig
     year, month : target period
+    bounding_box : spatial extent (default: France metropolitan)
+    raw_dir : output directory for ERA5 downloads
     include_validation : if True, also download soil moisture layers
     overwrite : re-download even if file exists
 
@@ -108,9 +124,10 @@ def fetch_era5_land_month(
     -------
     Path to the downloaded NetCDF file.
     """
-    out_path = _era5_output_path(cfg.raw_dir, year, month)
+    raw_dir = Path(raw_dir)
+    out_path = _era5_output_path(raw_dir, year, month)
     out_path_validation = (
-        _era5_output_path(cfg.raw_dir, year, month, validation=True) if include_validation else None
+        _era5_output_path(raw_dir, year, month, validation=True) if include_validation else None
     )
 
     if (
@@ -121,8 +138,6 @@ def fetch_era5_land_month(
         logger.info("ERA5-Land %04d-%02d already exists: %s", year, month, out_path)
         return out_path
 
-    variables = list(ERA5_LAND_VARIABLES)
-
     # Build day list for the month
     first_day = date(year, month, 1)
     if month == 12:
@@ -132,17 +147,15 @@ def fetch_era5_land_month(
     days = [f"{d:02d}" for d in range(1, last_day.day + 1)]
 
     request = {
-        "variable": variables,
+        "variable": list(ERA5_LAND_VARIABLES),
         "year": str(year),
         "month": f"{month:02d}",
         "day": days,
         "time": [f"{h:02d}:00" for h in range(24)],
-        "area": cfg.bbox_wgs84.as_cds_area(),
+        "area": bounding_box.as_cds_area(),
         "data_format": "netcdf",
         "download_format": "unarchived",
     }
-
-    print(request)
 
     logger.info("Requesting ERA5-Land %04d-%02d from CDS...", year, month)
     client = _init_cds_client()
@@ -150,22 +163,20 @@ def fetch_era5_land_month(
     logger.info("Downloaded: %s (%.1f MB)", out_path, out_path.stat().st_size / 1e6)
 
     if include_validation and out_path_validation is not None:
-        variables = ERA5_LAND_VALIDATION_VARIABLES
-
-        request = {
-            "variable": variables,
+        val_request = {
+            "variable": list(ERA5_LAND_VALIDATION_VARIABLES),
             "year": str(year),
             "month": f"{month:02d}",
             "day": days,
             "time": [f"{h:02d}:00" for h in range(24)],
-            "area": cfg.bbox_wgs84.as_cds_area(),
+            "area": bounding_box.as_cds_area(),
             "data_format": "netcdf",
             "download_format": "unarchived",
         }
 
-        logger.info("Requesting ERA5-Land %04d-%02d from CDS...", year, month)
+        logger.info("Requesting ERA5-Land validation %04d-%02d from CDS...", year, month)
         client = _init_cds_client()
-        client.retrieve("reanalysis-era5-land", request, str(out_path_validation))
+        client.retrieve("reanalysis-era5-land", val_request, str(out_path_validation))
         logger.info(
             "Downloaded: %s (%.1f MB)",
             out_path_validation,
@@ -176,12 +187,17 @@ def fetch_era5_land_month(
 
 
 def fetch_era5_land_range(
-    cfg: RegionConfig,
     start: date,
     end: date,
     **kwargs,
 ) -> list[Path]:
     """Download ERA5-Land for a date range, month by month.
+
+    Parameters
+    ----------
+    start, end : date range
+    **kwargs : forwarded to fetch_era5_land_month
+        (bounding_box, raw_dir, include_validation, overwrite)
 
     Returns list of paths to downloaded files.
     """
@@ -190,7 +206,7 @@ def fetch_era5_land_range(
     end_month = date(end.year, end.month, 1)
 
     while current <= end_month:
-        path = fetch_era5_land_month(cfg, current.year, current.month, **kwargs)
+        path = fetch_era5_land_month(current.year, current.month, **kwargs)
         paths.append(path)
         # Advance to next month
         if current.month == 12:
@@ -202,23 +218,29 @@ def fetch_era5_land_range(
 
 
 def open_era5_land(
-    cfg: RegionConfig,
+    raw_dir: str | Path = DEFAULT_RAW_DIR,
     start: date | None = None,
     end: date | None = None,
-    parent_path: str | None = None,
 ) -> xr.Dataset:
     """Open downloaded ERA5-Land files as a single lazy xarray Dataset.
 
     Uses dask for out-of-core access.  Call ``.load()`` or ``.compute()``
     to materialise into memory.
+
+    Parameters
+    ----------
+    raw_dir : root raw data directory (contains era5_land/ subdirectory)
+    start, end : optional date range filter
     """
-    era5_dir = cfg.raw_dir / "era5_land"
+    raw_dir = Path(raw_dir)
+    era5_dir = raw_dir / "era5_land"
     if not era5_dir.exists():
         raise FileNotFoundError(
             f"No ERA5-Land data found at {era5_dir}. Run fetch_era5_land_range first."
         )
 
-    files = sorted(era5_dir.glob("era5land_*.nc"))
+    # Match only forcing files, exclude validation files
+    files = sorted(f for f in era5_dir.glob("era5land_*.nc") if "validation" not in f.name)
     if not files:
         raise FileNotFoundError(f"No ERA5-Land NetCDF files in {era5_dir}")
 
@@ -254,10 +276,11 @@ def _seas5_output_path(raw_dir: Path, year: int, month: int) -> Path:
 
 
 def fetch_seas5(
-    cfg: RegionConfig,
     year: int,
     month: int,
     *,
+    bounding_box: BBoxWGS84 = FRANCE_BBOX,
+    raw_dir: str | Path = DEFAULT_RAW_DIR,
     overwrite: bool = False,
 ) -> Path:
     """Download SEAS5 seasonal forecast initialised at year/month.
@@ -266,31 +289,32 @@ def fetch_seas5(
 
     Parameters
     ----------
-    cfg : RegionConfig
     year, month : initialisation date of the forecast
+    bounding_box : spatial extent (default: France metropolitan)
+    raw_dir : output directory
     overwrite : re-download even if file exists
 
     Returns
     -------
     Path to downloaded NetCDF.
     """
-    out_path = _seas5_output_path(cfg.raw_dir, year, month)
+    raw_dir = Path(raw_dir)
+    out_path = _seas5_output_path(raw_dir, year, month)
 
     if out_path.exists() and not overwrite:
         logger.info("SEAS5 %04d-%02d already exists: %s", year, month, out_path)
         return out_path
 
-    seas5_cfg = cfg.data.get("seas5", {})
-    leadtime_months = seas5_cfg.get("leadtime_months", [1, 2, 3, 4, 5, 6])
+    leadtime_months = [1, 2, 3, 4, 5, 6]
 
     request = {
         "originating_centre": "ecmwf",
-        "system": str(seas5_cfg.get("system", 51)),
+        "system": "51",
         "variable": SEAS5_VARIABLES,
         "year": str(year),
         "month": f"{month:02d}",
         "leadtime_month": [str(m) for m in leadtime_months],
-        "area": cfg.bbox_wgs84.as_cds_area(),
+        "area": bounding_box.as_cds_area(),
         "data_format": "netcdf",
     }
 
@@ -302,9 +326,10 @@ def fetch_seas5(
     return out_path
 
 
-def open_seas5(cfg: RegionConfig, year: int, month: int) -> xr.Dataset:
+def open_seas5(raw_dir: str | Path = DEFAULT_RAW_DIR, *, year: int, month: int) -> xr.Dataset:
     """Open a downloaded SEAS5 forecast file."""
-    path = _seas5_output_path(cfg.raw_dir, year, month)
+    raw_dir = Path(raw_dir)
+    path = _seas5_output_path(raw_dir, year, month)
     if not path.exists():
         raise FileNotFoundError(f"SEAS5 file not found: {path}. Run fetch_seas5 first.")
     return xr.open_dataset(path)

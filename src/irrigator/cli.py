@@ -63,9 +63,7 @@ def fetch_era5(region: str, start: str, end: str, validation: bool, overwrite: b
     """
     from irrigator.ingestion.cds_client import fetch_era5_land_range
 
-    cfg = load_region_config(region)
     paths = fetch_era5_land_range(
-        cfg,
         _parse_date(start),
         _parse_date(end),
         include_validation=validation,
@@ -88,9 +86,7 @@ def fetch_era5_daily(region: str, start: str, end: str, validation: bool, overwr
     """
     from irrigator.ingestion.cds_client import fetch_era5_land_days
 
-    cfg = load_region_config(region)
     paths = fetch_era5_land_days(
-        cfg,
         _parse_date(start),
         _parse_date(end),
         include_validation=validation,
@@ -108,8 +104,7 @@ def fetch_seas5(region: str, year: int, month: int, overwrite: bool) -> None:
     """Download SEAS5 seasonal forecast from CDS."""
     from irrigator.ingestion.cds_client import fetch_seas5
 
-    cfg = load_region_config(region)
-    path = fetch_seas5(cfg, year, month, overwrite=overwrite)
+    path = fetch_seas5(year, month, overwrite=overwrite)
     click.echo(f"SEAS5 saved: {path}")
 
 

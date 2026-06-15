@@ -50,22 +50,19 @@ def fetch():
 
 
 @fetch.command("era5")
-@click.option("--region", default="configs/dordogne.yaml", type=click.Path(exists=True))
 @click.option("--start", required=True, help="Start date YYYY-MM-DD")
 @click.option("--end", required=True, help="End date YYYY-MM-DD")
 @click.option("--validation/--no-validation", default=False, help="Include soil moisture layers")
 @click.option("--overwrite", is_flag=True)
-def fetch_era5(region: str, start: str, end: str, validation: bool, overwrite: bool) -> None:
+def fetch_era5(start: str, end: str, validation: bool, overwrite: bool) -> None:
     """Download ERA5-Land reanalysis data from CDS (monthly bulk files).
 
-    This is the preferred method for historical data: one API request per month,
+    Downloads France-wide (41°N–51.5°N, 6°W–10°E). One API request per month,
     each file containing all 24 hourly timesteps for every day in that month.
     """
     from irrigator.ingestion.cds_client import fetch_era5_land_range
 
-    cfg = load_region_config(region)
     paths = fetch_era5_land_range(
-        cfg,
         _parse_date(start),
         _parse_date(end),
         include_validation=validation,
@@ -75,12 +72,11 @@ def fetch_era5(region: str, start: str, end: str, validation: bool, overwrite: b
 
 
 @fetch.command("era5-daily")
-@click.option("--region", default="configs/dordogne.yaml", type=click.Path(exists=True))
 @click.option("--start", required=True, help="Start date YYYY-MM-DD")
 @click.option("--end", required=True, help="End date YYYY-MM-DD")
 @click.option("--validation/--no-validation", default=False, help="Include soil moisture layers")
 @click.option("--overwrite", is_flag=True)
-def fetch_era5_daily(region: str, start: str, end: str, validation: bool, overwrite: bool) -> None:
+def fetch_era5_daily(start: str, end: str, validation: bool, overwrite: bool) -> None:
     """Download ERA5-Land day by day (for operational updates).
 
     Slower than 'era5' (one API call per day vs per month) but useful for
@@ -88,9 +84,7 @@ def fetch_era5_daily(region: str, start: str, end: str, validation: bool, overwr
     """
     from irrigator.ingestion.cds_client import fetch_era5_land_days
 
-    cfg = load_region_config(region)
     paths = fetch_era5_land_days(
-        cfg,
         _parse_date(start),
         _parse_date(end),
         include_validation=validation,
@@ -100,16 +94,14 @@ def fetch_era5_daily(region: str, start: str, end: str, validation: bool, overwr
 
 
 @fetch.command("seas5")
-@click.option("--region", default="configs/dordogne.yaml", type=click.Path(exists=True))
 @click.option("--year", required=True, type=int)
 @click.option("--month", required=True, type=int)
 @click.option("--overwrite", is_flag=True)
-def fetch_seas5(region: str, year: int, month: int, overwrite: bool) -> None:
+def fetch_seas5(year: int, month: int, overwrite: bool) -> None:
     """Download SEAS5 seasonal forecast from CDS."""
     from irrigator.ingestion.cds_client import fetch_seas5
 
-    cfg = load_region_config(region)
-    path = fetch_seas5(cfg, year, month, overwrite=overwrite)
+    path = fetch_seas5(year, month, overwrite=overwrite)
     click.echo(f"SEAS5 saved: {path}")
 
 
@@ -160,22 +152,21 @@ def fetch_ndvi(region: str, target_date: str, window: int) -> None:
 
 
 @fetch.command("ifs-ens")
-@click.option("--region", default="configs/dordogne.yaml", type=click.Path(exists=True))
 @click.option("--date", "run_date", default=None, help="Run date YYYY-MM-DD (default: today)")
 @click.option("--hour", default=0, type=int, help="Run hour (0 or 12)")
 @click.option("--overwrite", is_flag=True)
-def fetch_ifs_ens_cmd(region: str, run_date: str | None, hour: int, overwrite: bool) -> None:
+def fetch_ifs_ens_cmd(run_date: str | None, hour: int, overwrite: bool) -> None:
     """Download ECMWF IFS ENS ensemble forecast (51 members, 15 days).
 
     No API key needed — uses ECMWF open data (CC-BY-4.0).
+    Downloads globally, sliced to France on read.
     """
     from irrigator.ingestion.ifs_ens_client import fetch_ifs_ens, fetch_latest_ifs_ens
 
-    cfg = load_region_config(region)
     if run_date:
-        path = fetch_ifs_ens(cfg, _parse_date(run_date), hour, overwrite=overwrite)
+        path = fetch_ifs_ens(run_date=_parse_date(run_date), run_hour=hour, overwrite=overwrite)
     else:
-        path = fetch_latest_ifs_ens(cfg)
+        path = fetch_latest_ifs_ens()
 
     if path:
         click.echo(f"IFS ENS saved: {path} ({path.stat().st_size / 1e6:.1f} MB)")

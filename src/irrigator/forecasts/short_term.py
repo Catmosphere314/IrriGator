@@ -1,6 +1,7 @@
 """Short-term forecast integration with ensemble probabilistic stress.
 
 Architecture:
+- AROME (-5days-0h, deterministic): single forward water balance path
 - AROME (0-48h, deterministic): single forward water balance path
 - IFS ENS (0-15d, 51 members): ensemble forward water balance
 - Output: per-day statistics (mean/median/p25/p75/min/max Ks, depletion, precip)
@@ -18,6 +19,9 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 import xarray as xr
+from datetime import date, timedelta
+from pathlib import Path
+
 
 from irrigator.atmospheric.forcing import DailyForcing
 from irrigator.config import ParcelConfig
@@ -31,15 +35,16 @@ from irrigator.water_balance.state import WaterBalanceState
 logger = logging.getLogger(__name__)
 
 
+
 # ---------------------------------------------------------------------------
 # Forecast standardization (unchanged)
 # ---------------------------------------------------------------------------
 
+
 def standardize_forecast_to_era5_format(
     forecast_ds: xr.Dataset,
     source: str = "arpege",
-    shift_utc : int = 0,
-
+    shift_utc: int = 0,
 ) -> xr.Dataset:
     """Rename/convert a forecast dataset to match ERA5-Land daily format.
 
@@ -59,13 +64,18 @@ def standardize_forecast_to_era5_format(
     # These are common NWP output names; the exact names depend on the
     # API version and request format.
     rename_candidates = {
-        "2t": "t_mean", "t2m": "t_mean",
-        "mn2t": "t_min", "mx2t": "t_max",
-        "10u": "u10", "10v": "v10",
-        "ssrd": "rs_mj", "ssr": "rs_mj",
+        "2t": "t_mean",
+        "t2m": "t_mean",
+        "mn2t": "t_min",
+        "mx2t": "t_max",
+        "10u": "u10",
+        "10v": "v10",
+        "ssrd": "rs_mj",
+        "ssr": "rs_mj",
         "sp": "pressure_kpa",
         "tp": "precip_mm",
-        "2d": "dewpoint", "d2m": "dewpoint",
+        "2d": "dewpoint",
+        "d2m": "dewpoint",
     }
 
     result = forecast_ds.copy()
@@ -78,7 +88,7 @@ def standardize_forecast_to_era5_format(
             result[tvar] = result[tvar] - 273.15
 
     if "u10" in result and "v10" in result and "wind_speed_10m" not in result:
-        result["wind_speed_10m"] = np.sqrt(result["u10"]**2 + result["v10"]**2)
+        result["wind_speed_10m"] = np.sqrt(result["u10"] ** 2 + result["v10"] ** 2)
 
     if "pressure_kpa" in result and float(result["pressure_kpa"].mean()) > 10000:
         result["pressure_kpa"] = result["pressure_kpa"] / 1000.0
@@ -86,7 +96,7 @@ def standardize_forecast_to_era5_format(
     for old_time in ("time", "step", "forecast_time"):
         if old_time in result.dims and "valid_time" not in result.dims:
             result = result.rename({old_time: "valid_time"})
-    
+
     result = result.assign_coords(valid_time=result.valid_time + pd.Timedelta(f"{shift_utc}h"))
 
     return result
@@ -95,6 +105,7 @@ def standardize_forecast_to_era5_format(
 # ---------------------------------------------------------------------------
 # Single-path forward balance (AROME deterministic)
 # ---------------------------------------------------------------------------
+
 
 def run_forward_balance(
     current_state: WaterBalanceState,
@@ -117,14 +128,23 @@ def run_forward_balance(
 
     for i in range(forecast_forcing.n_days):
         current_date = pd.Timestamp(forecast_forcing.dates[i]).date()
-        crop = advance_crop(current_date, float(forecast_forcing.t_min[i]),
-                            float(forecast_forcing.t_max[i]), gdd, crop_params)
+        crop = advance_crop(
+            current_date,
+            float(forecast_forcing.t_min[i]),
+            float(forecast_forcing.t_max[i]),
+            gdd,
+            crop_params,
+        )
         state = daily_step(
             current_date=current_date,
             et0=float(et0_series[i]),
             precip=float(forecast_forcing.precip_mm[i]),
             irrigation=0.0,
-            crop=crop, soil=soil, dr_prev=dr, taw_prev=taw_prev, p=crop_params.p,
+            crop=crop,
+            soil=soil,
+            dr_prev=dr,
+            taw_prev=taw_prev,
+            p=crop_params.p,
         )
         dr, taw_prev, gdd = state.depletion, state.taw, crop.gdd
         states.append(state)
@@ -136,12 +156,14 @@ def run_forward_balance(
 # Ensemble stress report
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class DailyEnsembleStats:
     """Ensemble statistics for one forecast day."""
+
     date: pd.Timestamp
-    day_offset: int              # 0 = today
-    source: str                  # "arome" or "ifs_ens"
+    day_offset: int  # 0 = today
+    source: str  # "arome" or "ifs_ens"
     # Stress coefficient Ks
     ks_mean: float
     ks_median: float
@@ -201,10 +223,11 @@ class DailyEnsembleStats:
 @dataclass
 class EnsembleStressReport:
     """Full probabilistic stress report across the forecast horizon."""
+
     daily_stats: list[DailyEnsembleStats]
     n_members: int
     arome_days: int  # days covered by AROME (deterministic)
-    ens_days: int    # days covered by IFS ENS
+    ens_days: int  # days covered by IFS ENS
 
     @property
     def stress_expected(self) -> bool:
@@ -241,6 +264,7 @@ class EnsembleStressReport:
 # ---------------------------------------------------------------------------
 # Ensemble forward balance (IFS ENS)
 # ---------------------------------------------------------------------------
+
 
 def run_ensemble_forward_balance(
     current_state: WaterBalanceState,
@@ -288,16 +312,22 @@ def run_ensemble_forward_balance(
         for i in range(forcing.n_days):
             current_date = pd.Timestamp(forcing.dates[i]).date()
             crop = advance_crop(
-                current_date, float(forcing.t_min[i]),
-                float(forcing.t_max[i]), gdd, crop_params,
+                current_date,
+                float(forcing.t_min[i]),
+                float(forcing.t_max[i]),
+                gdd,
+                crop_params,
             )
             state = daily_step(
                 current_date=current_date,
                 et0=float(et0[i]),
                 precip=float(forcing.precip_mm[i]),
                 irrigation=0.0,
-                crop=crop, soil=soil,
-                dr_prev=dr, taw_prev=taw_prev, p=crop_params.p,
+                crop=crop,
+                soil=soil,
+                dr_prev=dr,
+                taw_prev=taw_prev,
+                p=crop_params.p,
             )
             dr, taw_prev, gdd = state.depletion, state.taw, crop.gdd
             member_states.append(state)
@@ -316,26 +346,28 @@ def run_ensemble_forward_balance(
         # For days within AROME range: use AROME deterministic
         if arome_states and day_idx < arome_days and day_idx < len(arome_states):
             arome = arome_states[day_idx]
-            daily_stats.append(DailyEnsembleStats(
-                date=pd.Timestamp(arome.date),
-                day_offset=day_idx,
-                source="arome",
-                ks_mean=arome.stress_coeff,
-                ks_median=arome.stress_coeff,
-                ks_p25=arome.stress_coeff,
-                ks_p75=arome.stress_coeff,
-                ks_min=arome.stress_coeff,
-                ks_max=arome.stress_coeff,
-                depletion_mean=arome.depletion,
-                depletion_p25=arome.depletion,
-                depletion_p75=arome.depletion,
-                precip_mean=arome.precip,
-                precip_p25=arome.precip,
-                precip_p75=arome.precip,
-                etc_mean=arome.etc_act,
-                n_members_stressed=1 if arome.stress_coeff < stress_threshold else 0,
-                n_members_total=1,
-            ))
+            daily_stats.append(
+                DailyEnsembleStats(
+                    date=pd.Timestamp(arome.date),
+                    day_offset=day_idx,
+                    source="arome",
+                    ks_mean=arome.stress_coeff,
+                    ks_median=arome.stress_coeff,
+                    ks_p25=arome.stress_coeff,
+                    ks_p75=arome.stress_coeff,
+                    ks_min=arome.stress_coeff,
+                    ks_max=arome.stress_coeff,
+                    depletion_mean=arome.depletion,
+                    depletion_p25=arome.depletion,
+                    depletion_p75=arome.depletion,
+                    precip_mean=arome.precip,
+                    precip_p25=arome.precip,
+                    precip_p75=arome.precip,
+                    etc_mean=arome.etc_act,
+                    n_members_stressed=1 if arome.stress_coeff < stress_threshold else 0,
+                    n_members_total=1,
+                )
+            )
             continue
 
         # For days beyond AROME: aggregate across IFS ENS members
@@ -363,26 +395,28 @@ def run_ensemble_forward_balance(
         pr_arr = np.array(day_precip)
         etc_arr = np.array(day_etc)
 
-        daily_stats.append(DailyEnsembleStats(
-            date=pd.Timestamp(day_date),
-            day_offset=day_idx,
-            source="ifs_ens",
-            ks_mean=float(ks_arr.mean()),
-            ks_median=float(np.median(ks_arr)),
-            ks_p25=float(np.percentile(ks_arr, 25)),
-            ks_p75=float(np.percentile(ks_arr, 75)),
-            ks_min=float(ks_arr.min()),
-            ks_max=float(ks_arr.max()),
-            depletion_mean=float(dr_arr.mean()),
-            depletion_p25=float(np.percentile(dr_arr, 25)),
-            depletion_p75=float(np.percentile(dr_arr, 75)),
-            precip_mean=float(pr_arr.mean()),
-            precip_p25=float(np.percentile(pr_arr, 25)),
-            precip_p75=float(np.percentile(pr_arr, 75)),
-            etc_mean=float(etc_arr.mean()),
-            n_members_stressed=int((ks_arr < stress_threshold).sum()),
-            n_members_total=len(ks_arr),
-        ))
+        daily_stats.append(
+            DailyEnsembleStats(
+                date=pd.Timestamp(day_date),
+                day_offset=day_idx,
+                source="ifs_ens",
+                ks_mean=float(ks_arr.mean()),
+                ks_median=float(np.median(ks_arr)),
+                ks_p25=float(np.percentile(ks_arr, 25)),
+                ks_p75=float(np.percentile(ks_arr, 75)),
+                ks_min=float(ks_arr.min()),
+                ks_max=float(ks_arr.max()),
+                depletion_mean=float(dr_arr.mean()),
+                depletion_p25=float(np.percentile(dr_arr, 25)),
+                depletion_p75=float(np.percentile(dr_arr, 75)),
+                precip_mean=float(pr_arr.mean()),
+                precip_p25=float(np.percentile(pr_arr, 25)),
+                precip_p75=float(np.percentile(pr_arr, 75)),
+                etc_mean=float(etc_arr.mean()),
+                n_members_stressed=int((ks_arr < stress_threshold).sum()),
+                n_members_total=len(ks_arr),
+            )
+        )
 
     report = EnsembleStressReport(
         daily_stats=daily_stats,
@@ -394,8 +428,12 @@ def run_ensemble_forward_balance(
     logger.info(
         "Ensemble stress report: %d days (%d AROME + %d IFS ENS), "
         "%d members, stress_expected=%s, first_stress_day=%s",
-        len(daily_stats), report.arome_days, report.ens_days,
-        n_members, report.stress_expected, report.first_stress_day,
+        len(daily_stats),
+        report.arome_days,
+        report.ens_days,
+        n_members,
+        report.stress_expected,
+        report.first_stress_day,
     )
     return report
 
@@ -403,6 +441,7 @@ def run_ensemble_forward_balance(
 # ---------------------------------------------------------------------------
 # Legacy compatibility
 # ---------------------------------------------------------------------------
+
 
 def will_stress_occur(
     forecast_states: list[WaterBalanceState],

@@ -20,7 +20,7 @@ import logging
 
 import xarray as xr
 
-from irrigator.config import RegionConfig
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -42,20 +42,26 @@ def compute_valid_month(init_month: int, leadtime_month: int) -> int:
 
 
 def build_era5_monthly_climatology(
-    cfg: RegionConfig,
     start_year: int = 1993,
     end_year: int = 2016,
+    processed_dir: str | Path | None = None,
 ) -> xr.Dataset:
     """Build ERA5 monthly climatology from downloaded monthly means.
 
     If you already have ERA5-Land daily data (from Block 0), aggregate
     to monthly means first, then compute the multi-year monthly average.
 
+    Parameters
+    ----------
+    start_year, end_year : climatology reference period
+    processed_dir : directory containing atmospheric/era5_daily.nc
+        (default: data/processed)
+
     Returns dataset with 'month' dimension (1-12).
     """
     from irrigator.atmospheric.era5_processor import load_daily
 
-    daily = load_daily(cfg)
+    daily = load_daily(processed_dir) if processed_dir else load_daily()
 
     # Filter to climatology period
     daily = daily.sel(valid_time=slice(f"{start_year}-01-01", f"{end_year}-12-31"))

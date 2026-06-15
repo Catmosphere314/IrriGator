@@ -99,7 +99,7 @@ def get_era5_elevation(cfg: RegionConfig, parcel: ParcelConfig) -> float:
     from irrigator.ingestion.cds_client import open_era5_land
 
     try:
-        ds = open_era5_land(cfg)
+        ds = open_era5_land()
         # ERA5-Land geopotential / orography is typically not in the standard
         # variable set.  Use the mean elevation from the terrain DEM at ERA5
         # resolution as an approximation: average the DEM over the ~9km cell.

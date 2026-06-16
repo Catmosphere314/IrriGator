@@ -26,11 +26,14 @@ from __future__ import annotations
 import logging
 import shutil
 import tarfile
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from pathlib import Path
 
 import requests
 import xarray as xr
+import rioxarray as rxr
+import numpy as np
+
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +42,17 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_RAW_DIR = Path("data/raw")
+
+
+PATTERNS = {
+    "accum": "RR",
+    "error": "ERR",
+    "qualif": "QUALIF",
+}
+
+PATTERNS_NA = {"accum": 65535, "error": 65535, "qualif": 255}
+
+TODAY = date.today()
 
 # ---------------------------------------------------------------------------
 # data.gouv.fr API
@@ -242,35 +256,94 @@ def extract_comephore_archive(
 
 def open_comephore(
     raw_dir: Path = DEFAULT_RAW_DIR,
-    start: date | None = None,
-    end: date | None = None,
+    type: str = "accum",
+    start: date = TODAY,
+    end: date = TODAY,
 ) -> xr.Dataset:
-    """Open extracted COMEPHORE files as a single lazy Dataset.
+    """Open extracted COMEPHORE GeoTIFF files as one lazy Dataset.
 
-    Parameters
-    ----------
-    raw_dir : root raw directory containing comephore/hourly/
-    start, end : optional date range filter
+    Args:
+        raw_dir : directory containing the compehore files
+        type : variable to get (error, accumulation, quality)
+        start : first day to look at (included)
+        end : last day to look at (included)
 
-    Returns
-    -------
-    xr.Dataset with hourly precipitation grids.
+    Notes:
+        Performs also a threshold selection, to limit space and remove
+         overseas/foreign country values.
+
     """
+
     hourly_dir = _comephore_dir(raw_dir) / "hourly"
+
     if not hourly_dir.exists():
         raise FileNotFoundError(
             f"No extracted COMEPHORE data at {hourly_dir}. "
             "Run fetch_comephore_month + extract_comephore_archive first."
         )
 
-    files = sorted(hourly_dir.glob("**/*.nc"))
-    if not files:
-        # Try GRIB files
-        files = sorted(hourly_dir.glob("**/*.grib2")) + sorted(hourly_dir.glob("**/*.grib"))
+    try:
+        pattern = PATTERNS[type]
+    except KeyError:
+        raise ValueError(f"type must be one of {tuple(PATTERNS)}, got {type!r}") from None
+
+    list_dates = [
+        (start + timedelta(days=i)).strftime("%Y%m%d") for i in range((end - start).days + 1)
+    ]
+
+    files = sorted(
+        file
+        for date_string in list_dates
+        for file in hourly_dir.glob(f"**/{date_string}*_{pattern}.gtif")
+    )
 
     if not files:
-        raise FileNotFoundError(f"No COMEPHORE data files in {hourly_dir}")
+        raise FileNotFoundError(
+            f"No COMEPHORE {pattern} GeoTIFF files in {hourly_dir} between {start} and {end}"
+        )
 
-    logger.info("Opening %d COMEPHORE files with dask", len(files))
-    ds = xr.open_mfdataset(files, combine="by_coords", chunks={"time": 24})
-    return ds
+    logger.info(
+        "Opening %d COMEPHORE GeoTIFF files with Dask",
+        len(files),
+    )
+
+    arrays = []
+
+    for file in files:
+        # Assumes filenames start with YYYYMMDDHH
+        timestamp = datetime.strptime(file.name[:10], "%Y%m%d%H")
+
+        array = rxr.open_rasterio(
+            file,
+            chunks={"x": 512, "y": 512},
+            masked=True,
+            cache=False,
+        )
+
+        if array.sizes["band"] != 1:
+            raise ValueError(f"Expected one band in {file}, found {array.sizes['band']}")
+
+        array = array.squeeze("band", drop=True).expand_dims(time=[timestamp])
+
+        arrays.append(array)
+
+    data = xr.concat(
+        arrays,
+        dim="time",
+        coords="minimal",
+        compat="override",
+        join="exact",
+        combine_attrs="override",
+    )
+
+    valid = data != PATTERNS_NA[type]
+
+    data = (
+        data.astype(np.float32)  # prevents unnecessary float64 storage
+        .where(valid)  # invalid values become NaN
+        .sortby("time")
+        .chunk({"time": 24})
+        .rename(type)
+    )
+
+    return data.to_dataset()

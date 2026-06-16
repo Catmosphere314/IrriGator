@@ -15,6 +15,7 @@ from irrigator.forecasts.short_term import (
     run_forward_balance,
     will_stress_occur,
 )
+from irrigator.forecasts.arome_processing import load_arome_daily_cache
 
 __all__ = [
     "DailyEnsembleStats",
@@ -22,4 +23,5 @@ __all__ = [
     "run_ensemble_forward_balance",
     "run_forward_balance",
     "will_stress_occur",
+    "load_arome_daily_cache",
 ]

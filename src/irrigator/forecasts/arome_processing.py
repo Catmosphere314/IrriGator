@@ -10,7 +10,6 @@ Static/Dynamic are used for mitigating the difference in processing days between
 """
 
 import logging
-import os
 import re
 import time
 from collections import defaultdict
@@ -21,9 +20,6 @@ import numpy as np
 import pandas as pd
 import requests
 import xarray as xr
-
-REPO_ROOT = os.path.dirname(os.getcwd())
-os.chdir(REPO_ROOT)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger("arome")
@@ -38,15 +34,6 @@ FRANCE_BBOX = {"north": 51.5, "south": 41.0, "west": -6.0, "east": 10.0}
 
 RAW_DIR = Path("data/raw/arome")
 DAILY_DIR = Path("data/processed/arome")
-for d in [
-    RAW_DIR / "static",
-    RAW_DIR / "dynamic",
-    RAW_DIR / "forecast",
-    DAILY_DIR / "static",
-    DAILY_DIR / "dynamic",
-    DAILY_DIR / "forecast",
-]:
-    d.mkdir(parents=True, exist_ok=True)
 
 DELETE_RAW = False
 API_PAUSE = 0.5
@@ -55,6 +42,19 @@ BASE_URL = "https://public-api.meteofrance.fr/public/arome/1.0"
 WCS_RESOURCE = "wcs/MF-NWP-HIGHRES-AROME-001-FRANCE-WCS"
 
 FORECAST_HORIZON = 48
+
+
+def ensure_dirs() -> None:
+    """Create data directories if they don't exist. Called by sync functions."""
+    for d in [
+        RAW_DIR / "static",
+        RAW_DIR / "dynamic",
+        RAW_DIR / "forecast",
+        DAILY_DIR / "static",
+        DAILY_DIR / "dynamic",
+        DAILY_DIR / "forecast",
+    ]:
+        d.mkdir(parents=True, exist_ok=True)
 
 
 VARS_INSTANTANEOUS = {
@@ -186,6 +186,7 @@ def format_cid(
         cid += f"_{accum}"
     return cid
 
+
 # -----------------------------------
 # Core fetch : single timestep
 # -----------------------------------
@@ -248,7 +249,7 @@ def fetch_static_day(target_date: date, overwrite: bool = False) -> Path:
 
     # Accumulated: P1D, valid at step 24h
     for var_name, cfg in VARS_ACCUMULATED.items():
-        cid = format_cid(cfg["coverage"], target_date,0, cfg["static_accum"])
+        cid = format_cid(cfg["coverage"], target_date, 0, cfg["static_accum"])
         valid_t = run_start + timedelta(hours=24)
         out = day_dir / f"{var_name}_P1D.grib2"
         fetch_single_timestep(cid, valid_t, out, height=None, overwrite=overwrite)
@@ -275,9 +276,9 @@ def fetch_static_day(target_date: date, overwrite: bool = False) -> Path:
 
 
 def fetch_forecast_day(target_date: date, overwrite: bool = False) -> Path:
-    """Fetch all variables for 48 hours from the 00Z run (static mode).
+    """Fetch all variables for 48 hours from the 00Z run (forecast mode).
 
-    ~42 API calls: precip(1) + rad(1) + temp(24) + wind(8) + dew(8)
+    Two forecast days, each with the same variable set as static mode.
     """
     day_dir = RAW_DIR / "forecast" / target_date.isoformat()
     run_start = datetime(target_date.year, target_date.month, target_date.day, tzinfo=timezone.utc)
@@ -285,7 +286,7 @@ def fetch_forecast_day(target_date: date, overwrite: bool = False) -> Path:
 
     # Accumulated: P1D, valid at step 24h
     for var_name, cfg in VARS_ACCUMULATED.items():
-        cid = format_cid(cfg["coverage"], target_date,0, cfg["static_accum"])
+        cid = format_cid(cfg["coverage"], target_date, 0, cfg["static_accum"])
         for day in [1, 2]:
             valid_t = run_start + timedelta(hours=24 * day)
             out = day_dir / f"{var_name}_day{day}_P1D.grib2"
@@ -405,7 +406,7 @@ def _build_static(target_date: date, out_path: Path) -> Path:
     if dew_files:
         daily["dewpoint"] = (
             xr.concat([_open_grib_scalar(f) for f in dew_files], dim="step").mean(dim="step")
-            - 273.0
+            - 273.15
         )
 
     ds = xr.Dataset(
@@ -647,6 +648,7 @@ def sync_static(overwrite: bool = False, delete_raw: bool = DELETE_RAW) -> dict:
     Returns {date: status} for each available date.
     """
     logger.info("Syncing static archive...")
+    ensure_dirs()
     all_coverages = get_available_coverages()
     parsed_all = [parse_coverage_id(c) for c in all_coverages]
     parsed_all = [p for p in parsed_all if p is not None]
@@ -695,6 +697,7 @@ def sync_static(overwrite: bool = False, delete_raw: bool = DELETE_RAW) -> dict:
 def sync_dynamic(overwrite: bool = False, fill: bool = True) -> dict:
     """Discover all available run times, fetch missing 3h windows."""
     logger.info("Syncing dynamic archive...")
+    ensure_dirs()
     all_coverages = get_available_coverages()
     parsed_all = [parse_coverage_id(c) for c in all_coverages]
     parsed_all = [p for p in parsed_all if p is not None]
@@ -750,7 +753,8 @@ def sync_forecast(overwrite: bool = False, delete_raw: bool = DELETE_RAW) -> dic
     Self-healing: run any time, catches up automatically.
     Returns {date: status} for each available date.
     """
-    logger.info("Syncing static archive...")
+    logger.info("Syncing forecast archive...")
+    ensure_dirs()
     all_coverages = get_available_coverages()
     parsed_all = [parse_coverage_id(c) for c in all_coverages]
     parsed_all = [p for p in parsed_all if p is not None]
@@ -855,14 +859,18 @@ def main(overwrite, sync_mode):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Create a ArcHydro schema")
+    parser = argparse.ArgumentParser(description="AROME France-wide fetch and archive")
     parser.add_argument(
         "--overwrite",
-        metavar="path",
+        action="store_true",
         default=False,
-        required=True,
-        help="to overwrite existing files if conflicting",
+        help="overwrite existing files if conflicting",
     )
-    parser.add_argument("--sync_mode", default="static", required=True, help="synchronisation mode")
+    parser.add_argument(
+        "--sync_mode",
+        default="static",
+        choices=["static", "dynamic", "forecast"],
+        help="synchronisation mode",
+    )
     args = parser.parse_args()
     main(overwrite=args.overwrite, sync_mode=args.sync_mode)

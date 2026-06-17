@@ -478,3 +478,85 @@ def extract_ensemble_parcel_forcing(
         t_correction,
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Daily archive — save/load processed IFS ENS at France level
+# ---------------------------------------------------------------------------
+
+DEFAULT_PROCESSED_DIR = Path("data/processed")
+
+
+def save_ifs_daily(
+    ds: xr.Dataset,
+    run_date: date,
+    run_hour: int = 0,
+    processed_dir: Path = DEFAULT_PROCESSED_DIR,
+) -> Path:
+    """Save processed IFS ENS daily data as a France-level cache file.
+
+    Parameters
+    ----------
+    ds : daily IFS ENS dataset (from process_ifs_ens_to_daily)
+    run_date : forecast initialization date
+    run_hour : initialization hour
+    processed_dir : output directory
+
+    Returns
+    -------
+    Path to saved file.
+    """
+    out_dir = Path(processed_dir) / "ifs_ens"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"ifs_daily_{run_date.isoformat()}_{run_hour:02d}z.nc"
+
+    encoding = {v: {"zlib": True, "complevel": 4} for v in ds.data_vars}
+    ds.to_netcdf(out_path, encoding=encoding)
+
+    size_mb = out_path.stat().st_size / 1e6
+    n_members = ds.sizes.get("number", 1)
+    n_days = ds.sizes.get("valid_time", 0)
+    logger.info(
+        "Saved IFS ENS daily: %s (%.1f MB, %d members, %d days)",
+        out_path,
+        size_mb,
+        n_members,
+        n_days,
+    )
+    return out_path
+
+
+def load_ifs_daily(
+    run_date: date | None = None,
+    run_hour: int = 0,
+    processed_dir: Path = DEFAULT_PROCESSED_DIR,
+) -> xr.Dataset:
+    """Load cached IFS ENS daily data.
+
+    Parameters
+    ----------
+    run_date : specific run to load (default: most recent available)
+    run_hour : initialization hour
+    processed_dir : directory containing ifs_ens/ subdirectory
+
+    Returns
+    -------
+    xr.Dataset with dims (valid_time, number, latitude, longitude).
+    """
+    ifs_dir = Path(processed_dir) / "ifs_ens"
+    if not ifs_dir.exists():
+        raise FileNotFoundError(
+            f"No IFS ENS cache at {ifs_dir}. Run the IFS archive notebook first."
+        )
+
+    if run_date is not None:
+        path = ifs_dir / f"ifs_daily_{run_date.isoformat()}_{run_hour:02d}z.nc"
+        if not path.exists():
+            raise FileNotFoundError(f"IFS ENS daily not found: {path}")
+        return xr.open_dataset(path)
+
+    # Find most recent
+    files = sorted(ifs_dir.glob("ifs_daily_*.nc"))
+    if not files:
+        raise FileNotFoundError(f"No IFS ENS daily files in {ifs_dir}")
+    return xr.open_dataset(files[-1])

@@ -224,7 +224,6 @@ def advance_crop(
     Updated CropState for today.
     """
     # Only accumulate GDD after planting
-    print(params.planting_date)
     if current_date < params.planting_date:
         return CropState(
             date=current_date,

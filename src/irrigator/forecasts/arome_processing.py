@@ -76,6 +76,14 @@ VARS_INSTANTANEOUS = {
         "static_hours": list(range(0, 24)),
         "dynamic_hours": [0, 1, 2],
     },
+    "surface_pressure": {
+        "coverage": "PRESSURE__GROUND_OR_WATER_SURFACE",
+        "is_surface": True,
+        "height": None,
+        "static_hours": list(range(0, 24)),  # 3-hourly, 8 values
+        "dynamic_hours": [0, 1, 2],
+        "forecast_hours": list(range(0, 24)),
+    },
 }
 
 VARS_ACCUMULATED = {

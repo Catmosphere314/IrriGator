@@ -481,7 +481,7 @@ def extract_ensemble_parcel_forcing(
 
 
 # ---------------------------------------------------------------------------
-# Daily archive — save/load processed IFS ENS at France level
+# Daily archive — save/load/pipeline for France-level IFS ENS
 # ---------------------------------------------------------------------------
 
 DEFAULT_PROCESSED_DIR = Path("data/processed")
@@ -545,9 +545,7 @@ def load_ifs_daily(
     """
     ifs_dir = Path(processed_dir) / "ifs_ens"
     if not ifs_dir.exists():
-        raise FileNotFoundError(
-            f"No IFS ENS cache at {ifs_dir}. Run the IFS archive notebook first."
-        )
+        raise FileNotFoundError(f"No IFS ENS cache at {ifs_dir}. Run run_ifs_pipeline() first.")
 
     if run_date is not None:
         path = ifs_dir / f"ifs_daily_{run_date.isoformat()}_{run_hour:02d}z.nc"
@@ -560,3 +558,144 @@ def load_ifs_daily(
     if not files:
         raise FileNotFoundError(f"No IFS ENS daily files in {ifs_dir}")
     return xr.open_dataset(files[-1])
+
+
+# ---------------------------------------------------------------------------
+# Pipeline: fetch → open France → daily → save (optionally delete raw)
+# ---------------------------------------------------------------------------
+
+
+def process_ifs_run(
+    run_date: date,
+    run_hour: int = 0,
+    *,
+    raw_dir: Path = DEFAULT_RAW_DIR,
+    processed_dir: Path = DEFAULT_PROCESSED_DIR,
+    bbox: BBoxWGS84 = FRANCE_BBOX,
+    shift_utc: int = 0,
+    overwrite: bool = False,
+    keep_raw: bool = False,
+) -> Path | None:
+    """Fetch, process, and cache one IFS ENS run at France level.
+
+    Steps:
+    1. Download global GRIB from ECMWF open data
+    2. Open and slice to France bounding box
+    3. Process 6-hourly → daily (de-accumulate tp/ssrd)
+    4. Save compressed NetCDF
+    5. Delete raw GRIB (unless keep_raw=True)
+
+    Parameters
+    ----------
+    run_date : forecast initialization date
+    run_hour : initialization hour (0 or 12)
+    raw_dir : directory for raw GRIB download
+    processed_dir : directory for daily NetCDF output
+    bbox : spatial extent for slicing (default: France)
+    shift_utc : timezone shift before daily aggregation
+    overwrite : re-process even if daily file exists
+    keep_raw : if False (default), delete the raw GRIB after processing
+
+    Returns
+    -------
+    Path to the daily NetCDF, or None if download failed.
+    """
+    # Check if already processed
+    out_dir = Path(processed_dir) / "ifs_ens"
+    out_path = out_dir / f"ifs_daily_{run_date.isoformat()}_{run_hour:02d}z.nc"
+    if out_path.exists() and not overwrite:
+        logger.info("IFS ENS %s %02dZ already processed: %s", run_date, run_hour, out_path)
+        return out_path
+
+    tag = f"{run_date.isoformat()} {run_hour:02d}Z"
+
+    # Step 1: Download
+    logger.info("[%s] Downloading...", tag)
+    try:
+        grib_path = fetch_ifs_ens(raw_dir, run_date, run_hour, overwrite=overwrite)
+    except Exception as exc:
+        logger.warning("[%s] Download failed: %s", tag, exc)
+        return None
+
+    # Step 2: Open and slice to France
+    logger.info("[%s] Opening and slicing to bbox...", tag)
+    ds_raw = open_ifs_ens(grib_path, bbox)
+
+    # Step 3: Process to daily
+    logger.info("[%s] Processing to daily...", tag)
+    ifs_daily = process_ifs_ens_to_daily(ds_raw, shift_utc=shift_utc)
+
+    # Step 4: Save
+    daily_path = save_ifs_daily(ifs_daily, run_date, run_hour, processed_dir)
+
+    # Step 5: Clean up raw GRIB
+    if not keep_raw and grib_path.exists():
+        raw_mb = grib_path.stat().st_size / 1e6
+        grib_path.unlink()
+        # Also remove any .idx sidecar files
+        for idx in grib_path.parent.glob(f"{grib_path.stem}*.idx"):
+            idx.unlink(missing_ok=True)
+        logger.info("[%s] Deleted raw GRIB (%.0f MB freed)", tag, raw_mb)
+
+    return daily_path
+
+
+def run_ifs_pipeline(
+    start: date | None = None,
+    end: date | None = None,
+    run_hour: int = 0,
+    *,
+    raw_dir: Path = DEFAULT_RAW_DIR,
+    processed_dir: Path = DEFAULT_PROCESSED_DIR,
+    shift_utc: int = 0,
+    overwrite: bool = False,
+    keep_raw: bool = False,
+) -> list[Path]:
+    """Fetch and process IFS ENS for a date range.
+
+    Iterates day by day from start to end, downloading and processing
+    each run. Skips runs that are already cached (unless overwrite=True).
+
+    Parameters
+    ----------
+    start : first run date (default: today)
+    end : last run date (default: same as start)
+    run_hour : initialization hour for all runs (0 or 12)
+    raw_dir : directory for raw GRIB downloads
+    processed_dir : directory for daily NetCDF output
+    shift_utc : timezone shift before daily aggregation
+    overwrite : re-process even if daily file exists
+    keep_raw : if False (default), delete raw GRIBs after processing
+
+    Returns
+    -------
+    List of paths to daily NetCDF files.
+    """
+    if start is None:
+        start = date.today()
+    if end is None:
+        end = date.today()
+
+    daily_paths = []
+    current = start
+
+    while current <= end:
+        result = process_ifs_run(
+            current,
+            run_hour,
+            raw_dir=raw_dir,
+            processed_dir=processed_dir,
+            shift_utc=shift_utc,
+            overwrite=overwrite,
+            keep_raw=keep_raw,
+        )
+        if result is not None:
+            daily_paths.append(result)
+        current += timedelta(days=1)
+
+    logger.info(
+        "IFS pipeline complete: %d/%d runs processed",
+        len(daily_paths),
+        (end - start).days + 1,
+    )
+    return daily_paths

@@ -125,7 +125,6 @@ def fetch_ifs_ens(
 
     out_dir = _output_dir(raw_dir)
     out_path = out_dir / f"ifs_ens_{run_date.isoformat()}_{run_hour:02d}z.grib2"
-
     if out_path.exists() and not overwrite:
         logger.info("IFS ENS already exists: %s", out_path)
         return out_path

@@ -76,7 +76,7 @@ PATTERNS = {
 PATTERNS_NA = {"accum": 65535, "error": 65535, "qualif": 255}
 
 # RR and ERR are stored in 1/100 mm; divide by this to get mm
-UNIT_SCALE = 100.0
+UNIT_SCALE = 10.0
 
 # QUALIF is 0–100; divide by this to get a 0–1 fraction
 QUALIF_SCALE = 100.0

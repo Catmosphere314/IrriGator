@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 from datetime import date, timedelta
 from pathlib import Path
+from calendar import monthrange
 
 import cdsapi
 import xarray as xr
@@ -135,8 +136,25 @@ def fetch_era5_land_month(
         and (out_path_validation is None or out_path_validation.exists())
         and not overwrite
     ):
-        logger.info("ERA5-Land %04d-%02d already exists: %s", year, month, out_path)
-        return out_path
+        with xr.open_dataset(
+            out_path,
+            chunks=None,  # no dask
+            decode_cf=False,  # skip CF decoding
+            mask_and_scale=False,  # skip scale/masking setup
+            create_default_indexes=False,  # avoid loading dim coords into pandas indexes
+            cache=False,
+        ) as ds:
+            n_time = ds.sizes["valid_time"]
+        if n_time // 24 == monthrange(year, month)[1] and n_time % 24 == 0:
+            logger.info("ERA5-Land %04d-%02d already exists: %s", year, month, out_path)
+            return out_path
+        else:
+            logger.info(
+                "ERA5-Land %04d-%02d already exists, BUT OVERWRITTEN AS THE MONTH IS NOT FULL: %s",
+                year,
+                month,
+                out_path,
+            )
 
     # Build day list for the month
     first_day = date(year, month, 1)

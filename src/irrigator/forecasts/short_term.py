@@ -298,18 +298,28 @@ def run_ensemble_forward_balance(
     # Run forward balance for each member
     all_member_states: dict[int, list[WaterBalanceState]] = {}
 
+    # IFS ENS members branch from the AROME endpoint so there's no
+    # discontinuity at the handoff.  They skip the first arome_days
+    # of their own forcing (AROME covers those days deterministically).
+    if arome_states and len(arome_states) >= arome_days:
+        ens_start = arome_states[arome_days - 1]
+        ens_skip = arome_days
+    else:
+        ens_start = current_state
+        ens_skip = 0
+
     for member_id, forcing in member_forcings.items():
         et0 = compute_et0(forcing, terrain, parcel.lat)
         if hasattr(et0, "values"):
             et0 = et0.values
         et0 = np.asarray(et0, dtype=np.float64)
 
-        dr = current_state.depletion
-        gdd = current_state.gdd
-        taw_prev = current_state.taw
+        dr = ens_start.depletion
+        gdd = ens_start.gdd
+        taw_prev = ens_start.taw
         member_states = []
 
-        for i in range(forcing.n_days):
+        for i in range(ens_skip,forcing.n_days):
             current_date = pd.Timestamp(forcing.dates[i]).date()
             crop = advance_crop(
                 current_date,
@@ -336,7 +346,9 @@ def run_ensemble_forward_balance(
 
     # Determine number of forecast days from first member
     first_member = next(iter(all_member_states.values()))
-    n_days = len(first_member)
+    n_ens_days = len(first_member)
+    n_arome = min(arome_days, len(arome_states)) if arome_states else 0
+    n_days = n_arome + n_ens_days
     n_members = len(all_member_states)
 
     # Build per-day ensemble statistics
@@ -370,7 +382,9 @@ def run_ensemble_forward_balance(
             )
             continue
 
-        # For days beyond AROME: aggregate across IFS ENS members
+        # For days beyond AROME: aggregate across IFS ENS members.
+        # member_states[0] = first day after AROME handoff, so offset.
+        ens_idx = day_idx - n_arome
         day_ks = []
         day_depletion = []
         day_precip = []
@@ -378,8 +392,8 @@ def run_ensemble_forward_balance(
         day_date = None
 
         for member_id, states in all_member_states.items():
-            if day_idx < len(states):
-                s = states[day_idx]
+            if ens_idx < len(states):
+                s = states[ens_idx]
                 day_ks.append(s.stress_coeff)
                 day_depletion.append(s.depletion)
                 day_precip.append(s.precip)
@@ -421,8 +435,8 @@ def run_ensemble_forward_balance(
     report = EnsembleStressReport(
         daily_stats=daily_stats,
         n_members=n_members,
-        arome_days=min(arome_days, len(arome_states)) if arome_states else 0,
-        ens_days=max(0, n_days - (arome_days if arome_states else 0)),
+        arome_days=n_arome,
+        ens_days=n_ens_days,
     )
 
     logger.info(

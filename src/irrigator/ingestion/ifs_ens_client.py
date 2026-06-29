@@ -93,6 +93,9 @@ def fetch_ifs_ens(
     run_hour: int = 0,
     steps: list[int] | None = None,
     overwrite: bool = False,
+    download_mode: str = "step",
+    max_workers: int = 3,
+    source: str = "ecmwf",
 ) -> Path:
     """Download IFS ENS forecast from ECMWF open data.
 
@@ -103,6 +106,19 @@ def fetch_ifs_ens(
     run_hour : initialization hour (0 or 12)
     steps : forecast hours to retrieve (default: 0 to 360 by 6)
     overwrite : re-download if exists
+    download_mode : download strategy:
+        - "step" (default): one request per step (~260 MB each).
+          Fastest on ECMWF direct — each step is a single file on their
+          servers, no byte-range extraction needed.
+        - "param": one request per variable (~2.3 GB each).
+          Better for AWS/Azure when ECMWF is unavailable.
+        - "bulk": single request for everything (~16 GB).
+          Fastest on fast connections but fragile.
+    max_workers : parallel downloads (default: 3). Only used in
+        "step" and "param" modes.
+    source : ECMWF open data source ("ecmwf", "aws", "azure").
+        Default "ecmwf" for step mode (fastest), "azure" may be
+        better for param mode.
 
     Returns
     -------
@@ -120,33 +136,25 @@ def fetch_ifs_ens(
         run_date = date.today()
 
     if steps is None:
-        # 0 to 360h by 6h = 15 days
         steps = list(range(0, 366, 6))
 
     out_dir = _output_dir(raw_dir)
     out_path = out_dir / f"ifs_ens_{run_date.isoformat()}_{run_hour:02d}z.grib2"
+
     if out_path.exists() and not overwrite:
         logger.info("IFS ENS already exists: %s", out_path)
         return out_path
 
-    logger.info(
-        "Downloading IFS ENS: %s %02dZ, %d steps, %d params",
-        run_date,
-        run_hour,
-        len(steps),
-        len(IFS_ENS_PARAMS),
-    )
-
-    client = Client(source="ecmwf")
-
-    client.retrieve(
-        type="ef",  # ensemble forecast
-        date=run_date.isoformat(),
-        time=run_hour,
-        param=IFS_ENS_PARAMS,
-        step=steps,
-        target=str(out_path),
-    )
+    if download_mode == "step":
+        _fetch_by_step(
+            out_dir, out_path, run_date, run_hour, steps, max_workers=max_workers, source=source
+        )
+    elif download_mode == "param":
+        _fetch_by_param(
+            out_dir, out_path, run_date, run_hour, steps, max_workers=max_workers, source=source
+        )
+    else:
+        _fetch_bulk(out_path, run_date, run_hour, steps, source=source)
 
     logger.info(
         "Downloaded IFS ENS: %s (%.1f MB)",
@@ -154,6 +162,221 @@ def fetch_ifs_ens(
         out_path.stat().st_size / 1e6,
     )
     return out_path
+
+
+def _combine_parts(part_files: list[Path], out_path: Path) -> None:
+    """Concatenate GRIB part files into a single combined file."""
+    logger.info("Combining %d parts into %s...", len(part_files), out_path.name)
+    with open(out_path, "wb") as combined:
+        for part_path in part_files:
+            with open(part_path, "rb") as part:
+                while True:
+                    chunk = part.read(8 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    combined.write(chunk)
+
+    for part_path in part_files:
+        part_path.unlink(missing_ok=True)
+
+    logger.info("Combined: %.1f MB", out_path.stat().st_size / 1e6)
+
+
+def _download_with_fallback(
+    param: list[str],
+    run_date: date,
+    run_hour: int,
+    step: list[int],
+    out_path: Path,
+    source: str,
+    label: str = "",
+) -> Path:
+    """Download one GRIB chunk with source fallback."""
+    import time as _time
+    from ecmwf.opendata import Client
+
+    sources = [source] + [s for s in ("ecmwf", "aws", "azure") if s != source]
+
+    for src in sources:
+        try:
+            client = Client(source=src)
+            client.retrieve(
+                type="ef",
+                date=run_date.isoformat(),
+                time=run_hour,
+                param=param,
+                step=step,
+                target=str(out_path),
+            )
+            return out_path
+        except Exception as exc:
+            logger.warning("%s failed from %s: %s", label, src, exc)
+            out_path.unlink(missing_ok=True)
+            if src != sources[-1]:
+                _time.sleep(5)
+
+    raise RuntimeError(f"{label}: failed from all sources")
+
+
+def _fetch_by_step(
+    out_dir: Path,
+    out_path: Path,
+    run_date: date,
+    run_hour: int,
+    steps: list[int],
+    max_workers: int = 3,
+    source: str = "ecmwf",
+) -> None:
+    """Download one step at a time, then concatenate.
+
+    Each step is a single ~260 MB file on ECMWF servers — no byte-range
+    extraction, no server-side stitching. Fastest and most reliable,
+    especially from ECMWF direct.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    logger.info(
+        "Downloading IFS ENS (by step, %d workers, source=%s): %s %02dZ, %d steps",
+        max_workers,
+        source,
+        run_date,
+        run_hour,
+        len(steps),
+    )
+
+    def _download_one_step(step_h: int, index: int) -> Path:
+        part_path = out_dir / f"_step_{run_date.isoformat()}_{run_hour:02d}z_{step_h:03d}h.grib2"
+
+        if part_path.exists() and part_path.stat().st_size > 100_000:
+            logger.debug("[%d/%d] step %dh — cached", index, len(steps), step_h)
+            return part_path
+
+        label = f"[{index}/{len(steps)}] step {step_h}h"
+        _download_with_fallback(
+            param=IFS_ENS_PARAMS,
+            run_date=run_date,
+            run_hour=run_hour,
+            step=[step_h],
+            out_path=part_path,
+            source=source,
+            label=label,
+        )
+        logger.info("%s done (%.0f MB)", label, part_path.stat().st_size / 1e6)
+        return part_path
+
+    part_files = [None] * len(steps)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(_download_one_step, step_h, i + 1): i for i, step_h in enumerate(steps)
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                part_files[idx] = future.result()
+            except Exception as exc:
+                for pf in part_files:
+                    if pf is not None:
+                        pf.unlink(missing_ok=True)
+                raise RuntimeError(f"Step {steps[idx]}h failed: {exc}") from exc
+
+    _combine_parts(part_files, out_path)
+
+
+def _fetch_by_param(
+    out_dir: Path,
+    out_path: Path,
+    run_date: date,
+    run_hour: int,
+    steps: list[int],
+    max_workers: int = 3,
+    source: str = "azure",
+) -> None:
+    """Download one parameter at a time, then concatenate.
+
+    Each parameter is ~2.3 GB (all steps, all members for one variable).
+    Uses byte-range requests on S3/Azure.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    logger.info(
+        "Downloading IFS ENS (by param, %d workers, source=%s): %s %02dZ, %d params",
+        max_workers,
+        source,
+        run_date,
+        run_hour,
+        len(IFS_ENS_PARAMS),
+    )
+
+    def _download_one_param(param: str, index: int) -> Path:
+        part_path = out_dir / f"_part_{run_date.isoformat()}_{run_hour:02d}z_{param}.grib2"
+
+        if part_path.exists() and part_path.stat().st_size > 1_000_000:
+            logger.info(
+                "[%d/%d] %s — cached (%.0f MB)",
+                index,
+                len(IFS_ENS_PARAMS),
+                param,
+                part_path.stat().st_size / 1e6,
+            )
+            return part_path
+
+        label = f"[{index}/{len(IFS_ENS_PARAMS)}] {param}"
+        _download_with_fallback(
+            param=[param],
+            run_date=run_date,
+            run_hour=run_hour,
+            step=steps,
+            out_path=part_path,
+            source=source,
+            label=label,
+        )
+        logger.info("%s done (%.0f MB)", label, part_path.stat().st_size / 1e6)
+        return part_path
+
+    part_files = [None] * len(IFS_ENS_PARAMS)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(_download_one_param, param, i + 1): i
+            for i, param in enumerate(IFS_ENS_PARAMS)
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                part_files[idx] = future.result()
+            except Exception as exc:
+                for pf in part_files:
+                    if pf is not None:
+                        pf.unlink(missing_ok=True)
+                raise RuntimeError(f"Param {IFS_ENS_PARAMS[idx]} failed: {exc}") from exc
+
+    _combine_parts(part_files, out_path)
+
+
+def _fetch_bulk(
+    out_path: Path,
+    run_date: date,
+    run_hour: int,
+    steps: list[int],
+    source: str = "ecmwf",
+) -> None:
+    """Download all parameters in a single request (~16 GB)."""
+    logger.info(
+        "Downloading IFS ENS (bulk, source=%s): %s %02dZ, %d steps, %d params",
+        source,
+        run_date,
+        run_hour,
+        len(steps),
+        len(IFS_ENS_PARAMS),
+    )
+    _download_with_fallback(
+        param=IFS_ENS_PARAMS,
+        run_date=run_date,
+        run_hour=run_hour,
+        step=steps,
+        out_path=out_path,
+        source=source,
+        label="bulk",
+    )
 
 
 def fetch_latest_ifs_ens(raw_dir: Path = DEFAULT_RAW_DIR) -> Path | None:
@@ -691,6 +914,12 @@ def run_ifs_pipeline(
         if result is not None:
             daily_paths.append(result)
         current += timedelta(days=1)
+
+        # Pause between downloads to avoid AWS/Azure S3 rate limiting
+        if current <= end:
+            import time
+
+            time.sleep(30)
 
     logger.info(
         "IFS pipeline complete: %d/%d runs processed",

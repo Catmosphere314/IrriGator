@@ -797,6 +797,7 @@ def process_ifs_run(
     shift_utc: int = 0,
     overwrite: bool = False,
     keep_raw: bool = False,
+    mode: str = "bulk"
 ) -> Path | None:
     """Fetch, process, and cache one IFS ENS run at France level.
 
@@ -834,7 +835,7 @@ def process_ifs_run(
     # Step 1: Download
     logger.info("[%s] Downloading...", tag)
     try:
-        grib_path = fetch_ifs_ens(raw_dir, run_date, run_hour, overwrite=overwrite)
+        grib_path = fetch_ifs_ens(raw_dir, run_date, run_hour, overwrite=overwrite, download_mode=mode)
     except Exception as exc:
         logger.warning("[%s] Download failed: %s", tag, exc)
         return None
@@ -872,6 +873,7 @@ def run_ifs_pipeline(
     shift_utc: int = 0,
     overwrite: bool = False,
     keep_raw: bool = False,
+    mode: str = "bulk",
 ) -> list[Path]:
     """Fetch and process IFS ENS for a date range.
 
@@ -910,6 +912,7 @@ def run_ifs_pipeline(
             shift_utc=shift_utc,
             overwrite=overwrite,
             keep_raw=keep_raw,
+            mode=mode,
         )
         if result is not None:
             daily_paths.append(result)

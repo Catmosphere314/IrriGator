@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from datetime import date
 
 import yaml
 
@@ -135,6 +136,7 @@ class ParcelConfig:
     soil: dict[str, Any]
     crop: dict[str, Any]
     irrigation: dict[str, Any]
+    irrigation_log: list[dict[str, Any]]
     sensors: dict[str, Any]
     raw: dict[str, Any] = field(repr=False)
 
@@ -165,6 +167,7 @@ def load_parcel_config(path: str | Path) -> ParcelConfig:
         soil=raw.get("soil", {}),
         crop=raw.get("crop", {}),
         irrigation=raw.get("irrigation", {}),
+        irrigation_log=raw.get("irrigation_log",{}),
         sensors=raw.get("sensors", {}),
         raw=raw,
     )

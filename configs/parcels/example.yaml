@@ -99,6 +99,19 @@ irrigation:
   # Water access constraints (if applicable)
   # water_quota_mm_season: 2000  # some ASA impose seasonal limits
 
+  # =============================================================================
+# Irrigation history
+# =============================================================================
+irrigation_log:
+  - date: "2026-05-15"
+    amount_mm: 10
+    source: "farmer"  # farmer | model_recommendation | probe_triggered
+  - date: "2026-06-01"
+    amount_mm: 100
+    source: "farmer"
+
+
+
 # =============================================================================
 # Monitoring — optional sensors
 # =============================================================================
@@ -118,3 +131,4 @@ sensors:
   # rain_gauge:
   #   data_file: "data/sensors/24_bergerac_001_rain.csv"
   #   data_format: "datetime,mm"
+

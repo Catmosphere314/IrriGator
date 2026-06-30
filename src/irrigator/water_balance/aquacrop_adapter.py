@@ -259,8 +259,11 @@ def run_aquacrop(
     soil = soil_to_aquacrop(soil_profile)
     crop = parcel_to_crop(parcel)
 
+    
+
     iwc = initial_water_content or InitialWaterContent(value=["FC"])
     irr = irrigation_management or parcel_to_irrigation(parcel)
+
 
     model = AquaCropModel(
         sim_start_time=sim_start.strftime("%Y/%m/%d"),
@@ -271,7 +274,7 @@ def run_aquacrop(
         initial_water_content=iwc,
         irrigation_management=irr,
     )
-
+    
     model.run_model(till_termination=True)
 
     result = AquaCropResult(

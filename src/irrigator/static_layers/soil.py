@@ -47,10 +47,10 @@ class SoilProfile:
     theta_wp: list[float]
     k_sat: list[float]
     z_layers_cm: list[tuple[int, int]]
-    theta_s: list[float] | None = None  # saturation water content [cm³/cm³]
     total_awc_mm: float
     max_root_depth_m: float
     source: str
+    theta_s: list[float] | None = None  # saturation water content [cm³/cm³]
 
     @property
     def n_layers(self) -> int:

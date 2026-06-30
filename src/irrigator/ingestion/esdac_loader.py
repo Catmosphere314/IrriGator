@@ -86,6 +86,7 @@ class SoilHydroData:
     wp : xr.DataArray — wilting point [cm³/cm³], dims (depth, y, x)
     ks : xr.DataArray — saturated hydraulic conductivity [cm/day], dims (depth, y, x)
     awc : xr.DataArray — available water capacity FC-WP [cm³/cm³], dims (depth, y, x)
+    ths : xr.DataArray - saturated water content [cm³/cm³ x 100]
     total_awc_mm : xr.DataArray — depth-integrated AWC [mm], dims (y, x)
     depths_cm : list of (top, bottom) tuples per layer
     tile_ids : list of grid_id strings used
@@ -95,6 +96,7 @@ class SoilHydroData:
     wp: xr.DataArray
     ks: xr.DataArray
     awc: xr.DataArray
+    ths: xr.DataArray
     total_awc_mm: xr.DataArray
     depths_cm: list[tuple[int, int]]
     tile_ids: list[str]
@@ -471,6 +473,13 @@ def load_soil_hydro(
         name="ks",
         attrs={"units": "cm/day", "long_name": "saturated hydraulic conductivity"},
     )
+    ths = xr.DataArray(
+        arrays["THS"] / 100,
+        dims=dims,
+        coords=coords,
+        name="ths",
+        attrs={"units": "cm3/cm3", "long_name": "saturated water content"},
+    )
 
     # Available water capacity
     awc = (fc - wp).clip(min=0)
@@ -489,6 +498,7 @@ def load_soil_hydro(
         wp=wp,
         ks=ks,
         awc=awc,
+        ths=ths,
         total_awc_mm=total_awc_mm,
         depths_cm=depth_intervals,
         tile_ids=tile_ids,
@@ -516,6 +526,7 @@ def save_soil_hydro(data: SoilHydroData, out_dir: Path) -> Path:
             "wp": data.wp,
             "ks": data.ks,
             "awc": data.awc,
+            "ths": data.ths,
             "total_awc_mm": data.total_awc_mm,
         }
     )

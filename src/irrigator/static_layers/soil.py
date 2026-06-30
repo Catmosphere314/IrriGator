@@ -47,6 +47,7 @@ class SoilProfile:
     theta_wp: list[float]
     k_sat: list[float]
     z_layers_cm: list[tuple[int, int]]
+    theta_s: list[float] | None = None  # saturation water content [cm³/cm³]
     total_awc_mm: float
     max_root_depth_m: float
     source: str
@@ -197,6 +198,13 @@ def extract_soil_from_grid(
     ks = _extract_grid_values(ds, x, y, "ks")
     total_awc = float(ds["total_awc_mm"].sel(x=x, y=y, method="nearest"))
 
+    # Saturation water content (theta_s) — may not be in older datasets
+    try:
+        ths = _extract_grid_values(ds, x, y, "ths")
+        theta_s = ths.tolist()
+    except (KeyError, ValueError):
+        theta_s = None
+
     # Reconstruct depth layers from the depth coordinate
     depths = ds["depth"].values  # midpoints
     # Standard EU-SoilHydroGrids layers
@@ -211,6 +219,7 @@ def extract_soil_from_grid(
         theta_wp=wp.tolist(),
         k_sat=ks.tolist(),
         z_layers_cm=z_layers,
+        theta_s=theta_s,
         total_awc_mm=total_awc,
         max_root_depth_m=2.0,  # will be constrained by crop later
         source="eu_soilhydrogrids",

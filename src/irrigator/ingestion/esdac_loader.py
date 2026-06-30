@@ -58,7 +58,7 @@ from irrigator.ingestion.grid import TargetGrid
 logger = logging.getLogger(__name__)
 
 # Variables we need for the water balance
-SOIL_VARIABLES = ("FC", "WP", "KS")
+SOIL_VARIABLES = ("FC", "WP", "KS", "THS")
 
 # Depth layers in EU-SoilHydroGrids (sl1..sl7)
 # sl7 (200-x cm) often has sparse coverage; we use sl1-sl6 by default

@@ -68,7 +68,7 @@ crop:
   type: "grain_maize"
 
   # CRITICAL: farmer must provide these
-  planting_date: "2025-04-20"
+  planting_date: "2026-04-20"
   # Variety and maturity group (Arvalis index)
   variety: "DKC4590"
   maturity_group: "C1"  # Very early to very late: A, B, C1, C2, D1, D2
@@ -81,7 +81,7 @@ crop:
   #   end_midseason: 1300
   #   maturity: 1700
 
-  expected_harvest: "2025-10-05"  # approximate, helps define season bounds
+  expected_harvest: "2026-10-05"  # approximate, helps define season bounds
 
 # =============================================================================
 # Irrigation system
@@ -89,7 +89,7 @@ crop:
 irrigation:
   system_type: "pivot"  # pivot | sprinkler | drip | flood
   # Application rate and constraints
-  max_dose_mm: 40          # maximum per application
+  max_dose_mm: 50          # maximum per application
   min_dose_mm: 15          # minimum worthwhile application
   application_rate_mm_h: 8 # system flow rate
   # Minimum interval between irrigations (days)
@@ -103,30 +103,18 @@ irrigation:
 # Irrigation history
 # =============================================================================
 irrigation_log:
-  - date: "2025-05-15"
-    amount_mm: 10
+  - date: "2026-05-15"
+    amount_mm: 50
     source: "farmer"  # farmer | model_recommendation | probe_triggered
-  - date: "2025-06-01"
-    amount_mm: 100
-    source: "farmer"
-  - date: "2025-06-15"
-    amount_mm: 100
-    source: "farmer"
-  - date: "2025-07-01"
-    amount_mm: 100
-    source: "farmer"
-  - date: "2025-07-15"
-    amount_mm: 1000
-    source: "farmer"
-  - date: "2025-08-01"
-    amount_mm: 100
-    source: "farmer"
-  - date: "2025-08-15"
-    amount_mm: 100
-    source: "farmer"
-  - date: "2025-09-01"
-    amount_mm: 100
-    source: "farmer"
+  - date: "2026-06-01"
+    amount_mm: 50
+  - date: "2026-06-14"
+    amount_mm: 50
+  - date: "2026-06-20"
+    amount_mm: 50
+  - date: "2026-06-28"
+    amount_mm: 50
+
 
 
 

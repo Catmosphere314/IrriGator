@@ -64,19 +64,21 @@ def forcing_to_weather(
     t_max = forcing.t_max.astype(np.float64)
     t_max = np.maximum(t_max, t_min + 0.1)
 
-    weather = pd.DataFrame({
-        "MinTemp": t_min,
-        "MaxTemp": t_max,
-        "Precipitation": forcing.precip_mm.astype(np.float64),
-        "ReferenceET": np.clip(et0, 0.0, None),
-        "Date": pd.to_datetime(forcing.dates),
-    })
+    weather = pd.DataFrame(
+        {
+            "MinTemp": t_min,
+            "MaxTemp": t_max,
+            "Precipitation": forcing.precip_mm.astype(np.float64),
+            "ReferenceET": np.clip(et0, 0.0, None),
+            "Date": pd.to_datetime(forcing.dates),
+        }
+    )
 
     # Replace NaN with 0 for precipitation and ET0
     weather["Precipitation"] = weather["Precipitation"].fillna(0.0).clip(lower=0.0)
     weather["ReferenceET"] = weather["ReferenceET"].fillna(0.1).clip(lower=0.01)
-    weather["MinTemp"] = weather["MinTemp"].fillna(method="ffill").fillna(10.0)
-    weather["MaxTemp"] = weather["MaxTemp"].fillna(method="ffill").fillna(20.0)
+    weather["MinTemp"] = weather["MinTemp"].ffill().fillna(10.0)
+    weather["MaxTemp"] = weather["MaxTemp"].ffill().fillna(20.0)
 
     return weather
 
@@ -114,7 +116,9 @@ def soil_to_aquacrop(profile: SoilProfile, min_depth_m: float = 2.5) -> Soil:
             logger.warning(
                 "Layer %d: theta_s not available, estimated %.3f from FC=%.3f. "
                 "Add THS to SOIL_VARIABLES in esdac_loader.py for accurate values.",
-                i, th_s, th_fc,
+                i,
+                th_s,
+                th_fc,
             )
 
         # Saturated hydraulic conductivity: SoilProfile stores cm/day,
@@ -140,8 +144,7 @@ def parcel_to_crop(parcel: ParcelConfig) -> Crop:
 
     if crop_type not in {"grain_maize", "maize"}:
         raise ValueError(
-            f"Unsupported AquaCrop crop: {crop_type}. "
-            f"Currently only grain_maize is supported."
+            f"Unsupported AquaCrop crop: {crop_type}. Currently only grain_maize is supported."
         )
 
     planting = pd.Timestamp(crop_cfg["planting_date"])
@@ -165,10 +168,12 @@ def parcel_to_irrigation(parcel: ParcelConfig) -> IrrigationManagement:
 
     rows = []
     for item in log:
-        rows.append({
-            "Date": pd.Timestamp(item["date"]),
-            "Depth": float(item["amount_mm"]),
-        })
+        rows.append(
+            {
+                "Date": pd.Timestamp(item["date"]),
+                "Depth": float(item["amount_mm"]),
+            }
+        )
 
     schedule = pd.DataFrame(rows, columns=["Date", "Depth"])
 
@@ -191,10 +196,10 @@ class AquaCropResult:
     """Results from a single AquaCrop simulation."""
 
     # Raw AquaCrop outputs
-    final_results: pd.DataFrame    # season summary (yield, irrigation)
-    crop_growth: pd.DataFrame      # daily: canopy, biomass, root depth, GDD
-    water_flux: pd.DataFrame       # daily: Tr, TrPot, Es, IrrDay, Wr, DeepPerc
-    water_storage: pd.DataFrame    # daily: soil moisture per compartment
+    final_results: pd.DataFrame  # season summary (yield, irrigation)
+    crop_growth: pd.DataFrame  # daily: canopy, biomass, root depth, GDD
+    water_flux: pd.DataFrame  # daily: Tr, TrPot, Es, IrrDay, Wr, DeepPerc
+    water_storage: pd.DataFrame  # daily: soil moisture per compartment
 
     # Derived daily stress metric (Tr/TrPot, equivalent to Ks)
     @property
@@ -216,23 +221,25 @@ class AquaCropResult:
 
         n = min(len(cg), len(wf))
 
-        return pd.DataFrame({
-            "dap": cg["dap"].values[:n],
-            "gdd_cum": cg["gdd_cum"].values[:n],
-            "ks": ks[:n],
-            "canopy_cover": cg["canopy_cover"].values[:n],
-            "canopy_cover_ns": cg["canopy_cover_ns"].values[:n],
-            "biomass_kg_ha": cg["biomass"].values[:n],
-            "z_root_m": cg["z_root"].values[:n],
-            "harvest_index": cg["harvest_index"].values[:n],
-            "precip_mm": wf["Infl"].values[:n],  # infiltration ≈ effective precip
-            "irrigation_mm": wf["IrrDay"].values[:n],
-            "tr_mm": wf["Tr"].values[:n],
-            "tr_pot_mm": wf["TrPot"].values[:n],
-            "es_mm": wf["Es"].values[:n],
-            "deep_perc_mm": wf["DeepPerc"].values[:n],
-            "wr_mm": wf["Wr"].values[:n],
-        })
+        return pd.DataFrame(
+            {
+                "dap": cg["dap"].values[:n],
+                "gdd_cum": cg["gdd_cum"].values[:n],
+                "ks": ks[:n],
+                "canopy_cover": cg["canopy_cover"].values[:n],
+                "canopy_cover_ns": cg["canopy_cover_ns"].values[:n],
+                "biomass_kg_ha": cg["biomass"].values[:n],
+                "z_root_m": cg["z_root"].values[:n],
+                "harvest_index": cg["harvest_index"].values[:n],
+                "precip_mm": wf["Infl"].values[:n],  # infiltration ≈ effective precip
+                "irrigation_mm": wf["IrrDay"].values[:n],
+                "tr_mm": wf["Tr"].values[:n],
+                "tr_pot_mm": wf["TrPot"].values[:n],
+                "es_mm": wf["Es"].values[:n],
+                "deep_perc_mm": wf["DeepPerc"].values[:n],
+                "wr_mm": wf["Wr"].values[:n],
+            }
+        )
 
 
 def run_aquacrop(
@@ -265,11 +272,8 @@ def run_aquacrop(
     soil = soil_to_aquacrop(soil_profile)
     crop = parcel_to_crop(parcel)
 
-    
-
     iwc = initial_water_content or InitialWaterContent(value=["FC"])
     irr = irrigation_management or parcel_to_irrigation(parcel)
-
 
     model = AquaCropModel(
         sim_start_time=sim_start.strftime("%Y/%m/%d"),
@@ -280,7 +284,7 @@ def run_aquacrop(
         initial_water_content=iwc,
         irrigation_management=irr,
     )
-    
+
     model.run_model(till_termination=True)
 
     result = AquaCropResult(
@@ -293,7 +297,9 @@ def run_aquacrop(
     n_days = len(result.crop_growth)
     logger.info(
         "AquaCrop run: %s → %s (%d days), GDD=%.0f, CC=%.2f, biomass=%.0f kg/ha",
-        sim_start, sim_end, n_days,
+        sim_start,
+        sim_end,
+        n_days,
         result.crop_growth["gdd_cum"].iloc[-2] if n_days > 1 else 0,
         result.crop_growth["canopy_cover"].iloc[-2] if n_days > 1 else 0,
         result.crop_growth["biomass"].iloc[-2] if n_days > 1 else 0,
@@ -334,6 +340,7 @@ class AquaCropEnsembleStats:
 
 def run_ensemble_aquacrop(
     historical_forcing: DailyForcing,
+    arome_forcing: DailyForcing,
     member_forcings: dict[int, DailyForcing],
     parcel: ParcelConfig,
     terrain: TerrainParams,
@@ -356,6 +363,7 @@ def run_ensemble_aquacrop(
     Parameters
     ----------
     historical_forcing : DailyForcing from Jan 1 → today
+    arome_forcing : DailyForcing from today+1 -> today+2
     member_forcings : {member_id: DailyForcing} for each IFS ENS member
     parcel : parcel configuration
     terrain : terrain parameters
@@ -366,10 +374,13 @@ def run_ensemble_aquacrop(
     """
     daily_stats: list[AquaCropEnsembleStats] = []
 
+    # Merge historical and arome
+    deter_forcing = historical_forcing.concat(arome_forcing)
+
     # Determine forecast end from first member
     first_forcing = next(iter(member_forcings.values()))
     forecast_end = pd.Timestamp(first_forcing.dates[-1]).date()
-    n_hist = len(historical_forcing.dates)
+    n_hist = len(deter_forcing.dates)
     n_forecast = first_forcing.n_days
 
     logger.info(
@@ -390,8 +401,11 @@ def run_ensemble_aquacrop(
 
     for member_id, member_forcing in member_forcings.items():
         # Concatenate: historical (Jan 1 → today) + forecast (today+1 → end)
-        full_forcing = historical_forcing.concat(member_forcing)
+        full_forcing = deter_forcing.concat(member_forcing)
         full_end = pd.Timestamp(full_forcing.dates[-1]).date()
+
+        print(sim_start)
+        print(full_end)
 
         # Run AquaCrop for full period (rainfed during forecast)
         result = run_aquacrop(
@@ -401,7 +415,7 @@ def run_ensemble_aquacrop(
             soil_profile=soil_profile,
             sim_start=sim_start,
             sim_end=full_end,
-            irrigation_management=IrrigationManagement(irrigation_method=0),
+            # irrigation_management=IrrigationManagement(irrigation_method=0),
         )
 
         stress = result.daily_stress
@@ -630,6 +644,7 @@ def optimize_irrigation(
 # ---------------------------------------------------------------------------
 from irrigator.water_balance.state import WaterBalanceState
 
+
 def aquacrop_to_current_state(
     hist_run: AquaCropResult,
     soil_profile: SoilProfile,
@@ -640,7 +655,6 @@ def aquacrop_to_current_state(
     Converts AquaCrop's last-day outputs into a WaterBalanceState
     compatible with the existing decision layer (compute_recommendation).
     """
-    
 
     stress = hist_run.daily_stress
     wf = hist_run.water_flux
@@ -722,12 +736,18 @@ def aquacrop_to_current_state(
     )
 
 
+from irrigator.forecasts.short_term import (
+    DailyEnsembleStats,
+    EnsembleStressReport,
+)
+
+
 def build_blended_stress_report(
     arome_run: AquaCropResult,
     ensemble_stats: list[AquaCropEnsembleStats],
     today: date,
     arome_days: int = 2,
-) -> "EnsembleStressReport":
+) -> EnsembleStressReport:
     """Build an EnsembleStressReport blending AROME + IFS ENS.
 
     Days 0 to arome_days-1: from AROME deterministic AquaCrop run.
@@ -735,10 +755,7 @@ def build_blended_stress_report(
 
     Returns an EnsembleStressReport compatible with compute_recommendation().
     """
-    from irrigator.forecasts.short_term import (
-        DailyEnsembleStats,
-        EnsembleStressReport,
-    )
+    
 
     daily_stats = []
 
@@ -785,8 +802,6 @@ def build_blended_stress_report(
 
     # IFS ENS ensemble days (skip the first arome_days of ensemble stats)
     for stat in ensemble_stats:
-        if stat.day_offset < arome_days:
-            continue
         daily_stats.append(
             DailyEnsembleStats(
                 date=stat.date,
@@ -872,7 +887,7 @@ def build_candidates(
 
     for d in range(0, max_days_ahead + 1):
         for dose in doses:
-            candidates.append( 
+            candidates.append(
                 IrrigationCandidate(
                     day_offset=d,
                     dose_mm=dose,
@@ -885,6 +900,7 @@ def build_candidates(
 
 def evaluate_candidates_ensemble(
     historical_forcing: DailyForcing,
+    arome_forcing: DailyForcing,
     member_forcings: dict[int, DailyForcing],
     parcel: ParcelConfig,
     terrain: TerrainParams,
@@ -917,7 +933,7 @@ def evaluate_candidates_ensemble(
         member_yield_impact = []
 
         for member_id, member_forcing in member_forcings.items():
-            full_forcing = historical_forcing.concat(member_forcing)
+            full_forcing = historical_forcing.concat(arome_forcing).concat(member_forcing)
             full_end = pd.Timestamp(full_forcing.dates[-1]).date()
 
             # Build irrigation schedule: existing log + candidate event

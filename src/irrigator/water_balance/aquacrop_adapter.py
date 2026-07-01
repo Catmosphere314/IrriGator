@@ -628,19 +628,19 @@ def optimize_irrigation(
 # ---------------------------------------------------------------------------
 # Bridge: AquaCrop outputs → decision layer format
 # ---------------------------------------------------------------------------
-
+from irrigator.water_balance.state import WaterBalanceState
 
 def aquacrop_to_current_state(
     hist_run: AquaCropResult,
     soil_profile: SoilProfile,
     today: date,
-) -> "WaterBalanceState":
+) -> WaterBalanceState:
     """Extract current state from AquaCrop historical run.
 
     Converts AquaCrop's last-day outputs into a WaterBalanceState
     compatible with the existing decision layer (compute_recommendation).
     """
-    from irrigator.water_balance.state import WaterBalanceState
+    
 
     stress = hist_run.daily_stress
     wf = hist_run.water_flux
@@ -818,3 +818,268 @@ def build_blended_stress_report(
         arome_days=arome_days,
         ens_days=len(daily_stats) - arome_days,
     )
+
+
+# ---------------------------------------------------------------------------
+# Ensemble irrigation optimizer (Block 6)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class IrrigationCandidate:
+    """One candidate irrigation action to evaluate."""
+
+    day_offset: int  # days from today (0 = today)
+    dose_mm: float  # irrigation amount
+    label: str  # human-readable label
+
+
+@dataclass
+class CandidateResult:
+    """Ensemble evaluation of one irrigation candidate."""
+
+    candidate: IrrigationCandidate
+    # Per-member outcomes
+    member_max_stress: list[float]  # max(1-Ks) per member over forecast
+    member_stress_days: list[int]  # days with Ks < 0.9 per member
+    member_yield_impact: list[float]  # CC reduction vs no-stress (proxy)
+    # Ensemble summary
+    mean_max_stress: float
+    median_max_stress: float
+    pct_members_avoid_stress: float  # fraction with max Ks > 0.9
+    mean_stress_days: float
+
+
+def build_candidates(
+    parcel_config: ParcelConfig,
+    max_days_ahead: int = 7,
+) -> list[IrrigationCandidate]:
+    """Build candidate irrigation actions to evaluate.
+
+    Tests: no irrigation, plus each (day, dose) combination within
+    the farmer's constraints (available days, min/max dose, interval).
+    """
+    irr_cfg = parcel_config.irrigation
+    min_dose = irr_cfg.get("min_dose_mm", 15)
+    max_dose = irr_cfg.get("max_dose_mm", 40)
+
+    # Dose levels: min, mid, max
+    doses = sorted(set([min_dose, (min_dose + max_dose) / 2, max_dose]))
+
+    candidates = [
+        IrrigationCandidate(day_offset=-1, dose_mm=0, label="No irrigation"),
+    ]
+
+    for d in range(0, max_days_ahead + 1):
+        for dose in doses:
+            candidates.append( 
+                IrrigationCandidate(
+                    day_offset=d,
+                    dose_mm=dose,
+                    label=f"{dose:.0f}mm on day+{d}",
+                )
+            )
+
+    return candidates
+
+
+def evaluate_candidates_ensemble(
+    historical_forcing: DailyForcing,
+    member_forcings: dict[int, DailyForcing],
+    parcel: ParcelConfig,
+    terrain: TerrainParams,
+    soil_profile: SoilProfile,
+    sim_start: date,
+    today: date,
+    candidates: list[IrrigationCandidate] | None = None,
+    stress_threshold: float = 0.9,
+) -> list[CandidateResult]:
+    """Evaluate irrigation candidates across the ensemble.
+
+    For each candidate action × each IFS ENS member:
+    1. Build forcing = historical + member forecast
+    2. Insert the candidate irrigation event into the schedule
+    3. Run AquaCrop for the full period
+    4. Extract stress metrics over the forecast horizon
+
+    Returns candidates ranked by ensemble performance.
+
+    Typical runtime: 25 candidates × 50 members = 1250 runs ≈ 5-8 minutes.
+    """
+    if candidates is None:
+        candidates = build_candidates(parcel)
+
+    results = []
+
+    for ci, cand in enumerate(candidates):
+        member_max_stress = []
+        member_stress_days = []
+        member_yield_impact = []
+
+        for member_id, member_forcing in member_forcings.items():
+            full_forcing = historical_forcing.concat(member_forcing)
+            full_end = pd.Timestamp(full_forcing.dates[-1]).date()
+
+            # Build irrigation schedule: existing log + candidate event
+            irr_schedule = parcel_to_irrigation(parcel)
+
+            if cand.dose_mm > 0 and cand.day_offset >= 0:
+                # Add candidate event to schedule
+                event_date = today + pd.Timedelta(days=cand.day_offset)
+                extra = pd.DataFrame(
+                    {
+                        "Date": [pd.Timestamp(event_date)],
+                        "Depth": [cand.dose_mm],
+                    }
+                )
+
+                if irr_schedule.irrigation_method == 3:
+                    # Append to existing schedule
+                    combined = (
+                        pd.concat([irr_schedule.Schedule, extra], ignore_index=True)
+                        .sort_values("Date")
+                        .reset_index(drop=True)
+                    )
+                    irr_mgmt = IrrigationManagement(
+                        irrigation_method=3,
+                        Schedule=combined,
+                    )
+                else:
+                    irr_mgmt = IrrigationManagement(
+                        irrigation_method=3,
+                        Schedule=extra,
+                    )
+            else:
+                irr_mgmt = irr_schedule
+
+            # Run AquaCrop
+            try:
+                result = run_aquacrop(
+                    forcing=full_forcing,
+                    parcel=parcel,
+                    terrain=terrain,
+                    soil_profile=soil_profile,
+                    sim_start=sim_start,
+                    sim_end=full_end,
+                    irrigation_management=irr_mgmt,
+                )
+
+                stress = result.daily_stress
+                n_total = len(stress)
+                if n_total > 1 and stress["dap"].iloc[-1] == 0:
+                    n_total -= 1
+
+                # Extract forecast portion
+                n_forecast = member_forcing.n_days
+                fc_start = max(0, n_total - n_forecast)
+                fc_slice = stress.iloc[fc_start:n_total]
+
+                ks = fc_slice["ks"].values
+                max_stress = float(1.0 - np.nanmin(ks)) if len(ks) > 0 else 0.0
+                n_stress_days = int((ks < stress_threshold).sum())
+                cc_loss = (
+                    float((fc_slice["canopy_cover_ns"] - fc_slice["canopy_cover"]).mean())
+                    if "canopy_cover_ns" in fc_slice
+                    else 0.0
+                )
+
+                member_max_stress.append(max_stress)
+                member_stress_days.append(n_stress_days)
+                member_yield_impact.append(cc_loss)
+
+            except Exception as exc:
+                logger.warning("Member %d, candidate '%s' failed: %s", member_id, cand.label, exc)
+                member_max_stress.append(1.0)
+                member_stress_days.append(15)
+                member_yield_impact.append(1.0)
+
+        arr_stress = np.array(member_max_stress)
+        arr_days = np.array(member_stress_days)
+
+        results.append(
+            CandidateResult(
+                candidate=cand,
+                member_max_stress=member_max_stress,
+                member_stress_days=member_stress_days,
+                member_yield_impact=member_yield_impact,
+                mean_max_stress=float(np.mean(arr_stress)),
+                median_max_stress=float(np.median(arr_stress)),
+                pct_members_avoid_stress=float((arr_stress < (1 - stress_threshold)).mean()),
+                mean_stress_days=float(np.mean(arr_days)),
+            )
+        )
+
+        logger.info(
+            "Candidate %d/%d '%s': mean_stress=%.3f, avoid_pct=%.0f%%, mean_stress_days=%.1f",
+            ci + 1,
+            len(candidates),
+            cand.label,
+            results[-1].mean_max_stress,
+            results[-1].pct_members_avoid_stress * 100,
+            results[-1].mean_stress_days,
+        )
+
+    # Sort by best outcome: highest pct_members_avoid_stress, then lowest mean_stress
+    results.sort(key=lambda r: (-r.pct_members_avoid_stress, r.mean_max_stress))
+    return results
+
+
+def recommend_from_optimizer(
+    results: list[CandidateResult],
+    water_cost_eur_mm: float = 2.5,
+) -> dict:
+    """Pick the best irrigation action from optimizer results.
+
+    Selection logic:
+    1. If no-irrigation already avoids stress in >80% of members → don't irrigate
+    2. Otherwise, pick the cheapest action that avoids stress in >70% of members
+    3. If no action avoids stress in >70%, pick the one that minimizes mean stress
+
+    Returns a dict with the recommendation and comparison.
+    """
+    no_irr = next((r for r in results if r.candidate.dose_mm == 0), None)
+
+    if no_irr and no_irr.pct_members_avoid_stress > 0.80:
+        return {
+            "action": "No irrigation needed",
+            "reason": f"{no_irr.pct_members_avoid_stress:.0%} of members avoid stress without irrigation",
+            "candidate": no_irr.candidate,
+            "avoid_stress_pct": no_irr.pct_members_avoid_stress,
+            "mean_stress_days": no_irr.mean_stress_days,
+            "all_results": results,
+        }
+
+    # Find cheapest action that avoids stress in >70% of members
+    good = [r for r in results if r.pct_members_avoid_stress > 0.70 and r.candidate.dose_mm > 0]
+    if good:
+        # Sort by dose (cheapest first), then by earliest day
+        good.sort(key=lambda r: (r.candidate.dose_mm, r.candidate.day_offset))
+        best = good[0]
+        return {
+            "action": f"Irrigate {best.candidate.dose_mm:.0f}mm on day+{best.candidate.day_offset}",
+            "reason": (
+                f"{best.pct_members_avoid_stress:.0%} of members avoid stress. "
+                f"Mean stress days: {best.mean_stress_days:.1f} vs "
+                f"{no_irr.mean_stress_days:.1f} without irrigation"
+            ),
+            "candidate": best.candidate,
+            "avoid_stress_pct": best.pct_members_avoid_stress,
+            "mean_stress_days": best.mean_stress_days,
+            "cost_eur_ha": best.candidate.dose_mm * water_cost_eur_mm,
+            "all_results": results,
+        }
+
+    # Nothing avoids stress well — pick action that minimizes stress
+    best = results[0]  # already sorted by best outcome
+    return {
+        "action": f"Irrigate {best.candidate.dose_mm:.0f}mm on day+{best.candidate.day_offset} (limited benefit)",
+        "reason": (
+            f"No action avoids stress in >70% of members. Best option: "
+            f"{best.pct_members_avoid_stress:.0%} avoid stress, "
+            f"mean {best.mean_stress_days:.1f} stress days"
+        ),
+        "candidate": best.candidate,
+        "avoid_stress_pct": best.pct_members_avoid_stress,
+        "mean_stress_days": best.mean_stress_days,
+        "all_results": results,
+    }

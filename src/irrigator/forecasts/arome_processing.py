@@ -464,7 +464,7 @@ def _build_static(target_date: date, out_path: Path) -> Path:
     if press_files:
         daily["pressure_kpa"] = xr.concat(
             [_open_grib_scalar(f, is_surface=True) for f in press_files], dim="step"
-        ).mean(dim="step")
+        ).mean(dim="step") / 1000
 
     ds = xr.Dataset(
         {k: v.expand_dims(valid_time=[np.datetime64(target_date)]) for k, v in daily.items()}
@@ -528,7 +528,7 @@ def _build_dynamic(target_date: date, out_path: Path) -> Path:
 
     sp = _collect("surface_pressure", is_surface=True)
     if sp:
-        daily["pressure_kpa"] = xr.concat(sp, dim="step").mean(dim="step")
+        daily["pressure_kpa"] = xr.concat(sp, dim="step").mean(dim="step") / 1000
 
     n_win = len(window_dirs)
 
@@ -628,7 +628,7 @@ def _build_forecast(target_date: date, out_path: Path) -> Path:
                 [_open_grib_scalar(path, is_surface=True) for path in sp_files],
                 dim="step",
             )
-            sub_daily[index]["pressure_kpa"] = surface_press.mean(dim="step") - 273.15
+            sub_daily[index]["pressure_kpa"] = surface_press.mean(dim="step") / 1000
 
     # Convert each day's sub-daily aggregates into a Dataset with a
     # length-one valid_time dimension.

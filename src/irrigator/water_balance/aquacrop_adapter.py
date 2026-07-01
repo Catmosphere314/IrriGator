@@ -81,13 +81,19 @@ def forcing_to_weather(
     return weather
 
 
-def soil_to_aquacrop(profile: SoilProfile) -> Soil:
+def soil_to_aquacrop(profile: SoilProfile, min_depth_m: float = 2.5) -> Soil:
     """Convert IrriGator SoilProfile to AquaCrop Soil object.
 
     Requires theta_s (saturation water content) in the profile.
     If not available, estimates it from field capacity.
     """
     dz = [(bottom - top) / 100.0 for top, bottom in profile.z_layers_cm]
+
+    total = sum(dz)
+    # Ensure profile is deep enough for maize (Zmax ≈ 2.3m + 0.1m buffer)
+    if total < min_depth_m:
+        dz[-1] += min_depth_m - total
+
     soil = Soil("custom", dz=dz)
 
     for i, (top, bottom) in enumerate(profile.z_layers_cm):
@@ -304,6 +310,7 @@ def run_aquacrop(
 @dataclass
 class AquaCropEnsembleStats:
     """Per-day ensemble statistics from AquaCrop forecast runs."""
+
     date: date
     day_offset: int
     source: str  # "historical" or "ifs_ens"
@@ -367,7 +374,11 @@ def run_ensemble_aquacrop(
 
     logger.info(
         "Running AquaCrop ensemble: %d members, %s → %s (forecast: %s → %s)",
-        len(member_forcings), sim_start, forecast_end, today, forecast_end,
+        len(member_forcings),
+        sim_start,
+        forecast_end,
+        today,
+        forecast_end,
     )
 
     # Run each member
@@ -410,9 +421,7 @@ def run_ensemble_aquacrop(
         all_member_precip[member_id] = forecast_slice["precip_mm"].values
 
         if member_dates is None:
-            member_dates = pd.to_datetime(
-                first_forcing.dates[:len(forecast_slice)]
-            )
+            member_dates = pd.to_datetime(first_forcing.dates[: len(forecast_slice)])
 
     # Aggregate ensemble statistics per day
     n_days = min(len(v) for v in all_member_ks.values())
@@ -425,22 +434,24 @@ def run_ensemble_aquacrop(
 
         day_date = member_dates[d] if d < len(member_dates) else None
 
-        daily_stats.append(AquaCropEnsembleStats(
-            date=day_date,
-            day_offset=d,
-            source="ifs_ens",
-            ks_mean=float(np.nanmean(ks_arr)),
-            ks_median=float(np.nanmedian(ks_arr)),
-            ks_p25=float(np.nanpercentile(ks_arr, 25)),
-            ks_p75=float(np.nanpercentile(ks_arr, 75)),
-            ks_min=float(np.nanmin(ks_arr)),
-            ks_max=float(np.nanmax(ks_arr)),
-            cc_mean=float(np.nanmean(cc_arr)),
-            wr_mean=float(np.nanmean(wr_arr)),
-            precip_mean=float(np.nanmean(pr_arr)),
-            n_members_stressed=int((ks_arr < stress_threshold).sum()),
-            n_members_total=len(ks_arr),
-        ))
+        daily_stats.append(
+            AquaCropEnsembleStats(
+                date=day_date,
+                day_offset=d,
+                source="ifs_ens",
+                ks_mean=float(np.nanmean(ks_arr)),
+                ks_median=float(np.nanmedian(ks_arr)),
+                ks_p25=float(np.nanpercentile(ks_arr, 25)),
+                ks_p75=float(np.nanpercentile(ks_arr, 75)),
+                ks_min=float(np.nanmin(ks_arr)),
+                ks_max=float(np.nanmax(ks_arr)),
+                cc_mean=float(np.nanmean(cc_arr)),
+                wr_mean=float(np.nanmean(wr_arr)),
+                precip_mean=float(np.nanmean(pr_arr)),
+                n_members_stressed=int((ks_arr < stress_threshold).sum()),
+                n_members_total=len(ks_arr),
+            )
+        )
 
     logger.info(
         "Ensemble complete: %d days, %d members, stress_days=%d",
@@ -604,8 +615,7 @@ def optimize_irrigation(
     )
 
     logger.info(
-        "Optimization complete: SMT=%s, yield=%.1f t/ha, "
-        "irrigation=%d mm, profit=€%.0f/ha",
+        "Optimization complete: SMT=%s, yield=%.1f t/ha, irrigation=%d mm, profit=€%.0f/ha",
         [f"{s:.0f}" for s in optimal_smt],
         metrics["yield_t_ha"],
         metrics["seasonal_irrigation_mm"],
@@ -613,3 +623,198 @@ def optimize_irrigation(
     )
 
     return metrics
+
+
+# ---------------------------------------------------------------------------
+# Bridge: AquaCrop outputs → decision layer format
+# ---------------------------------------------------------------------------
+
+
+def aquacrop_to_current_state(
+    hist_run: AquaCropResult,
+    soil_profile: SoilProfile,
+    today: date,
+) -> "WaterBalanceState":
+    """Extract current state from AquaCrop historical run.
+
+    Converts AquaCrop's last-day outputs into a WaterBalanceState
+    compatible with the existing decision layer (compute_recommendation).
+    """
+    from irrigator.water_balance.state import WaterBalanceState
+
+    stress = hist_run.daily_stress
+    wf = hist_run.water_flux
+    cg = hist_run.crop_growth
+
+    # Use second-to-last row (last row is often a zero/terminal row)
+    idx = -2 if len(stress) > 1 else -1
+
+    z_root = float(stress["z_root_m"].iloc[idx])
+    if z_root <= 0:
+        z_root = 0.1  # minimum
+
+    # Compute TAW and depletion from root zone water content
+    # Weighted average FC/WP over root depth
+    total_depth_cm = soil_profile.z_layers_cm[-1][1]
+    total_thick = sum(b - t for t, b in soil_profile.z_layers_cm)
+    avg_fc, avg_wp = 0.0, 0.0
+    for i, (top, bot) in enumerate(soil_profile.z_layers_cm):
+        w = (bot - top) / total_thick
+        avg_fc += soil_profile.theta_fc[i] * w
+        avg_wp += soil_profile.theta_wp[i] * w
+
+    taw = (avg_fc - avg_wp) * z_root * 1000  # mm
+    wr = float(stress["wr_mm"].iloc[idx])
+    fc_content = avg_fc * z_root * 1000  # water at FC in mm
+    depletion = max(0.0, fc_content - wr)
+
+    ks = float(stress["ks"].iloc[idx])
+    gdd = float(stress["gdd_cum"].iloc[idx])
+    cc = float(stress["canopy_cover"].iloc[idx])
+    dap = float(stress["dap"].iloc[idx])
+
+    # Estimate Kc from canopy cover (Beer's law)
+    kc = 1.2 * (1.0 - np.exp(-0.65 * cc * 10)) if cc > 0.01 else 0.0
+    kc = min(1.2, max(0.0, kc))
+
+    # Crop stage from GDD
+    if dap <= 0:
+        stage = "not_planted"
+    elif gdd < 80:
+        stage = "pre_emergence"
+    elif gdd < 300:
+        stage = "initial"
+    elif gdd < 700:
+        stage = "development"
+    elif gdd < 1300:
+        stage = "midseason"
+    elif gdd < 1700:
+        stage = "mature"
+    else:
+        stage = "harvest"
+
+    # p_adj for RAW
+    etc_act = float(stress["tr_mm"].iloc[idx]) + float(stress["es_mm"].iloc[idx])
+    p = 0.55  # maize default
+    p_adj = p + 0.04 * (5.0 - etc_act)
+    p_adj = max(0.1, min(0.8, p_adj))
+    raw = p_adj * taw
+
+    et0 = float(stress["tr_pot_mm"].iloc[idx]) / max(kc, 0.01) if kc > 0.01 else 0.0
+
+    return WaterBalanceState(
+        date=today,
+        et0=et0,
+        kc=kc,
+        etc_pot=float(stress["tr_pot_mm"].iloc[idx]),
+        etc_act=etc_act,
+        precip=float(stress["precip_mm"].iloc[idx]),
+        irrigation=float(stress["irrigation_mm"].iloc[idx]),
+        runoff=0.0,
+        drainage=float(stress["deep_perc_mm"].iloc[idx]),
+        depletion=depletion,
+        taw=taw,
+        raw=raw,
+        stress_coeff=ks,
+        z_root=z_root,
+        gdd=gdd,
+        crop_stage=stage,
+    )
+
+
+def build_blended_stress_report(
+    arome_run: AquaCropResult,
+    ensemble_stats: list[AquaCropEnsembleStats],
+    today: date,
+    arome_days: int = 2,
+) -> "EnsembleStressReport":
+    """Build an EnsembleStressReport blending AROME + IFS ENS.
+
+    Days 0 to arome_days-1: from AROME deterministic AquaCrop run.
+    Days arome_days onwards: from IFS ENS ensemble AquaCrop runs.
+
+    Returns an EnsembleStressReport compatible with compute_recommendation().
+    """
+    from irrigator.forecasts.short_term import (
+        DailyEnsembleStats,
+        EnsembleStressReport,
+    )
+
+    daily_stats = []
+
+    # AROME deterministic days (days 0 to arome_days-1)
+    arome_stress = arome_run.daily_stress
+    # Find the rows corresponding to today onwards
+    arome_wf = arome_run.water_flux
+    n_total = len(arome_stress)
+    # Skip the terminal zero row
+    if n_total > 1 and arome_stress["dap"].iloc[-1] == 0:
+        n_total -= 1
+    # The last arome_days rows before the terminal row are the forecast
+    arome_forecast_start = max(0, n_total - arome_days)
+
+    for d in range(min(arome_days, n_total - arome_forecast_start)):
+        row_idx = arome_forecast_start + d
+        if row_idx >= len(arome_stress):
+            break
+        ks = float(arome_stress["ks"].iloc[row_idx])
+        day_date = today + pd.Timedelta(days=d)
+
+        daily_stats.append(
+            DailyEnsembleStats(
+                date=day_date,
+                day_offset=d,
+                source="arome",
+                ks_mean=ks,
+                ks_median=ks,
+                ks_p25=ks,
+                ks_p75=ks,
+                ks_min=ks,
+                ks_max=ks,
+                depletion_mean=0.0,
+                depletion_p25=0.0,
+                depletion_p75=0.0,
+                precip_mean=float(arome_stress["precip_mm"].iloc[row_idx]),
+                precip_p25=float(arome_stress["precip_mm"].iloc[row_idx]),
+                precip_p75=float(arome_stress["precip_mm"].iloc[row_idx]),
+                etc_mean=float(arome_stress["tr_mm"].iloc[row_idx]),
+                n_members_stressed=1 if ks < 0.9 else 0,
+                n_members_total=1,
+            )
+        )
+
+    # IFS ENS ensemble days (skip the first arome_days of ensemble stats)
+    for stat in ensemble_stats:
+        if stat.day_offset < arome_days:
+            continue
+        daily_stats.append(
+            DailyEnsembleStats(
+                date=stat.date,
+                day_offset=stat.day_offset,
+                source="ifs_ens",
+                ks_mean=stat.ks_mean,
+                ks_median=stat.ks_median,
+                ks_p25=stat.ks_p25,
+                ks_p75=stat.ks_p75,
+                ks_min=stat.ks_min,
+                ks_max=stat.ks_max,
+                depletion_mean=0.0,
+                depletion_p25=0.0,
+                depletion_p75=0.0,
+                precip_mean=stat.precip_mean,
+                precip_p25=stat.precip_mean,
+                precip_p75=stat.precip_mean,
+                etc_mean=0.0,
+                n_members_stressed=stat.n_members_stressed,
+                n_members_total=stat.n_members_total,
+            )
+        )
+
+    n_ens = ensemble_stats[0].n_members_total if ensemble_stats else 0
+
+    return EnsembleStressReport(
+        daily_stats=daily_stats,
+        n_members=n_ens,
+        arome_days=arome_days,
+        ens_days=len(daily_stats) - arome_days,
+    )

@@ -83,9 +83,15 @@ class DailyForcing:
             }
         ).set_index("date")
 
-    def slice(self, start: date, end: date) -> DailyForcing:
+    def slice(self, start: date | None = None, end: date | None = None) -> DailyForcing:
         """Return a DailyForcing for a date sub-range."""
-        mask = (self.dates >= np.datetime64(start)) & (self.dates <= np.datetime64(end))
+        mask = (
+            (self.dates >= np.datetime64(start)) & (self.dates <= np.datetime64(end))
+            if start is not None and end is not None
+            else (self.dates >= np.datetime64(start))
+            if start is not None
+            else (self.dates <= np.datetime64(end))
+        )
         return DailyForcing(
             dates=self.dates[mask],
             t_min=self.t_min[mask],
@@ -143,6 +149,7 @@ class DailyForcing:
             rs_mj=np.concatenate([self.rs_mj, other.rs_mj[new_mask]]),
             precip_mm=np.concatenate([self.precip_mm, other.precip_mm[new_mask]]),
         )
+
 
 # ---------------------------------------------------------------------------
 # Wind height conversion

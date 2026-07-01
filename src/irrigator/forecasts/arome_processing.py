@@ -59,8 +59,8 @@ def ensure_dirs() -> None:
 
 VARS_INSTANTANEOUS = {
     "temp_2m": {
-        "coverage": "TEMPERATURE__GROUND_OR_WATER_SURFACE",
-        "height": None,
+        "coverage": "TEMPERATURE__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND",
+        "height": "2",
         "static_hours": list(range(0, 24)),  # all 24 for Tmin/Tmax
         "dynamic_hours": [0, 1, 2],  # single snapshot per window
     },
@@ -74,6 +74,12 @@ VARS_INSTANTANEOUS = {
         "coverage": "DEW_POINT_TEMPERATURE__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND",
         "height": "2",
         "static_hours": list(range(0, 24)),
+        "dynamic_hours": [0, 1, 2],
+    },
+    "surface_pressure": {
+        "coverage": "PRESSURE__GROUND_OR_WATER_SURFACE",
+        "height": None,
+        "static_hours": list(range(0, 24)),  # 3-hourly, 8 values
         "dynamic_hours": [0, 1, 2],
     },
 }
@@ -199,8 +205,14 @@ def fetch_single_timestep(
     bbox: dict = FRANCE_BBOX,
     height: str | None = None,
     overwrite: bool = False,
+    max_retries : int = 4,
 ) -> Path:
-    """Fetch one AROME grid for one timestep."""
+    """Fetch one AROME grid for one timestep.
+
+    Retries with exponential backoff on 502/503/504 errors, which are
+    common when the Météo-France backend is congested (especially right
+    after a new model run is published).
+    """
     if out_path.exists() and not overwrite:
         return out_path
 
@@ -223,14 +235,52 @@ def fetch_single_timestep(
     if height:
         params["subset"].append(f"height({height})")
 
-    resp = session.get(f"{BASE_URL}/{WCS_RESOURCE}/GetCoverage", params=params, timeout=120)
-    if not resp.ok:
-        logger.error("FAIL %s at %s: %d", coverage_id[:50], time_str, resp.status_code)
-        resp.raise_for_status()
+    url = f"{BASE_URL}/{WCS_RESOURCE}/GetCoverage"
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_bytes(resp.content)
-    return out_path
+    for attempt in range(max_retries + 1):
+        try:
+            resp = session.get(url, params=params, timeout=120)
+
+            if resp.status_code in (502, 503, 504) and attempt < max_retries:
+                wait = API_PAUSE * (2**attempt) + API_PAUSE
+                logger.warning(
+                    "Retry %d/%d for %s at %s (HTTP %d, waiting %.0fs)",
+                    attempt + 1,
+                    max_retries,
+                    coverage_id[:50],
+                    time_str,
+                    resp.status_code,
+                    wait,
+                )
+                time.sleep(wait)
+                continue
+
+            if not resp.ok:
+                logger.error("FAIL %s at %s: %d", coverage_id[:50], time_str, resp.status_code)
+                resp.raise_for_status()
+
+            # Success
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(resp.content)
+            return out_path
+
+        except requests.exceptions.Timeout:
+            if attempt < max_retries:
+                wait = API_PAUSE * (2**attempt) + API_PAUSE
+                logger.warning(
+                    "Timeout %d/%d for %s at %s (waiting %.0fs)",
+                    attempt + 1,
+                    max_retries,
+                    coverage_id[:50],
+                    time_str,
+                    wait,
+                )
+                time.sleep(wait)
+                continue
+            raise
+
+    # Should not reach here, but just in case
+    raise requests.HTTPError(f"Failed after {max_retries} retries: {coverage_id} at {time_str}")
 
 
 # -----------------------------------
@@ -389,7 +439,7 @@ def _build_static(target_date: date, out_path: Path) -> Path:
     # Temperature: hourly → min/max/mean
     temp_files = sorted(day_dir.glob("temp_2m_*.grib2"))
     if temp_files:
-        temps = xr.concat([_open_grib_scalar(f, is_surface=True) for f in temp_files], dim="step")
+        temps = xr.concat([_open_grib_scalar(f, is_surface=False) for f in temp_files], dim="step")
         daily["t_min"] = temps.min(dim="step") - 273.15
         daily["t_max"] = temps.max(dim="step") - 273.15
         daily["t_mean"] = temps.mean(dim="step") - 273.15
@@ -408,6 +458,13 @@ def _build_static(target_date: date, out_path: Path) -> Path:
             xr.concat([_open_grib_scalar(f) for f in dew_files], dim="step").mean(dim="step")
             - 273.15
         )
+
+    # Ground Pressure: 3-hourly → mean, Kpa
+    press_files = sorted(day_dir.glob("surface_pressure_*.grib2"))
+    if press_files:
+        daily["pressure_kpa"] = xr.concat(
+            [_open_grib_scalar(f, is_surface=True) for f in press_files], dim="step"
+        ).mean(dim="step") / 1000
 
     ds = xr.Dataset(
         {k: v.expand_dims(valid_time=[np.datetime64(target_date)]) for k, v in daily.items()}
@@ -455,7 +512,7 @@ def _build_dynamic(target_date: date, out_path: Path) -> Path:
             for path in sorted(wd.glob(f"{name}_*.grib2"))
         ]
 
-    tv = _collect("temp_2m", is_surface=True)
+    tv = _collect("temp_2m", is_surface=False)
     if tv:
         t = xr.concat(tv, dim="step")
         daily["t_min"] = t.min(dim="step") - 273.15
@@ -468,6 +525,10 @@ def _build_dynamic(target_date: date, out_path: Path) -> Path:
     dv = _collect("dewpoint_2m", is_surface=False)
     if dv:
         daily["dewpoint"] = xr.concat(dv, dim="step").mean(dim="step") - 273.15
+
+    sp = _collect("surface_pressure", is_surface=True)
+    if sp:
+        daily["pressure_kpa"] = xr.concat(sp, dim="step").mean(dim="step") / 1000
 
     n_win = len(window_dirs)
 
@@ -531,7 +592,7 @@ def _build_forecast(target_date: date, out_path: Path) -> Path:
 
         if temp_files:
             temps = xr.concat(
-                [_open_grib_scalar(path, is_surface=True) for path in temp_files],
+                [_open_grib_scalar(path, is_surface=False) for path in temp_files],
                 dim="step",
             )
 
@@ -558,6 +619,16 @@ def _build_forecast(target_date: date, out_path: Path) -> Path:
                 dim="step",
             )
             sub_daily[index]["dewpoint"] = dewpoints.mean(dim="step") - 273.15
+
+        # Dewpoint: 3-hourly → daily mean, K → °C
+        sp_files = sorted(day_dir.glob(f"surface_pressure_day{day}_*.grib2"))
+
+        if sp_files:
+            surface_press = xr.concat(
+                [_open_grib_scalar(path, is_surface=True) for path in sp_files],
+                dim="step",
+            )
+            sub_daily[index]["pressure_kpa"] = surface_press.mean(dim="step") / 1000
 
     # Convert each day's sub-daily aggregates into a Dataset with a
     # length-one valid_time dimension.
@@ -837,6 +908,7 @@ def load_arome_daily_cache(
         )
     if not files:
         raise FileNotFoundError(f"No AROME for {start_date} → {end_date}")
+    
 
     return xr.open_mfdataset(files, combine="by_coords")
 

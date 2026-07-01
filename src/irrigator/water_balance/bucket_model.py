@@ -29,7 +29,7 @@ References
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
@@ -199,7 +199,6 @@ def run_simulation(
     terrain: TerrainParams,
     soil: SoilProfile,
     crop_params: CropParams,
-    irrigation_schedule: dict[date, float] | None = None,
     initial_depletion_frac: float = 0.0,
 ) -> list[WaterBalanceState]:
     """Run the coupled crop growth + water balance simulation.
@@ -217,8 +216,6 @@ def run_simulation(
     terrain : TerrainParams
     soil : SoilProfile from Block 1
     crop_params : CropParams (GDD thresholds, Kc values, etc.)
-    irrigation_schedule : dict mapping dates to irrigation amounts [mm]
-                         (None or {} for rainfed simulation)
     initial_depletion_frac : starting depletion as fraction of TAW
                              0.0 = at field capacity, 1.0 = at wilting point
 
@@ -226,8 +223,6 @@ def run_simulation(
     -------
     List of WaterBalanceState, one per day.
     """
-    if irrigation_schedule is None:
-        irrigation_schedule = {}
 
     n = forcing.n_days
     logger.info(
@@ -261,7 +256,11 @@ def run_simulation(
         t_max = float(forcing.t_max[i])
         et0 = float(et0_series[i])
         precip = float(forcing.precip_mm[i])
-        irrigation = irrigation_schedule.get(current_date, 0.0)
+        irrigation = [
+            irrig_i.get("amount_mm")
+            for irrig_i in parcel.irrigation_log
+            if datetime.strptime(irrig_i.get("date"), "%Y-%m-%d").date() == current_date
+        ]
 
         # Step 1: advance crop
         crop = advance_crop(current_date, t_min, t_max, gdd_prev, crop_params)
@@ -271,7 +270,7 @@ def run_simulation(
             current_date=current_date,
             et0=et0,
             precip=precip,
-            irrigation=irrigation,
+            irrigation=sum(irrigation),
             crop=crop,
             soil=soil,
             dr_prev=dr,

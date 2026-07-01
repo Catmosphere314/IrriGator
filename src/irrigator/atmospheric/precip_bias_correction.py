@@ -5,23 +5,30 @@ precipitation.  CDF-t (Michelangeli et al., 2009) maps the ERA5-Land
 precipitation distribution to the observed distribution (COMEPHORE)
 while accounting for potential non-stationarity.
 
-The correction is fitted PER ERA5-Land GRID CELL using the COMEPHORE
-pixels that fall within each cell.  This ensures local bias structure
-is captured (alluvial valleys vs. limestone plateaux behave differently).
+The correction is fitted at the COMEPHORE pixel level (1 km), using
+the ERA5-Land cell value that covers that pixel.  This captures
+sub-grid bias structure — a valley parcel gets a different correction
+than a hilltop parcel even within the same ~9 km ERA5 cell.
 
 When COMEPHORE data is not available, falls back to simple multiplicative
 bias correction or no correction.
+
+Calibration period
+------------------
+COMEPHORE is available 1997–present (~2 month lag).  The recommended
+calibration period is 2010–2025 (post-upgrade, better radar coverage).
+Use ``quality_frac`` from the daily COMEPHORE to filter out low-quality
+days before fitting.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import xarray as xr
-
-from irrigator.config import RegionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -167,71 +174,139 @@ def fit_multiplicative(
 
 
 # ---------------------------------------------------------------------------
-# Calibration workflow
+# Calibration at parcel level
 # ---------------------------------------------------------------------------
 
 
 def calibrate_precipitation(
-    cfg: RegionConfig,
     era5_daily: xr.Dataset,
-    comephore: xr.Dataset | None = None,
+    comephore_daily: xr.Dataset | None = None,
+    *,
+    parcel_lon: float | None = None,
+    parcel_lat: float | None = None,
+    min_quality: float = 0.5,
     method: str = "cdf_t",
-    parcel_x: float | None = None,
-    parcel_y: float | None = None,
 ) -> BiasCorrection:
     """Fit precipitation bias correction at a parcel location.
 
-    Uses ERA5-Land precipitation and COMEPHORE observations over the
-    calibration period defined in the config.
+    Pairs the ERA5-Land cell covering the parcel with the nearest
+    COMEPHORE pixel (1 km).  The correction captures local bias
+    at sub-ERA5-cell resolution.
 
     Parameters
     ----------
-    cfg : RegionConfig
-    era5_daily : daily ERA5-Land with 'precip_mm' variable
-    comephore : COMEPHORE daily precipitation (if available)
+    era5_daily : daily ERA5-Land Dataset with 'precip_mm' variable
+        (from ``era5_processor.load_daily``)
+    comephore_daily : daily COMEPHORE Dataset with 'precip_mm' variable
+        (from ``comephore_client.load_comephore_daily``).
+        May also contain 'quality_frac' for filtering.
+    parcel_lon, parcel_lat : parcel WGS84 coordinates
+    min_quality : minimum quality_frac to include a day in calibration
+        (default: 0.5 = at least 50% of hours had good radar coverage)
     method : "cdf_t", "quantile_mapping", or "multiplicative"
-    parcel_x, parcel_y : parcel coordinates in Lambert-93
 
     Returns
     -------
     Fitted BiasCorrection.
     """
-    if comephore is None:
+    if comephore_daily is None:
         logger.warning(
             "No COMEPHORE data — precipitation will not be bias-corrected. "
             "Download COMEPHORE and rerun for better accuracy."
         )
         return BiasCorrection(method="none")
 
-    # Extract time series at the nearest grid points
-    if parcel_x is not None and parcel_y is not None:
-        era5_ts = era5_daily["precip_mm"].sel(x=parcel_x, y=parcel_y, method="nearest").values
+    # --- Extract ERA5-Land time series at parcel ---
+    if parcel_lon is not None and parcel_lat is not None:
+        era5_cell = era5_daily["precip_mm"].sel(
+            longitude=parcel_lon,
+            latitude=parcel_lat,
+            method="nearest",
+        )
     else:
-        # Use spatial mean as fallback
-        era5_ts = era5_daily["precip_mm"].mean(dim=["x", "y"]).values
+        era5_cell = era5_daily["precip_mm"].mean(dim=["longitude", "latitude"])
 
-    # COMEPHORE needs to be matched to the same time range
-    # and aggregated to the ERA5 grid cell (mean of ~80 COMEPHORE pixels)
-    if parcel_x is not None and parcel_y is not None:
-        # COMEPHORE is in WGS84 typically — may need coordinate matching
+    # --- Extract COMEPHORE time series at nearest 1 km pixel ---
+    comephore_precip = comephore_daily["precip_mm"]
+
+    # COMEPHORE uses Lambert-93 (x, y) — try that first, then WGS84
+    if parcel_lon is not None and parcel_lat is not None:
         try:
-            obs_ts = comephore.sel(x=parcel_x, y=parcel_y, method="nearest").values.flatten()
-        except Exception:
-            # Try lat/lon coordinates
+            # Try projected coordinates (Lambert-93)
             from pyproj import Transformer
 
-            to_wgs = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
-            lon, lat = to_wgs.transform(parcel_x, parcel_y)
-            obs_ts = comephore.sel(longitude=lon, latitude=lat, method="nearest").values.flatten()
+            to_l93 = Transformer.from_crs("EPSG:4326", "EPSG:2154", always_xy=True)
+            px, py = to_l93.transform(parcel_lon, parcel_lat)
+            obs_cell = comephore_precip.sel(x=px, y=py, method="nearest")
+        except (KeyError, ValueError):
+            # Try WGS84 coordinates
+            try:
+                obs_cell = comephore_precip.sel(
+                    longitude=parcel_lon,
+                    latitude=parcel_lat,
+                    method="nearest",
+                )
+            except (KeyError, ValueError):
+                obs_cell = comephore_precip.sel(
+                    x=parcel_lon,
+                    y=parcel_lat,
+                    method="nearest",
+                )
     else:
-        obs_ts = comephore.mean(dim=["x", "y"]).values.flatten()
+        obs_cell = comephore_precip.mean(dim=[d for d in comephore_precip.dims if d != "time"])
 
-    # Align lengths
-    min_len = min(len(era5_ts), len(obs_ts))
-    era5_ts = era5_ts[:min_len]
-    obs_ts = obs_ts[:min_len]
+    # --- Quality filtering ---
+    if "quality_frac" in comephore_daily:
+        if parcel_lon is not None and parcel_lat is not None:
+            try:
+                from pyproj import Transformer
 
-    if method == "cdf_t" or method == "quantile_mapping":
-        return fit_cdf_t(era5_ts, obs_ts)
+                to_l93 = Transformer.from_crs("EPSG:4326", "EPSG:2154", always_xy=True)
+                px, py = to_l93.transform(parcel_lon, parcel_lat)
+                quality = comephore_daily["quality_frac"].sel(x=px, y=py, method="nearest")
+            except (KeyError, ValueError):
+                quality = comephore_daily["quality_frac"].sel(
+                    longitude=parcel_lon,
+                    latitude=parcel_lat,
+                    method="nearest",
+                )
+        else:
+            quality = comephore_daily["quality_frac"].mean(
+                dim=[d for d in comephore_daily["quality_frac"].dims if d != "time"]
+            )
+
+        good_quality = quality >= min_quality
+        obs_cell = obs_cell.where(good_quality)
+        n_filtered = int((~good_quality).sum())
+        if n_filtered > 0:
+            logger.info(
+                "Filtered %d low-quality COMEPHORE days (quality_frac < %.2f)",
+                n_filtered,
+                min_quality,
+            )
+
+    # --- Align on overlapping time ---
+    era5_ts = era5_cell.to_series().dropna()
+    obs_ts = obs_cell.to_series().dropna()
+
+    common_dates = era5_ts.index.intersection(obs_ts.index)
+    if len(common_dates) == 0:
+        logger.warning(
+            "No overlapping dates between ERA5-Land and COMEPHORE — cannot fit bias correction"
+        )
+        return BiasCorrection(method="none")
+
+    era5_arr = era5_ts.loc[common_dates].values
+    obs_arr = obs_ts.loc[common_dates].values
+
+    logger.info(
+        "Calibrating CDF-t: %d overlapping days (ERA5 %.1f mm/d, COMEPHORE %.1f mm/d)",
+        len(common_dates),
+        era5_arr[era5_arr > 0.1].mean() if (era5_arr > 0.1).any() else 0,
+        obs_arr[obs_arr > 0.1].mean() if (obs_arr > 0.1).any() else 0,
+    )
+
+    if method in ("cdf_t", "quantile_mapping"):
+        return fit_cdf_t(era5_arr, obs_arr)
     else:
-        return fit_multiplicative(era5_ts, obs_ts)
+        return fit_multiplicative(era5_arr, obs_arr)

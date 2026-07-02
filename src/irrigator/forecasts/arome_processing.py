@@ -205,7 +205,7 @@ def fetch_single_timestep(
     bbox: dict = FRANCE_BBOX,
     height: str | None = None,
     overwrite: bool = False,
-    max_retries : int = 4,
+    max_retries: int = 4,
 ) -> Path:
     """Fetch one AROME grid for one timestep.
 
@@ -462,9 +462,12 @@ def _build_static(target_date: date, out_path: Path) -> Path:
     # Ground Pressure: 3-hourly → mean, Kpa
     press_files = sorted(day_dir.glob("surface_pressure_*.grib2"))
     if press_files:
-        daily["pressure_kpa"] = xr.concat(
-            [_open_grib_scalar(f, is_surface=True) for f in press_files], dim="step"
-        ).mean(dim="step") / 1000
+        daily["pressure_kpa"] = (
+            xr.concat(
+                [_open_grib_scalar(f, is_surface=True) for f in press_files], dim="step"
+            ).mean(dim="step")
+            / 1000
+        )
 
     ds = xr.Dataset(
         {k: v.expand_dims(valid_time=[np.datetime64(target_date)]) for k, v in daily.items()}
@@ -651,7 +654,7 @@ def _build_forecast(target_date: date, out_path: Path) -> Path:
 
             cleaned_variables[name] = array
 
-        valid_time = np.datetime64(target_date + timedelta(days=day))
+        valid_time = np.datetime64(target_date + timedelta(days=day - 1))
 
         day_dataset = (
             xr.Dataset(cleaned_variables)
@@ -664,8 +667,13 @@ def _build_forecast(target_date: date, out_path: Path) -> Path:
     # Dataset containing precipitation and radiation.
     daily_dataset = xr.Dataset(daily).transpose("valid_time", "latitude", "longitude", ...)
 
+    # P1D accumulations have valid_time at the END of the accumulation
+    # period (step 24h / 48h from 00Z = target_date+1 / target_date+2).
+    # Shift back by 1 day so the valid_time represents the day the weather
+    # actually occurred (target_date+0 / target_date+1), matching the
+    # sub-daily variables.
     daily_dataset = daily_dataset.assign_coords(
-        valid_time=daily_dataset.valid_time.astype("datetime64[s]")
+        valid_time=(daily_dataset.valid_time.astype("datetime64[s]") - np.timedelta64(1, "D"))
     )
 
     datasets_to_merge = [daily_dataset]
@@ -908,7 +916,6 @@ def load_arome_daily_cache(
         )
     if not files:
         raise FileNotFoundError(f"No AROME for {start_date} → {end_date}")
-    
 
     return xr.open_mfdataset(files, combine="by_coords")
 

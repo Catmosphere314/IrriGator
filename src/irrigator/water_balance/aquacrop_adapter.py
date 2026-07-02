@@ -352,13 +352,9 @@ def run_ensemble_aquacrop(
 ) -> list[AquaCropEnsembleStats]:
     """Run AquaCrop for each IFS ENS member and compute ensemble statistics.
 
-    For each member:
-    1. Concatenate historical forcing (Jan 1 → today) with member forecast
-    2. Run AquaCrop for the full period
-    3. Extract the forecast portion (today → end) of the results
-
-    This ensures crop state at the forecast start is consistent
-    across all members and the stress-growth coupling is preserved.
+    Optimized: weather DataFrames (including ET₀) are pre-computed once
+    for the historical+AROME portion and once per member for the forecast
+    portion, rather than redundantly inside each ``run_aquacrop`` call.
 
     Parameters
     ----------
@@ -374,23 +370,42 @@ def run_ensemble_aquacrop(
     """
     daily_stats: list[AquaCropEnsembleStats] = []
 
-    # Merge historical and arome
-    deter_forcing = historical_forcing.concat(arome_forcing)
+    # Pre-compute shared objects
+    soil = soil_to_aquacrop(soil_profile)
+    crop = parcel_to_crop(parcel)
+    iwc = InitialWaterContent(value=["FC"])
 
-    # Determine forecast end from first member
+    # Base weather: historical + AROME (ET₀ computed once)
+    deter_forcing = historical_forcing.concat(arome_forcing)
+    base_weather = forcing_to_weather(deter_forcing, terrain, parcel.lat)
+
+    # Determine forecast length from first member
     first_forcing = next(iter(member_forcings.values()))
-    forecast_end = pd.Timestamp(first_forcing.dates[-1]).date()
-    n_hist = len(deter_forcing.dates)
     n_forecast = first_forcing.n_days
 
     logger.info(
-        "Running AquaCrop ensemble: %d members, %s → %s (forecast: %s → %s)",
+        "Running AquaCrop ensemble: %d members, %s → %s "
+        "(weather pre-computed, %d hist + %d forecast days)",
         len(member_forcings),
         sim_start,
-        forecast_end,
-        today,
-        forecast_end,
+        pd.Timestamp(first_forcing.dates[-1]).date(),
+        deter_forcing.n_days,
+        n_forecast,
     )
+
+    # Pre-compute per-member weather
+    member_weathers: dict[int, pd.DataFrame] = {}
+    member_end_dates: dict[int, date] = {}
+    for m_id, m_forcing in member_forcings.items():
+        m_weather = forcing_to_weather(m_forcing, terrain, parcel.lat)
+        full = (
+            pd.concat([base_weather, m_weather])
+            .drop_duplicates("Date", keep="first")
+            .sort_values("Date")
+            .reset_index(drop=True)
+        )
+        member_weathers[m_id] = full
+        member_end_dates[m_id] = pd.Timestamp(m_forcing.dates[-1]).date()
 
     # Run each member
     all_member_ks: dict[int, np.ndarray] = {}
@@ -399,30 +414,34 @@ def run_ensemble_aquacrop(
     all_member_precip: dict[int, np.ndarray] = {}
     member_dates = None
 
-    for member_id, member_forcing in member_forcings.items():
-        # Concatenate: historical (Jan 1 → today) + forecast (today+1 → end)
-        full_forcing = deter_forcing.concat(member_forcing)
-        full_end = pd.Timestamp(full_forcing.dates[-1]).date()
+    for member_id in member_weathers:
+        weather = member_weathers[member_id]
+        full_end = member_end_dates[member_id]
 
-        print(sim_start)
-        print(full_end)
+        logger.debug("Member %d: %s → %s", member_id, sim_start, full_end)
 
-        # Run AquaCrop for full period (rainfed during forecast)
-        result = run_aquacrop(
-            forcing=full_forcing,
-            parcel=parcel,
-            terrain=terrain,
-            soil_profile=soil_profile,
-            sim_start=sim_start,
-            sim_end=full_end,
-            # irrigation_management=IrrigationManagement(irrigation_method=0),
+        model = AquaCropModel(
+            sim_start_time=sim_start.strftime("%Y/%m/%d"),
+            sim_end_time=full_end.strftime("%Y/%m/%d"),
+            weather_df=weather,
+            soil=soil,
+            crop=crop,
+            initial_water_content=iwc,
+            irrigation_management=parcel_to_irrigation(parcel),
+        )
+        model.run_model(till_termination=True)
+
+        result = AquaCropResult(
+            final_results=model.get_simulation_results(),
+            crop_growth=model.get_crop_growth(),
+            water_flux=model.get_water_flux(),
+            water_storage=model.get_water_storage(),
         )
 
         stress = result.daily_stress
 
         # Extract forecast portion (last n_forecast days, excluding terminal zero row)
         n_total = len(stress)
-        # AquaCrop adds a zero row at the end — skip it
         if n_total > 1 and stress["dap"].iloc[-1] == 0:
             n_total -= 1
 
@@ -755,7 +774,6 @@ def build_blended_stress_report(
 
     Returns an EnsembleStressReport compatible with compute_recommendation().
     """
-    
 
     daily_stats = []
 
@@ -800,12 +818,12 @@ def build_blended_stress_report(
             )
         )
 
-    # IFS ENS ensemble days (skip the first arome_days of ensemble stats)
+    # IFS ENS ensemble days (offset day_offset by arome_days for continuity)
     for stat in ensemble_stats:
         daily_stats.append(
             DailyEnsembleStats(
                 date=stat.date,
-                day_offset=stat.day_offset,
+                day_offset=arome_days + stat.day_offset,
                 source="ifs_ens",
                 ks_mean=stat.ks_mean,
                 ks_median=stat.ks_median,
@@ -842,11 +860,36 @@ def build_blended_stress_report(
 
 @dataclass
 class IrrigationCandidate:
-    """One candidate irrigation action to evaluate."""
+    """One candidate irrigation schedule to evaluate.
 
-    day_offset: int  # days from today (0 = today)
-    dose_mm: float  # irrigation amount
+    Supports 0–N irrigation events.  ``events`` is a list of
+    ``(day_offset, dose_mm)`` tuples, where ``day_offset`` is the
+    number of days from today (0 = today).
+    """
+
+    events: list[tuple[int, float]]  # [(day_offset, dose_mm), ...]
     label: str  # human-readable label
+
+    @property
+    def total_mm(self) -> float:
+        return sum(dose for _, dose in self.events)
+
+    @property
+    def n_events(self) -> int:
+        return len(self.events)
+
+    @property
+    def is_rainfed(self) -> bool:
+        return len(self.events) == 0
+
+    # Convenience for single-event backward compat
+    @property
+    def day_offset(self) -> int:
+        return self.events[0][0] if self.events else -1
+
+    @property
+    def dose_mm(self) -> float:
+        return self.total_mm
 
 
 @dataclass
@@ -868,34 +911,115 @@ class CandidateResult:
 def build_candidates(
     parcel_config: ParcelConfig,
     max_days_ahead: int = 7,
+    max_events: int = 3,
 ) -> list[IrrigationCandidate]:
-    """Build candidate irrigation actions to evaluate.
+    """Build candidate irrigation schedules to evaluate.
 
-    Tests: no irrigation, plus each (day, dose) combination within
-    the farmer's constraints (available days, min/max dose, interval).
+    Generates:
+    - 0 events: rainfed baseline
+    - 1 event:  every (day, dose) combination
+    - 2 events: pairs separated by ≥ min_interval, using min/max doses
+    - 3 events: triples separated by ≥ min_interval, max dose only
+
+    Parameters
+    ----------
+    parcel_config : parcel with irrigation constraints
+    max_days_ahead : furthest day to consider for irrigation
+    max_events : maximum number of irrigations per candidate (1–3)
     """
     irr_cfg = parcel_config.irrigation
     min_dose = irr_cfg.get("min_dose_mm", 15)
     max_dose = irr_cfg.get("max_dose_mm", 40)
+    min_interval = irr_cfg.get("min_interval_days", 3)
 
-    # Dose levels: min, mid, max
-    doses = sorted(set([min_dose, (min_dose + max_dose) / 2, max_dose]))
+    # Dose levels for single events: min, mid, max
+    doses_single = sorted(set([min_dose, (min_dose + max_dose) / 2, max_dose]))
+    # Dose levels for multi-event: just min and max to limit combinatorics
+    doses_multi = sorted(set([min_dose, max_dose]))
 
-    candidates = [
-        IrrigationCandidate(day_offset=-1, dose_mm=0, label="No irrigation"),
+    days = list(range(0, max_days_ahead + 1))
+
+    candidates: list[IrrigationCandidate] = [
+        IrrigationCandidate(events=[], label="No irrigation"),
     ]
 
-    for d in range(0, max_days_ahead + 1):
-        for dose in doses:
+    # --- Single events ---
+    for d in days:
+        for dose in doses_single:
             candidates.append(
                 IrrigationCandidate(
-                    day_offset=d,
-                    dose_mm=dose,
+                    events=[(d, dose)],
                     label=f"{dose:.0f}mm on day+{d}",
                 )
             )
 
+    # --- Double events ---
+    if max_events >= 2:
+        for d1 in days:
+            for d2 in days:
+                if d2 < d1 + min_interval:
+                    continue
+                for dose in doses_multi:
+                    candidates.append(
+                        IrrigationCandidate(
+                            events=[(d1, dose), (d2, dose)],
+                            label=f"2×{dose:.0f}mm on day+{d1} & +{d2}",
+                        )
+                    )
+
+    # --- Triple events (max dose only to keep count manageable) ---
+    if max_events >= 3:
+        for d1 in range(0, min(4, max_days_ahead + 1)):
+            for d2 in range(d1 + min_interval, max_days_ahead + 1):
+                for d3 in range(d2 + min_interval, max_days_ahead + 1):
+                    candidates.append(
+                        IrrigationCandidate(
+                            events=[(d1, max_dose), (d2, max_dose), (d3, max_dose)],
+                            label=f"3×{max_dose:.0f}mm on day+{d1},{d2},{d3}",
+                        )
+                    )
+
+    logger.info(
+        "Built %d candidates (1-event: %d, 2-event: %d, 3-event: %d)",
+        len(candidates),
+        sum(1 for c in candidates if c.n_events == 1),
+        sum(1 for c in candidates if c.n_events == 2),
+        sum(1 for c in candidates if c.n_events == 3),
+    )
     return candidates
+
+
+def _build_candidate_irrigation(
+    parcel: ParcelConfig,
+    candidate: IrrigationCandidate,
+    today: date,
+) -> IrrigationManagement:
+    """Build AquaCrop IrrigationManagement from parcel log + candidate events."""
+    base = parcel_to_irrigation(parcel)
+
+    if candidate.is_rainfed:
+        return base
+
+    extra_rows = []
+    for day_offset, dose_mm in candidate.events:
+        if dose_mm > 0 and day_offset >= 0:
+            event_date = today + pd.Timedelta(days=day_offset)
+            extra_rows.append({"Date": pd.Timestamp(event_date), "Depth": dose_mm})
+
+    if not extra_rows:
+        return base
+
+    extra = pd.DataFrame(extra_rows)
+
+    if base.irrigation_method == 3:
+        combined = (
+            pd.concat([base.Schedule, extra], ignore_index=True)
+            .sort_values("Date")
+            .reset_index(drop=True)
+        )
+        return IrrigationManagement(irrigation_method=3, Schedule=combined)
+    else:
+        return IrrigationManagement(irrigation_method=3, Schedule=extra)
 
 
 def evaluate_candidates_ensemble(
@@ -910,74 +1034,95 @@ def evaluate_candidates_ensemble(
     candidates: list[IrrigationCandidate] | None = None,
     stress_threshold: float = 0.9,
 ) -> list[CandidateResult]:
-    """Evaluate irrigation candidates across the ensemble.
+    """Evaluate irrigation candidates across the IFS ENS ensemble.
+
+    Optimized: weather DataFrames (including ET₀) are pre-computed once
+    per member.  The historical + AROME portion (Jan 1 → today+2) is
+    shared by all candidates — only the irrigation schedule varies.
 
     For each candidate action × each IFS ENS member:
-    1. Build forcing = historical + member forecast
-    2. Insert the candidate irrigation event into the schedule
+    1. Reuse pre-computed weather (historical + AROME + member)
+    2. Insert the candidate irrigation events into the schedule
     3. Run AquaCrop for the full period
     4. Extract stress metrics over the forecast horizon
 
     Returns candidates ranked by ensemble performance.
-
-    Typical runtime: 25 candidates × 50 members = 1250 runs ≈ 5-8 minutes.
     """
     if candidates is None:
         candidates = build_candidates(parcel)
 
-    results = []
+    # ------------------------------------------------------------------
+    # Pre-compute shared objects (computed once, reused for all runs)
+    # ------------------------------------------------------------------
+    soil = soil_to_aquacrop(soil_profile)
+    crop = parcel_to_crop(parcel)
+    iwc = InitialWaterContent(value=["FC"])
+
+    # Base weather: historical + AROME (includes ET₀ computation)
+    base_forcing = historical_forcing.concat(arome_forcing)
+    base_weather = forcing_to_weather(base_forcing, terrain, parcel.lat)
+
+    # Per-member weather: base + IFS ENS forecast.
+    # ET₀ is computed once per member here, not once per candidate.
+    member_weathers: dict[int, pd.DataFrame] = {}
+    member_end_dates: dict[int, date] = {}
+
+    for m_id, m_forcing in member_forcings.items():
+        m_weather = forcing_to_weather(m_forcing, terrain, parcel.lat)
+        # Concat with base taking precedence on overlapping dates
+        full = (
+            pd.concat([base_weather, m_weather])
+            .drop_duplicates("Date", keep="first")
+            .sort_values("Date")
+            .reset_index(drop=True)
+        )
+        member_weathers[m_id] = full
+        member_end_dates[m_id] = pd.Timestamp(m_forcing.dates[-1]).date()
+
+    n_forecast = next(iter(member_forcings.values())).n_days
+
+    logger.info(
+        "Evaluating %d candidates × %d members "
+        "(weather pre-computed, %d historical + %d forecast days)",
+        len(candidates),
+        len(member_forcings),
+        base_forcing.n_days,
+        n_forecast,
+    )
+
+    # ------------------------------------------------------------------
+    # Evaluate each candidate
+    # ------------------------------------------------------------------
+    results: list[CandidateResult] = []
 
     for ci, cand in enumerate(candidates):
         member_max_stress = []
         member_stress_days = []
         member_yield_impact = []
 
-        for member_id, member_forcing in member_forcings.items():
-            full_forcing = historical_forcing.concat(arome_forcing).concat(member_forcing)
-            full_end = pd.Timestamp(full_forcing.dates[-1]).date()
+        # Irrigation schedule for this candidate (same for all members)
+        irr_mgmt = _build_candidate_irrigation(parcel, cand, today)
 
-            # Build irrigation schedule: existing log + candidate event
-            irr_schedule = parcel_to_irrigation(parcel)
+        for m_id, weather in member_weathers.items():
+            full_end = member_end_dates[m_id]
 
-            if cand.dose_mm > 0 and cand.day_offset >= 0:
-                # Add candidate event to schedule
-                event_date = today + pd.Timedelta(days=cand.day_offset)
-                extra = pd.DataFrame(
-                    {
-                        "Date": [pd.Timestamp(event_date)],
-                        "Depth": [cand.dose_mm],
-                    }
-                )
-
-                if irr_schedule.irrigation_method == 3:
-                    # Append to existing schedule
-                    combined = (
-                        pd.concat([irr_schedule.Schedule, extra], ignore_index=True)
-                        .sort_values("Date")
-                        .reset_index(drop=True)
-                    )
-                    irr_mgmt = IrrigationManagement(
-                        irrigation_method=3,
-                        Schedule=combined,
-                    )
-                else:
-                    irr_mgmt = IrrigationManagement(
-                        irrigation_method=3,
-                        Schedule=extra,
-                    )
-            else:
-                irr_mgmt = irr_schedule
-
-            # Run AquaCrop
             try:
-                result = run_aquacrop(
-                    forcing=full_forcing,
-                    parcel=parcel,
-                    terrain=terrain,
-                    soil_profile=soil_profile,
-                    sim_start=sim_start,
-                    sim_end=full_end,
+                model = AquaCropModel(
+                    sim_start_time=sim_start.strftime("%Y/%m/%d"),
+                    sim_end_time=full_end.strftime("%Y/%m/%d"),
+                    weather_df=weather,
+                    soil=soil,
+                    crop=crop,
+                    initial_water_content=iwc,
                     irrigation_management=irr_mgmt,
+                )
+                model.run_model(till_termination=True)
+
+                result = AquaCropResult(
+                    final_results=model.get_simulation_results(),
+                    crop_growth=model.get_crop_growth(),
+                    water_flux=model.get_water_flux(),
+                    water_storage=model.get_water_storage(),
                 )
 
                 stress = result.daily_stress
@@ -986,7 +1131,6 @@ def evaluate_candidates_ensemble(
                     n_total -= 1
 
                 # Extract forecast portion
-                n_forecast = member_forcing.n_days
                 fc_start = max(0, n_total - n_forecast)
                 fc_slice = stress.iloc[fc_start:n_total]
 
@@ -1004,7 +1148,7 @@ def evaluate_candidates_ensemble(
                 member_yield_impact.append(cc_loss)
 
             except Exception as exc:
-                logger.warning("Member %d, candidate '%s' failed: %s", member_id, cand.label, exc)
+                logger.warning("Member %d, candidate '%s' failed: %s", m_id, cand.label, exc)
                 member_max_stress.append(1.0)
                 member_stress_days.append(15)
                 member_yield_impact.append(1.0)
@@ -1049,11 +1193,12 @@ def recommend_from_optimizer(
     Selection logic:
     1. If no-irrigation already avoids stress in >80% of members → don't irrigate
     2. Otherwise, pick the cheapest action that avoids stress in >70% of members
+       (cheapest = lowest total water, then fewest events)
     3. If no action avoids stress in >70%, pick the one that minimizes mean stress
 
     Returns a dict with the recommendation and comparison.
     """
-    no_irr = next((r for r in results if r.candidate.dose_mm == 0), None)
+    no_irr = next((r for r in results if r.candidate.is_rainfed), None)
 
     if no_irr and no_irr.pct_members_avoid_stress > 0.80:
         return {
@@ -1066,29 +1211,32 @@ def recommend_from_optimizer(
         }
 
     # Find cheapest action that avoids stress in >70% of members
-    good = [r for r in results if r.pct_members_avoid_stress > 0.70 and r.candidate.dose_mm > 0]
+    good = [r for r in results if r.pct_members_avoid_stress > 0.70 and not r.candidate.is_rainfed]
     if good:
-        # Sort by dose (cheapest first), then by earliest day
-        good.sort(key=lambda r: (r.candidate.dose_mm, r.candidate.day_offset))
+        # Sort by total water (cheapest), then fewest events, then earliest start
+        good.sort(
+            key=lambda r: (r.candidate.total_mm, r.candidate.n_events, r.candidate.day_offset)
+        )
         best = good[0]
+        no_irr_days = no_irr.mean_stress_days if no_irr else float("nan")
         return {
-            "action": f"Irrigate {best.candidate.dose_mm:.0f}mm on day+{best.candidate.day_offset}",
+            "action": best.candidate.label,
             "reason": (
                 f"{best.pct_members_avoid_stress:.0%} of members avoid stress. "
                 f"Mean stress days: {best.mean_stress_days:.1f} vs "
-                f"{no_irr.mean_stress_days:.1f} without irrigation"
+                f"{no_irr_days:.1f} without irrigation"
             ),
             "candidate": best.candidate,
             "avoid_stress_pct": best.pct_members_avoid_stress,
             "mean_stress_days": best.mean_stress_days,
-            "cost_eur_ha": best.candidate.dose_mm * water_cost_eur_mm,
+            "cost_eur_ha": best.candidate.total_mm * water_cost_eur_mm,
             "all_results": results,
         }
 
     # Nothing avoids stress well — pick action that minimizes stress
     best = results[0]  # already sorted by best outcome
     return {
-        "action": f"Irrigate {best.candidate.dose_mm:.0f}mm on day+{best.candidate.day_offset} (limited benefit)",
+        "action": f"{best.candidate.label} (limited benefit)",
         "reason": (
             f"No action avoids stress in >70% of members. Best option: "
             f"{best.pct_members_avoid_stress:.0%} avoid stress, "

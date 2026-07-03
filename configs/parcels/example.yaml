@@ -110,9 +110,9 @@ irrigation_log:
     amount_mm: 50
   - date: "2026-06-14"
     amount_mm: 50
-  - date: "2026-06-20"
+  - date: "2026-06-23"
     amount_mm: 50
-  - date: "2026-06-28"
+  - date: "2026-06-29"
     amount_mm: 50
 
 

@@ -21,6 +21,8 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import multiprocessing as mp
+from functools import partial
 
 from aquacrop import (
     AquaCropModel,
@@ -1022,6 +1024,66 @@ def _build_candidate_irrigation(
         return IrrigationManagement(irrigation_method=3, Schedule=extra)
 
 
+def _run_single_candidate(
+    job,
+    m_id,
+    cand,
+    parcel,
+    today,
+    member_end_dates,
+    sim_start,
+    soil,
+    crop,
+    iwc,
+    stress_threshold,
+    n_forecast,
+):
+    irr_mgmt = _build_candidate_irrigation(parcel, cand, today)
+    full_end = member_end_dates[m_id]
+
+    # try:
+    m_id, weather = job
+
+    model = AquaCropModel(
+        sim_start_time=sim_start.strftime("%Y/%m/%d"),
+        sim_end_time=full_end.strftime("%Y/%m/%d"),
+        weather_df=weather,
+        soil=soil,
+        crop=crop,
+        initial_water_content=iwc,
+        irrigation_management=irr_mgmt,
+    )
+    model.run_model(till_termination=True)
+
+    result = AquaCropResult(
+        final_results=model.get_simulation_results(),
+        crop_growth=model.get_crop_growth(),
+        water_flux=model.get_water_flux(),
+        water_storage=model.get_water_storage(),
+    )
+
+    stress = result.daily_stress
+    n_total = len(stress)
+    if n_total > 1 and stress["dap"].iloc[-1] == 0:
+        n_total -= 1
+
+    # Extract forecast portion
+    fc_start = max(0, n_total - n_forecast)
+    fc_slice = stress.iloc[fc_start:n_total]
+
+    ks = fc_slice["ks"].values
+    max_stress = float(1.0 - np.nanmin(ks)) if len(ks) > 0 else 0.0
+    n_stress_days = int((ks < stress_threshold).sum())
+
+    cc_loss = (
+        float((fc_slice["canopy_cover_ns"] - fc_slice["canopy_cover"]).mean())
+        if "canopy_cover_ns" in fc_slice
+        else 0.0
+    )
+
+    return (max_stress, n_stress_days, cc_loss)
+
+
 def evaluate_candidates_ensemble(
     historical_forcing: DailyForcing,
     arome_forcing: DailyForcing,
@@ -1032,6 +1094,7 @@ def evaluate_candidates_ensemble(
     sim_start: date,
     today: date,
     candidates: list[IrrigationCandidate] | None = None,
+    workers: int = 3,
     stress_threshold: float = 0.9,
 ) -> list[CandidateResult]:
     """Evaluate irrigation candidates across the IFS ENS ensemble.
@@ -1096,20 +1159,12 @@ def evaluate_candidates_ensemble(
     # ------------------------------------------------------------------
     results: list[CandidateResult] = []
 
-
     # # Build job list: all (basin, phase, loop_idx) combinations
-    # jobs = []
-    # for ci, cand in enumerate(candidates):
-    #     for m_id, weather in member_weathers.items():
-    #             jobs.append((ci,cand,m_id,weather))
+    jobs = []
+    for m_id, weather in member_weathers.items():
+        jobs.append((m_id, weather))
 
-    # n_workers = workers or min(len(jobs), mp.cpu_count())
-    
-    # workers_fn = partial(
-    #     _run_single_strat,
-    #     parcel=parcel,
-    #     today=today,
-
+    n_workers = workers or min(len(jobs), mp.cpu_count())
 
     for ci, cand in enumerate(candidates):
         member_max_stress = []
@@ -1118,57 +1173,27 @@ def evaluate_candidates_ensemble(
 
         # Irrigation schedule for this candidate (same for all members) - does not work
 
-        for m_id, weather in member_weathers.items():
-            irr_mgmt = _build_candidate_irrigation(parcel, cand, today)
-            full_end = member_end_dates[m_id]
+        worker_fn = partial(
+            _run_single_candidate,
+            m_id=m_id,
+            cand=cand,
+            parcel=parcel,
+            today=today,
+            member_end_dates=member_end_dates,
+            sim_start=sim_start,
+            soil=soil,
+            crop=crop,
+            iwc=iwc,
+            stress_threshold=stress_threshold,
+            n_forecast=n_forecast,
+        )
 
-            # try:
-            
-            model = AquaCropModel(
-                sim_start_time=sim_start.strftime("%Y/%m/%d"),
-                sim_end_time=full_end.strftime("%Y/%m/%d"),
-                weather_df=weather,
-                soil=soil,
-                crop=crop,
-                initial_water_content=iwc,
-                irrigation_management=irr_mgmt,
-            )
-            model.run_model(till_termination=True)
-           
-
-            result = AquaCropResult(
-                final_results=model.get_simulation_results(),
-                crop_growth=model.get_crop_growth(),
-                water_flux=model.get_water_flux(),
-                water_storage=model.get_water_storage(),
-            )
-
-
-            stress = result.daily_stress
-            n_total = len(stress)
-            if n_total > 1 and stress["dap"].iloc[-1] == 0:
-                n_total -= 1
-
-            # Extract forecast portion
-            fc_start = max(0, n_total - n_forecast)
-            fc_slice = stress.iloc[fc_start:n_total]
-
-            ks = fc_slice["ks"].values
-            max_stress = float(1.0 - np.nanmin(ks)) if len(ks) > 0 else 0.0
-            n_stress_days = int((ks < stress_threshold).sum())
-
-
-            cc_loss = (
-                float((fc_slice["canopy_cover_ns"] - fc_slice["canopy_cover"]).mean())
-                if "canopy_cover_ns" in fc_slice
-                else 0.0
-            )
-
-
-            member_max_stress.append(max_stress)
-            member_stress_days.append(n_stress_days)
-            member_yield_impact.append(cc_loss)
-
+        with mp.Pool(processes=n_workers) as pool:
+            for i, result in enumerate(pool.imap_unordered(worker_fn, jobs)):
+                max_stress, n_stress_days, cc_loss = result
+                member_max_stress.append(max_stress)
+                member_stress_days.append(n_stress_days)
+                member_yield_impact.append(cc_loss)
 
             # except Exception as exc:
             #     logger.warning("Member %d, candidate '%s' failed: %s", m_id, cand.label, exc)

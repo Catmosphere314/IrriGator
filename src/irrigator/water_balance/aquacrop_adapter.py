@@ -84,55 +84,156 @@ def forcing_to_weather(
 
     return weather
 
+def _profile_theta_s(profile: SoilProfile, i: int) -> float:
+    """Return saturation water content for layer i, with a conservative fallback."""
+    if hasattr(profile, "theta_s") and profile.theta_s is not None:
+        if isinstance(profile.theta_s, list):
+            return float(profile.theta_s[i])
+        return float(profile.theta_s)
+    return min(0.60, float(profile.theta_fc[i]) + 0.12)
 
-def soil_to_aquacrop(profile: SoilProfile, min_depth_m: float = 2.5) -> Soil:
-    """Convert IrriGator SoilProfile to AquaCrop Soil object.
 
-    Requires theta_s (saturation water content) in the profile.
-    If not available, estimates it from field capacity.
+def _weighted_profile_interval(
+    profile: SoilProfile,
+    top_m: float,
+    bottom_m: float,
+) -> tuple[float, float, float, float]:
+    """Depth-weight soil properties over [top_m, bottom_m].
+
+    Returns th_wp, th_fc, th_s, ksat_mm_day. Ksat is averaged arithmetically;
+    if drainage becomes too optimistic in layered soils, replace this by a
+    harmonic mean for Ksat only.
     """
-    dz = [(bottom - top) / 100.0 for top, bottom in profile.z_layers_cm]
+    top_cm = top_m * 100.0
+    bottom_cm = bottom_m * 100.0
+    w_sum = 0.0
+    th_wp = th_fc = th_s = ksat = 0.0
+    for i, (layer_top_cm, layer_bottom_cm) in enumerate(profile.z_layers_cm):
+        overlap_cm = max(
+            0.0,
+            min(bottom_cm, layer_bottom_cm) - max(top_cm, layer_top_cm),
+        )
+        if overlap_cm <= 0:
+            continue
 
-    total = sum(dz)
-    # Ensure profile is deep enough for maize (Zmax ≈ 2.3m + 0.1m buffer)
-    if total < min_depth_m:
-        dz[-1] += min_depth_m - total
+        w_sum += overlap_cm
+        th_wp += float(profile.theta_wp[i]) * overlap_cm
+        th_fc += float(profile.theta_fc[i]) * overlap_cm
+        th_s += _profile_theta_s(profile, i) * overlap_cm
+        # SoilProfile stores cm/day; AquaCrop expects mm/day.
+        ksat += float(profile.k_sat[i]) * 10.0 * overlap_cm
+
+    if w_sum == 0.0:
+        # This can only happen when the requested AquaCrop compartment extends
+        # below the available soil data. Do not silently invent a new horizon;
+        # reuse the deepest observed layer and let the caller log that choice.
+        i = len(profile.z_layers_cm) - 1
+        th_wp = float(profile.theta_wp[i])
+        th_fc = float(profile.theta_fc[i])
+        th_s = _profile_theta_s(profile, i)
+        ksat = float(profile.k_sat[i]) * 10.0
+    else:
+        th_wp /= w_sum
+        th_fc /= w_sum
+        th_s /= w_sum
+        ksat /= w_sum
+    # Physical sanity clamps. Keep these minimal; bad soil data should remain visible.
+    th_fc = max(th_fc, th_wp + 0.02)
+    th_s = max(th_s, th_fc + 0.01)
+    ksat = max(ksat, 1.0)
+    return th_wp, th_fc, th_s, ksat
+
+def soil_to_aquacrop(
+    profile: SoilProfile,
+    min_depth_m: float | None = None,
+    *,
+    dz_comp_m: float = 0.10,
+    extrapolate_below_profile: bool = False,
+) -> Soil:
+    """Convert IrriGator SoilProfile to an AquaCrop Soil object.
+
+    This avoids the fragile ``Soil.add_layer`` path for multi-layer custom soils.
+    AquaCrop's ``dz`` argument defines numerical compartments, not agronomic
+    horizons. We therefore build uniform 10 cm compartments and write the
+    per-compartment hydraulic properties directly into ``soil.profile``.
+
+    Compared with collapsing the profile into one depth-weighted layer, this
+    keeps the vertical FC/WP/THS/Ksat signal used for soil water storage,
+    drainage, and root-zone extraction, while avoiding artificial layer-boundary
+    root barriers.
+    """
+    data_depth_m = profile.z_layers_cm[-1][1] / 100.0
+    requested_depth_m = data_depth_m if min_depth_m is None else max(data_depth_m, min_depth_m)
+
+    if requested_depth_m > data_depth_m and not extrapolate_below_profile:
+        logger.warning(
+            "AquaCrop soil depth limited to available profile depth %.2fm; "
+            "requested %.2fm. Set extrapolate_below_profile=True only if "
+            "copying the deepest observed layer below the measured profile is acceptable.",
+            data_depth_m,
+            requested_depth_m,
+        )
+        total_depth_m = data_depth_m
+    else:
+        total_depth_m = requested_depth_m
+    n_comp = int(np.ceil(total_depth_m / dz_comp_m))
+    dz = [dz_comp_m] * n_comp
+    dz[-1] = round(total_depth_m - dz_comp_m * (n_comp - 1), 10)
+    if dz[-1] <= 0:
+        dz[-1] = dz_comp_m
 
     soil = Soil("custom", dz=dz)
+    prof = soil.profile.copy()
 
-    for i, (top, bottom) in enumerate(profile.z_layers_cm):
-        thickness_m = (bottom - top) / 100.0
+    # Bypass add_layer: fill each numerical compartment explicitly.
+    # Keep Layer=1 to avoid treating EU-SoilHydroGrids horizons as mechanical
+    # root-penetrability barriers. The hydraulic columns still vary by depth.
+    for idx, row in prof.iterrows():
+        th_wp, th_fc, th_s, ksat = _weighted_profile_interval(
+            profile,
+            float(row["z_top"]),
+            float(row["zBot"]),
+        )
+        tau = round(0.0866 * (ksat**0.35), 2)
+        tau = min(1.0, max(0.0, tau))
 
-        th_wp = profile.theta_wp[i]
-        th_fc = profile.theta_fc[i]
+        prof.loc[idx, "Layer"] = 1
+        prof.loc[idx, "th_dry"] = th_wp / 2.0
+        prof.loc[idx, "th_wp"] = th_wp
+        prof.loc[idx, "th_fc"] = th_fc
+        prof.loc[idx, "th_s"] = th_s
+        prof.loc[idx, "Ksat"] = ksat
+        prof.loc[idx, "penetrability"] = 100.0
+        prof.loc[idx, "tau"] = tau
+        # Required by AquaCrop's SoilProfile jit object; only used for capillary rise.
+        prof.loc[idx, "aCR"] = 0.0
+        prof.loc[idx, "bCR"] = 0.0
 
-        # Saturation water content
-        if hasattr(profile, "theta_s") and profile.theta_s is not None:
-            if isinstance(profile.theta_s, list):
-                th_s = profile.theta_s[i]
-            else:
-                th_s = profile.theta_s
-        else:
-            # Fallback: estimate from field capacity
-            th_s = min(0.60, th_fc + 0.12)
-            logger.warning(
-                "Layer %d: theta_s not available, estimated %.3f from FC=%.3f. "
-                "Add THS to SOIL_VARIABLES in esdac_loader.py for accurate values.",
-                i,
-                th_s,
-                th_fc,
-            )
+    required = ["Layer", "th_dry", "th_wp", "th_fc", "th_s", "Ksat", "penetrability", "tau"]
+    if prof[required].isna().any().any():
+        raise ValueError(f"AquaCrop soil profile contains NaNs:\n{prof}")
 
-        # Saturated hydraulic conductivity: SoilProfile stores cm/day,
-        # AquaCrop expects mm/day
-        ksat_mm_day = profile.k_sat[i] * 10.0
+    soil.profile = prof
+    soil.nLayer = 1
+    soil.zSoil = round(float(sum(dz)), 2)
+    soil.nComp = len(dz)
 
-        # Penetrability: 100% unless restricted layer
-        penetrability = 100
-
-        soil.add_layer(thickness_m, th_wp, th_fc, th_s, ksat_mm_day, penetrability)
+    logger.info(
+        "AquaCrop soil: %.2fm depth, %d x %.2fm compartments, "
+        "FC range %.3f-%.3f, WP range %.3f-%.3f, Ksat range %.0f-%.0f mm/day",
+        soil.zSoil,
+        soil.nComp,
+        dz_comp_m,
+        float(prof["th_fc"].min()),
+        float(prof["th_fc"].max()),
+        float(prof["th_wp"].min()),
+        float(prof["th_wp"].max()),
+        float(prof["Ksat"].min()),
+        float(prof["Ksat"].max()),
+    )
 
     return soil
+
 
 
 def parcel_to_crop(parcel: ParcelConfig) -> Crop:
@@ -931,7 +1032,7 @@ def build_candidates(
     """
     irr_cfg = parcel_config.irrigation
     min_dose = irr_cfg.get("min_dose_mm", 15)
-    max_dose = irr_cfg.get("max_dose_mm", 40)
+    max_dose = irr_cfg.get("max_dose_mm",35)
     min_interval = irr_cfg.get("min_interval_days", 3)
 
     # Dose levels for single events: min, mid, max
@@ -998,6 +1099,7 @@ def _build_candidate_irrigation(
 ) -> IrrigationManagement:
     """Build AquaCrop IrrigationManagement from parcel log + candidate events."""
     base = parcel_to_irrigation(parcel)
+    max_dose = parcel.irrigation.get("max_dose_mm", 40.0)
 
     if candidate.is_rainfed:
         return base
@@ -1019,69 +1121,105 @@ def _build_candidate_irrigation(
             .sort_values("Date")
             .reset_index(drop=True)
         )
-        return IrrigationManagement(irrigation_method=3, Schedule=combined)
+        return IrrigationManagement(irrigation_method=3, Schedule=combined, MaxIrr=max_dose)
     else:
-        return IrrigationManagement(irrigation_method=3, Schedule=extra)
+        return IrrigationManagement(irrigation_method=3, Schedule=extra, MaxIrr=max_dose)
 
 
-def _run_single_candidate(
-    job,
-    m_id,
-    cand,
-    parcel,
-    today,
-    member_end_dates,
-    sim_start,
-    soil,
-    crop,
-    iwc,
-    stress_threshold,
-    n_forecast,
-):
-    irr_mgmt = _build_candidate_irrigation(parcel, cand, today)
-    full_end = member_end_dates[m_id]
+_CANDIDATE_WORKER_CTX: dict[str, Any] = {}
 
-    # try:
-    m_id, weather = job
+
+def _init_candidate_worker(
+    candidates: list[IrrigationCandidate],
+    member_weathers: dict[int, pd.DataFrame],
+    member_end_dates: dict[int, date],
+    parcel: ParcelConfig,
+    today: date,
+    sim_start: date,
+    soil: Soil,
+    crop: Crop,
+    iwc: InitialWaterContent,
+    stress_threshold: float,
+    n_forecast: int,
+) -> None:
+    """Initialize process-local state for candidate evaluation workers.
+
+    The pool calls this once per worker process.  Jobs can then stay tiny:
+    only (candidate_index, member_id) needs to be sent for each AquaCrop run.
+    This avoids repeatedly pickling the same weather DataFrames, soil, crop,
+    parcel, and candidate list for every job.
+    """
+    global _CANDIDATE_WORKER_CTX
+    _CANDIDATE_WORKER_CTX = {
+        "candidates": candidates,
+        "member_weathers": member_weathers,
+        "member_end_dates": member_end_dates,
+        "parcel": parcel,
+        "today": today,
+        "sim_start": sim_start,
+        "soil": soil,
+        "crop": crop,
+        "iwc": iwc,
+        "stress_threshold": stress_threshold,
+        "n_forecast": n_forecast,
+    }
+
+
+def _run_single_candidate_job(job: tuple[int, int]) -> tuple[int, int, float, int, float]:
+    """Run one candidate × ensemble-member AquaCrop simulation.
+
+    Returns
+    -------
+    tuple
+        (candidate_index, member_id, max_stress, n_stress_days, cc_loss)
+    """
+    cand_idx, m_id = job
+    ctx = _CANDIDATE_WORKER_CTX
+
+    cand = ctx["candidates"][cand_idx]
+    weather = ctx["member_weathers"][m_id]
+    full_end = ctx["member_end_dates"][m_id]
+
+    irr_mgmt = _build_candidate_irrigation(ctx["parcel"], cand, ctx["today"])
 
     model = AquaCropModel(
-        sim_start_time=sim_start.strftime("%Y/%m/%d"),
+        sim_start_time=ctx["sim_start"].strftime("%Y/%m/%d"),
         sim_end_time=full_end.strftime("%Y/%m/%d"),
         weather_df=weather,
-        soil=soil,
-        crop=crop,
-        initial_water_content=iwc,
+        soil=ctx["soil"],
+        crop=ctx["crop"],
+        initial_water_content=ctx["iwc"],
         irrigation_management=irr_mgmt,
     )
     model.run_model(till_termination=True)
 
-    result = AquaCropResult(
-        final_results=model.get_simulation_results(),
-        crop_growth=model.get_crop_growth(),
-        water_flux=model.get_water_flux(),
-        water_storage=model.get_water_storage(),
-    )
+    # Avoid constructing AquaCropResult and avoid calling get_water_storage().
+    # The optimizer only needs stress and canopy-loss metrics.
+    cg = model.get_crop_growth()
+    wf = model.get_water_flux()
 
-    stress = result.daily_stress
-    n_total = len(stress)
-    if n_total > 1 and stress["dap"].iloc[-1] == 0:
+    n_total = min(len(cg), len(wf))
+    if n_total > 1 and cg["dap"].iloc[n_total - 1] == 0:
         n_total -= 1
 
-    # Extract forecast portion
+    n_forecast = ctx["n_forecast"]
     fc_start = max(0, n_total - n_forecast)
-    fc_slice = stress.iloc[fc_start:n_total]
 
-    ks = fc_slice["ks"].values
+    tr = wf["Tr"].values[fc_start:n_total]
+    tr_pot = wf["TrPot"].values[fc_start:n_total]
+    ks = np.where(tr_pot > 0.01, tr / tr_pot, 1.0)
+
     max_stress = float(1.0 - np.nanmin(ks)) if len(ks) > 0 else 0.0
-    n_stress_days = int((ks < stress_threshold).sum())
+    n_stress_days = int((ks < ctx["stress_threshold"]).sum())
 
-    cc_loss = (
-        float((fc_slice["canopy_cover_ns"] - fc_slice["canopy_cover"]).mean())
-        if "canopy_cover_ns" in fc_slice
-        else 0.0
-    )
+    if "canopy_cover_ns" in cg and "canopy_cover" in cg:
+        cc_ns = cg["canopy_cover_ns"].values[fc_start:n_total]
+        cc = cg["canopy_cover"].values[fc_start:n_total]
+        cc_loss = float(np.nanmean(cc_ns - cc))
+    else:
+        cc_loss = 0.0
 
-    return (max_stress, n_stress_days, cc_loss)
+    return cand_idx, m_id, max_stress, n_stress_days, cc_loss
 
 
 def evaluate_candidates_ensemble(
@@ -1094,7 +1232,7 @@ def evaluate_candidates_ensemble(
     sim_start: date,
     today: date,
     candidates: list[IrrigationCandidate] | None = None,
-    workers: int = 3,
+    workers: int | None = 3,
     stress_threshold: float = 0.9,
 ) -> list[CandidateResult]:
     """Evaluate irrigation candidates across the IFS ENS ensemble.
@@ -1103,16 +1241,19 @@ def evaluate_candidates_ensemble(
     per member.  The historical + AROME portion (Jan 1 → today+2) is
     shared by all candidates — only the irrigation schedule varies.
 
-    For each candidate action × each IFS ENS member:
-    1. Reuse pre-computed weather (historical + AROME + member)
-    2. Insert the candidate irrigation events into the schedule
-    3. Run AquaCrop for the full period
-    4. Extract stress metrics over the forecast horizon
-
-    Returns candidates ranked by ensemble performance.
+    Immediate runtime fix:
+    - build all candidate × member jobs once
+    - create only one process pool
+    - send only small job tuples to workers
+    - avoid full AquaCropResult/water_storage extraction inside optimizer jobs
     """
     if candidates is None:
         candidates = build_candidates(parcel)
+
+    if not candidates:
+        return []
+    if not member_forcings:
+        return []
 
     # ------------------------------------------------------------------
     # Pre-compute shared objects (computed once, reused for all runs)
@@ -1144,87 +1285,112 @@ def evaluate_candidates_ensemble(
         member_end_dates[m_id] = pd.Timestamp(m_forcing.dates[-1]).date()
 
     n_forecast = next(iter(member_forcings.values())).n_days
+    member_ids = list(member_weathers.keys())
+
+    jobs: list[tuple[int, int]] = [
+        (cand_idx, m_id) for cand_idx in range(len(candidates)) for m_id in member_ids
+    ]
+
+    n_jobs = len(jobs)
+    if workers is None or workers <= 0:
+        n_workers = min(mp.cpu_count(), n_jobs)
+    else:
+        n_workers = min(workers, mp.cpu_count(), n_jobs)
 
     logger.info(
-        "Evaluating %d candidates × %d members "
-        "(weather pre-computed, %d historical + %d forecast days)",
+        "Evaluating %d candidates × %d members = %d AquaCrop runs "
+        "(%d worker%s, weather pre-computed, %d historical + %d forecast days)",
         len(candidates),
         len(member_forcings),
+        n_jobs,
+        n_workers,
+        "s" if n_workers != 1 else "",
         base_forcing.n_days,
         n_forecast,
     )
 
+    # candidate_member_results[candidate_index][member_id] =
+    #     (max_stress, n_stress_days, cc_loss)
+    candidate_member_results: list[dict[int, tuple[float, int, float]]] = [{} for _ in candidates]
+
+    initargs = (
+        candidates,
+        member_weathers,
+        member_end_dates,
+        parcel,
+        today,
+        sim_start,
+        soil,
+        crop,
+        iwc,
+        stress_threshold,
+        n_forecast,
+    )
+
+    if n_workers == 1:
+        _init_candidate_worker(*initargs)
+        iterator = map(_run_single_candidate_job, jobs)
+        for cand_idx, m_id, max_stress, n_stress_days, cc_loss in iterator:
+            candidate_member_results[cand_idx][m_id] = (
+                max_stress,
+                n_stress_days,
+                cc_loss,
+            )
+    else:
+        # AquaCrop jobs are relatively heavy.  A small chunksize keeps load
+        # balancing good while reducing IPC overhead versus chunksize=1.
+        chunksize = max(1, n_jobs // (n_workers * 8))
+        with mp.Pool(
+            processes=n_workers,
+            initializer=_init_candidate_worker,
+            initargs=initargs,
+        ) as pool:
+            for cand_idx, m_id, max_stress, n_stress_days, cc_loss in pool.imap_unordered(
+                _run_single_candidate_job,
+                jobs,
+                chunksize=chunksize,
+            ):
+                candidate_member_results[cand_idx][m_id] = (
+                    max_stress,
+                    n_stress_days,
+                    cc_loss,
+                )
+
     # ------------------------------------------------------------------
-    # Evaluate each candidate
+    # Aggregate per candidate
     # ------------------------------------------------------------------
     results: list[CandidateResult] = []
 
-    # # Build job list: all (basin, phase, loop_idx) combinations
-    jobs = []
-    for m_id, weather in member_weathers.items():
-        jobs.append((m_id, weather))
-
-    n_workers = workers or min(len(jobs), mp.cpu_count())
-
     for ci, cand in enumerate(candidates):
-        member_max_stress = []
-        member_stress_days = []
-        member_yield_impact = []
+        member_rows = [candidate_member_results[ci][m_id] for m_id in member_ids]
 
-        # Irrigation schedule for this candidate (same for all members) - does not work
+        member_max_stress = [row[0] for row in member_rows]
+        member_stress_days = [row[1] for row in member_rows]
+        member_yield_impact = [row[2] for row in member_rows]
 
-        worker_fn = partial(
-            _run_single_candidate,
-            m_id=m_id,
-            cand=cand,
-            parcel=parcel,
-            today=today,
-            member_end_dates=member_end_dates,
-            sim_start=sim_start,
-            soil=soil,
-            crop=crop,
-            iwc=iwc,
-            stress_threshold=stress_threshold,
-            n_forecast=n_forecast,
+        arr_stress = np.asarray(member_max_stress, dtype=float)
+        arr_days = np.asarray(member_stress_days, dtype=float)
+
+        result = CandidateResult(
+            candidate=cand,
+            member_max_stress=member_max_stress,
+            member_stress_days=member_stress_days,
+            member_yield_impact=member_yield_impact,
+            mean_max_stress=float(np.nanmean(arr_stress)),
+            median_max_stress=float(np.nanmedian(arr_stress)),
+            pct_members_avoid_stress=float(np.nanmean(arr_stress < (1.0 - stress_threshold))),
+            mean_stress_days=float(np.nanmean(arr_days)),
         )
-
-        with mp.Pool(processes=n_workers) as pool:
-            for i, result in enumerate(pool.imap_unordered(worker_fn, jobs)):
-                max_stress, n_stress_days, cc_loss = result
-                member_max_stress.append(max_stress)
-                member_stress_days.append(n_stress_days)
-                member_yield_impact.append(cc_loss)
-
-            # except Exception as exc:
-            #     logger.warning("Member %d, candidate '%s' failed: %s", m_id, cand.label, exc)
-            #     member_max_stress.append(1.0)
-            #     member_stress_days.append(15)
-            #     member_yield_impact.append(1.0)
-
-        arr_stress = np.array(member_max_stress)
-        arr_days = np.array(member_stress_days)
-
-        results.append(
-            CandidateResult(
-                candidate=cand,
-                member_max_stress=member_max_stress,
-                member_stress_days=member_stress_days,
-                member_yield_impact=member_yield_impact,
-                mean_max_stress=float(np.mean(arr_stress)),
-                median_max_stress=float(np.median(arr_stress)),
-                pct_members_avoid_stress=float((arr_stress < (1 - stress_threshold)).mean()),
-                mean_stress_days=float(np.mean(arr_days)),
-            )
-        )
+        results.append(result)
 
         logger.info(
             "Candidate %d/%d '%s': mean_stress=%.3f, avoid_pct=%.0f%%, mean_stress_days=%.1f",
             ci + 1,
             len(candidates),
             cand.label,
-            results[-1].mean_max_stress,
-            results[-1].pct_members_avoid_stress * 100,
-            results[-1].mean_stress_days,
+            result.mean_max_stress,
+            result.pct_members_avoid_stress * 100,
+            result.mean_stress_days,
         )
 
     # Sort by best outcome: highest pct_members_avoid_stress, then lowest mean_stress

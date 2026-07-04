@@ -14,6 +14,7 @@ and extracts results in a format compatible with the decision layer.
 
 from __future__ import annotations
 
+import copy
 import logging
 from dataclasses import dataclass
 from datetime import date
@@ -22,7 +23,6 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import multiprocessing as mp
-from functools import partial
 
 from aquacrop import (
     AquaCropModel,
@@ -1398,10 +1398,856 @@ def evaluate_candidates_ensemble(
     return results
 
 
+# ---------------------------------------------------------------------------
+# Two-level private-internals candidate evaluator
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _TwoLevelBranchState:
+    """A pre-run AquaCrop model at a branching date.
+
+    This is intentionally private: it stores an AquaCropModel that has already
+    been advanced to a particular timestep.  The optimization path below uses
+    AquaCrop private attributes to avoid rerunning the full season for every
+    candidate/member pair.
+    """
+
+    model: AquaCropModel
+    branch_start_idx: int
+    branch_steps: int
+    metric_start_idx: int
+    metric_steps: int
+    branch_date: date
+
+
+@dataclass
+class _MemberFutureWeather:
+    """Prepared member-specific weather array aligned to an AquaCrop time_span."""
+
+    weather_array: np.ndarray
+    time_span: Any
+    full_end: date
+
+
+def _model_dates(model: AquaCropModel) -> list[date]:
+    """Return model time_span as Python dates."""
+    return [ts.date() for ts in pd.to_datetime(model._clock_struct.time_span)]
+
+
+def _index_for_model_date(model: AquaCropModel, target: date) -> int:
+    """Return the AquaCrop timestep index corresponding to target."""
+    dates = _model_dates(model)
+    target_date = pd.Timestamp(target).date()
+    try:
+        return dates.index(target_date)
+    except ValueError as exc:
+        first = dates[0] if dates else None
+        last = dates[-1] if dates else None
+        raise ValueError(
+            f"Date {target_date} is outside AquaCrop time_span ({first} -> {last})."
+        ) from exc
+
+
+def _advance_model_to_date(
+    model: AquaCropModel,
+    *,
+    sim_start: date,
+    branch_date: date,
+) -> int:
+    """Initialize model and advance it to the beginning of branch_date.
+
+    If branch_date == today, candidate day+0 irrigation is still available
+    because today's timestep has not been executed yet.
+    """
+    sim_start_ts = pd.Timestamp(sim_start).normalize()
+    branch_ts = pd.Timestamp(branch_date).normalize()
+    prefix_steps = int((branch_ts - sim_start_ts).days)
+
+    if prefix_steps < 0:
+        raise ValueError(f"branch_date={branch_date} is before sim_start={sim_start}.")
+
+    if prefix_steps == 0:
+        # Private, but needed because run_model(num_steps=0) is not allowed.
+        model._initialize()
+    else:
+        model.run_model(
+            num_steps=prefix_steps,
+            till_termination=False,
+            initialize_model=True,
+            process_outputs=False,
+        )
+
+    branch_idx = _index_for_model_date(model, branch_date)
+    current_idx = int(model._clock_struct.time_step_counter)
+
+    if current_idx != branch_idx:
+        dates = _model_dates(model)
+        current_date = dates[current_idx] if 0 <= current_idx < len(dates) else None
+        raise RuntimeError(
+            "AquaCrop branch alignment failed: "
+            f"expected index {branch_idx} for {branch_date}, "
+            f"but model is at index {current_idx} ({current_date})."
+        )
+
+    return branch_idx
+
+
+def _add_candidate_to_initialized_schedule(
+    model: AquaCropModel,
+    candidate: IrrigationCandidate,
+    *,
+    today: date,
+    max_dose: float,
+    earliest_idx : int,
+    latest_idx_exclusive: int | None = None,
+) -> None:
+    """Inject candidate events into AquaCrop's initialized daily schedule array.
+
+        Parameters
+        ----------
+        earliest_idx
+            First AquaCrop timestep index where candidate events may be added.
+        latest_idx_exclusive
+            Optional exclusive upper bound.  This is useful for two-level branching:
+            add day+0/day+1 events while running the deterministic AROME window,
+            then add day+2+ events only after switching to the member-specific
+            weather branch.
+
+        AquaCrop method 3 converts the user schedule DataFrame to a dense daily
+        array during initialization.  This function mutates that array directly.
+    """
+    if candidate.is_rainfed:
+        return
+
+    schedule = np.asarray(model._param_struct.IrrMngt.Schedule, dtype=float).copy()
+    date_to_idx = {d: i for i, d in enumerate(_model_dates(model))}
+
+    for day_offset, dose_mm in candidate.events:
+        if dose_mm <= 0 or day_offset < 0:
+            continue
+
+        event_date = (pd.Timestamp(today) + pd.Timedelta(days=int(day_offset))).date()
+        idx = date_to_idx.get(event_date)
+        if idx is None or idx < earliest_idx:
+            continue
+        if latest_idx_exclusive is not None and idx >= latest_idx_exclusive:
+                continue
+
+        # Preserve the physical MaxIrr daily cap when a farmer event and a
+        # candidate event fall on the same date.
+        schedule[idx] = min(schedule[idx] + float(dose_mm), float(max_dose))
+
+    model._param_struct.IrrMngt.irrigation_method = 3
+    model._param_struct.IrrMngt.Schedule = schedule
+    model._param_struct.IrrMngt.MaxIrr = float(max_dose)
+
+
+def _prepare_member_future_weather(
+    *,
+    member_weathers: dict[int, pd.DataFrame],
+    member_end_dates: dict[int, date],
+    parcel: ParcelConfig,
+    sim_start: date,
+    soil: Soil,
+    crop: Crop,
+    iwc: InitialWaterContent,
+) -> dict[int, _MemberFutureWeather]:
+    """Initialize each member once to obtain AquaCrop's internal weather array.
+
+    The two-level evaluator uses one reference member to produce the shared
+    historical and candidate-specific AROME states.  From ensemble_start onward,
+    each job swaps in the relevant member's private ``_weather`` array.
+    """
+    prepared: dict[int, _MemberFutureWeather] = {}
+
+    for member_id, weather in member_weathers.items():
+        full_end = member_end_dates[member_id]
+        model = AquaCropModel(
+            sim_start_time=sim_start.strftime("%Y/%m/%d"),
+            sim_end_time=full_end.strftime("%Y/%m/%d"),
+            weather_df=weather,
+            soil=soil,
+            crop=crop,
+            initial_water_content=iwc,
+            irrigation_management=parcel_to_irrigation(parcel),
+        )
+        model._initialize()
+        prepared[member_id] = _MemberFutureWeather(
+            weather_array=np.asarray(model._weather).copy(),
+            time_span=copy.deepcopy(model._clock_struct.time_span),
+            full_end=full_end,
+        )
+
+    return prepared
+
+
+def _assert_compatible_member_time_spans(
+    reference_model: AquaCropModel,
+    member_future_weather: dict[int, _MemberFutureWeather],
+) -> None:
+    """Ensure all member weather arrays share the reference model time axis."""
+    ref_dates = [ts.date() for ts in pd.to_datetime(reference_model._clock_struct.time_span)]
+
+    for member_id, prepared in member_future_weather.items():
+        member_dates = [ts.date() for ts in pd.to_datetime(prepared.time_span)]
+        if member_dates != ref_dates:
+            raise ValueError(
+                "Two-level branching currently requires all members to share "
+                "the same AquaCrop time_span. "
+                f"Member {member_id} differs from the reference member."
+            )
+
+
+def _build_candidate_arome_states(
+    *,
+    reference_model: AquaCropModel,
+    candidates: list[IrrigationCandidate],
+    today: date,
+    sim_start: date,
+    ensemble_start_date:date,
+    metric_days: int,
+    max_dose: float,
+) -> dict[int, _TwoLevelBranchState]:
+    """Run the common history once, then candidate-specific deterministic days once.
+
+        Output state is positioned at ``ensemble_start_date``, which should be the
+        first date in the ensemble-member forcing.  Do not infer this solely from
+        ``today + arome_days`` because duplicate/overlap handling can otherwise
+        create a one-day scoring mismatch at the boundary.
+    """
+
+    today_idx = _advance_model_to_date(
+        reference_model,
+        sim_start=sim_start,
+        branch_date=today,
+    )
+
+    ensemble_start_idx = _index_for_model_date(reference_model, ensemble_start_date)
+    deterministic_steps = ensemble_start_idx - today_idx
+    if deterministic_steps < 0:
+        raise ValueError(
+            f"ensemble_start_date={ensemble_start_date} is before today={today}."
+        )
+    n_time = len(reference_model._clock_struct.time_span)
+    metric_steps = min(metric_days, n_time - ensemble_start_idx)
+    if metric_steps <= 0:
+        raise RuntimeError(
+            f"No metric timesteps available from ensemble_start_date={ensemble_start_date}."
+        )
+    # AquaCrop private output arrays label completed timesteps with the
+    # pre-increment time_step_counter.  Therefore, when the model is positioned
+    # at ensemble_start_idx, the output row for the first ensemble timestep is
+    # stored with counter ensemble_start_idx - 1.  The full-rerun reference uses
+    # public DataFrame positions, so the private-output scorer must shift the
+    # metric window back by one internal counter to include the first ensemble
+    # day instead of starting at day+3.
+    metric_output_start_idx = max(0, ensemble_start_idx - 1)
+    candidate_states: dict[int, _TwoLevelBranchState] = {}
+
+    for cand_idx, candidate in enumerate(candidates):
+        model = copy.deepcopy(reference_model)
+
+        # Only inject events that belong to the deterministic shared window.
+        # Events on the boundary date itself (e.g. day+2 when ensemble starts at
+        # day+2) are injected later inside the member-specific branch, before
+        # that timestep is processed.
+
+        _add_candidate_to_initialized_schedule(
+            model,
+            candidate,
+            today=today,
+            max_dose=max_dose,
+            earliest_idx=today_idx,
+            latest_idx_exclusive=ensemble_start_idx,
+        )
+
+        if deterministic_steps > 0:
+            model.run_model(
+                num_steps=deterministic_steps,
+                till_termination=False,
+                initialize_model=False,
+                process_outputs=False,
+            )
+
+        
+        current_idx = int(model._clock_struct.time_step_counter)
+        if current_idx != ensemble_start_idx:
+            dates = _model_dates(model)
+            current_date = dates[current_idx] if 0 <= current_idx < len(dates) else None
+            raise RuntimeError(
+                "Candidate deterministic branch alignment failed: "
+                f"expected index {ensemble_start_idx} for {ensemble_start_date}, "
+                f"but model is at index {current_idx} ({current_date})."
+            )
+
+        candidate_states[cand_idx] = _TwoLevelBranchState(
+            model=model,
+            branch_start_idx=ensemble_start_idx,
+            branch_steps=metric_steps,
+            metric_start_idx=metric_output_start_idx,
+            metric_steps=metric_steps,
+            branch_date=ensemble_start_date,
+        )
+
+    return candidate_states
+
+
+def _extract_optimizer_metrics_from_private_outputs(
+    model: AquaCropModel,
+    state: _TwoLevelBranchState,
+    *,
+    stress_threshold: float,
+) -> tuple[float, int, float]:
+    """Extract optimizer metrics directly from AquaCrop private outputs."""
+    start = state.metric_start_idx
+    stop = start + state.metric_steps
+
+    wf = model._outputs.water_flux
+    cg = model._outputs.crop_growth
+
+    if isinstance(wf, pd.DataFrame):
+        wf_slice = wf[(wf["time_step_counter"] >= start) & (wf["time_step_counter"] < stop)]
+        cg_slice = cg[(cg["time_step_counter"] >= start) & (cg["time_step_counter"] < stop)]
+
+        tr = wf_slice["Tr"].to_numpy(dtype=float)
+        tr_pot = wf_slice["TrPot"].to_numpy(dtype=float)
+        cc_loss_arr = cg_slice["canopy_cover_ns"].to_numpy(dtype=float) - cg_slice[
+            "canopy_cover"
+        ].to_numpy(dtype=float)
+    else:
+        wf_arr = np.asarray(wf)
+        cg_arr = np.asarray(cg)
+
+        if wf_arr.size == 0 or cg_arr.size == 0:
+            return 1.0, state.metric_steps, 1.0
+
+        # Use AquaCrop's time_step_counter column instead of raw row positions.
+        # This avoids off-by-one errors at branch boundaries and avoids including
+        # any terminal/zero rows that AquaCrop may append after the last timestep.
+        wf_mask = (wf_arr[:, 0] >= start) & (wf_arr[:, 0] < stop)
+        cg_mask = (cg_arr[:, 0] >= start) & (cg_arr[:, 0] < stop)
+        wf_slice = wf_arr[wf_mask]
+        cg_slice = cg_arr[cg_mask]
+
+        if wf_slice.size == 0 or cg_slice.size == 0:
+            return 1.0, state.metric_steps, 1.0
+
+        # Raw AquaCrop output columns, from aquacrop.timestep:
+        # water_flux: 15=Tr, 16=TrPot
+        # crop_growth: 6=canopy_cover, 7=canopy_cover_ns
+        tr = wf_slice[:, 15].astype(float)
+        tr_pot = wf_slice[:, 16].astype(float)
+        cc_loss_arr = cg_slice[:, 7].astype(float) - cg_slice[:, 6].astype(float)
+
+    if len(tr) == 0:
+        return 1.0, state.metric_steps, 1.0
+
+    ks = np.where(tr_pot > 0.01, tr / tr_pot, 1.0)
+    max_stress = float(1.0 - np.nanmin(ks))
+    n_stress_days = int(np.sum(ks < stress_threshold))
+    cc_loss = float(np.nanmean(cc_loss_arr)) if len(cc_loss_arr) else 0.0
+
+    return max_stress, n_stress_days, cc_loss
+
+
+_TWO_LEVEL_WORKER_CTX: dict[str, Any] = {}
+
+
+def _init_two_level_worker(
+    candidate_states: dict[int, _TwoLevelBranchState],
+    member_future_weather: dict[int, _MemberFutureWeather],
+    candidates: list[IrrigationCandidate],
+    today: date,
+    max_dose: float,
+    stress_threshold: float,
+) -> None:
+    """Initialize process-local context for two-level branching workers."""
+    global _TWO_LEVEL_WORKER_CTX
+    _TWO_LEVEL_WORKER_CTX = {
+        "candidate_states": candidate_states,
+        "member_future_weather": member_future_weather,
+        "candidates": candidates,
+        "today": today,
+        "max_dose": float(max_dose),
+        "stress_threshold": float(stress_threshold),
+    }
+
+
+def _run_two_level_candidate_member_job(
+    job: tuple[int, int],
+) -> tuple[int, int, float, int, float]:
+    """Run one candidate × member from the candidate-specific AROME state."""
+    cand_idx, member_id = job
+    ctx = _TWO_LEVEL_WORKER_CTX
+
+    base_state = ctx["candidate_states"][cand_idx]
+    member_weather = ctx["member_future_weather"][member_id]
+
+    model = copy.deepcopy(base_state.model)
+    # At this point the model is already at ensemble_start.  Replace only the
+    # internal weather array so that today+arome_days onward follows the member.
+    model._weather = member_weather.weather_array
+
+    state = _TwoLevelBranchState(
+        model=model,
+        branch_start_idx=base_state.branch_start_idx,
+        branch_steps=base_state.branch_steps,
+        metric_start_idx=base_state.metric_start_idx,
+        metric_steps=base_state.metric_steps,
+        branch_date=base_state.branch_date,
+    )
+
+    # Inject events on/after the ensemble boundary only after the member weather
+    # has been selected.  This fixes boundary candidates such as day+2 when the
+    # ensemble also starts at day+2.
+    _add_candidate_to_initialized_schedule(
+        model,
+        ctx["candidates"][cand_idx],
+        today=ctx["today"],
+        max_dose=ctx["max_dose"],
+        earliest_idx=state.branch_start_idx,
+    )
+
+
+    if state.branch_steps > 0:
+        model.run_model(
+            num_steps=state.branch_steps,
+            till_termination=False,
+            initialize_model=False,
+            process_outputs=False,
+        )
+
+    max_stress, n_stress_days, cc_loss = _extract_optimizer_metrics_from_private_outputs(
+        model,
+        state,
+        stress_threshold=ctx["stress_threshold"],
+    )
+
+    return cand_idx, member_id, max_stress, n_stress_days, cc_loss
+
+
+def evaluate_candidates_ensemble_branching_2level(
+    historical_forcing: DailyForcing,
+    arome_forcing: DailyForcing,
+    member_forcings: dict[int, DailyForcing],
+    parcel: ParcelConfig,
+    terrain: TerrainParams,
+    soil_profile: SoilProfile,
+    sim_start: date,
+    today: date,
+    candidates: list[IrrigationCandidate] | None = None,
+    workers: int | None = 3,
+    stress_threshold: float = 0.9,
+    arome_days: int = 2,
+) -> list[CandidateResult]:
+    """Evaluate candidates using two-level AquaCrop branching.
+
+    Pipeline:
+    1. Build full weather per member: historical + deterministic AROME + member.
+    2. Initialize one reference full-weather model and run sim_start -> today - 1.
+    3. For each candidate, add its full future schedule and run the shared
+       deterministic AROME window once: today -> today + arome_days - 1.
+    4. For each candidate × member, copy that candidate state, swap in the
+       member-specific internal weather array, run ensemble_start -> full_end,
+       and score the same final IFS horizon as the original evaluator.
+
+    This is a private-internals prototype.  Keep the original
+    evaluate_candidates_ensemble() available for equivalence checks.
+    """
+    if candidates is None:
+        candidates = build_candidates(parcel)
+
+    if not candidates or not member_forcings:
+        return []
+
+    soil = soil_to_aquacrop(soil_profile)
+    crop = parcel_to_crop(parcel)
+    iwc = InitialWaterContent(value=["FC"])
+
+    base_forcing = historical_forcing.concat(arome_forcing)
+    base_weather = forcing_to_weather(base_forcing, terrain, parcel.lat)
+
+    member_weathers: dict[int, pd.DataFrame] = {}
+    member_end_dates: dict[int, date] = {}
+
+    for member_id, member_forcing in member_forcings.items():
+        member_weather = forcing_to_weather(member_forcing, terrain, parcel.lat)
+        full_weather = (
+            pd.concat([base_weather, member_weather])
+            .drop_duplicates("Date", keep="first")
+            .sort_values("Date")
+            .reset_index(drop=True)
+        )
+        member_weathers[member_id] = full_weather
+        member_end_dates[member_id] = pd.Timestamp(member_forcing.dates[-1]).date()
+
+    metric_days = next(iter(member_forcings.values())).n_days
+    member_start_dates = {
+        member_id: pd.Timestamp(member_forcings[member_id].dates[0]).date()
+        for member_id in member_weathers
+    }
+    unique_member_start_dates = set(member_start_dates.values())
+    if len(unique_member_start_dates) != 1:
+        raise ValueError(
+            "Two-level branching requires all ensemble members to start on the same date. "
+            f"Got: {member_start_dates}"
+        )
+    ensemble_start_date = next(iter(unique_member_start_dates))
+    inferred_arome_days = (pd.Timestamp(ensemble_start_date) - pd.Timestamp(today).normalize()).days
+    if inferred_arome_days != arome_days:
+        logger.warning(
+            "arome_days=%d but first ensemble member date implies %d deterministic days "
+            "(%s -> %s). Using the member forcing date as source of truth.",
+            arome_days,
+            inferred_arome_days,
+            today,
+            ensemble_start_date,
+        )
+
+    max_dose = float(parcel.irrigation.get("max_dose_mm", 40.0))
+    member_ids = list(member_weathers.keys())
+    reference_member_id = member_ids[0]
+
+    # Initialize members once to get AquaCrop-prepared weather arrays.
+    member_future_weather = _prepare_member_future_weather(
+        member_weathers=member_weathers,
+        member_end_dates=member_end_dates,
+        parcel=parcel,
+        sim_start=sim_start,
+        soil=soil,
+        crop=crop,
+        iwc=iwc,
+    )
+
+    reference_model = AquaCropModel(
+        sim_start_time=sim_start.strftime("%Y/%m/%d"),
+        sim_end_time=member_end_dates[reference_member_id].strftime("%Y/%m/%d"),
+        weather_df=member_weathers[reference_member_id],
+        soil=soil,
+        crop=crop,
+        initial_water_content=iwc,
+        irrigation_management=parcel_to_irrigation(parcel),
+    )
+
+    # Initialize reference before time-span compatibility check.
+    reference_model._initialize()
+    _assert_compatible_member_time_spans(reference_model, member_future_weather)
+
+    # Rebuild reference_model after the compatibility check because _initialize()
+    # above was only needed to inspect the time axis; _build_candidate_arome_states
+    # expects an unadvanced model and will initialize/advance it itself.
+    reference_model = AquaCropModel(
+        sim_start_time=sim_start.strftime("%Y/%m/%d"),
+        sim_end_time=member_end_dates[reference_member_id].strftime("%Y/%m/%d"),
+        weather_df=member_weathers[reference_member_id],
+        soil=soil,
+        crop=crop,
+        initial_water_content=iwc,
+        irrigation_management=parcel_to_irrigation(parcel),
+    )
+
+    candidate_states = _build_candidate_arome_states(
+        reference_model=reference_model,
+        candidates=candidates,
+        today=today,
+        sim_start=sim_start,
+        ensemble_start_date=ensemble_start_date,
+        metric_days=metric_days,
+        max_dose=max_dose,
+    )
+
+    jobs = [
+        (cand_idx, member_id) for cand_idx in range(len(candidates)) for member_id in member_ids
+    ]
+    n_jobs = len(jobs)
+
+    if workers is None or workers <= 0:
+        n_workers = min(mp.cpu_count(), n_jobs)
+    else:
+        n_workers = min(int(workers), mp.cpu_count(), n_jobs)
+
+    logger.info(
+        "Evaluating %d candidates × %d members = %d AquaCrop branches "
+        "(two-level branching, arome_days=%d, workers=%d)",
+        len(candidates),
+        len(member_ids),
+        n_jobs,
+        arome_days,
+        n_workers,
+    )
+
+    candidate_member_results: list[dict[int, tuple[float, int, float]]] = [{} for _ in candidates]
+
+    initargs = (
+        candidate_states,
+        member_future_weather,
+        candidates,
+        today,
+        max_dose,
+        stress_threshold,
+    )
+
+
+    if n_workers == 1:
+        _init_two_level_worker(*initargs)
+        iterator = map(_run_two_level_candidate_member_job, jobs)
+        for cand_idx, member_id, max_stress, n_days, cc_loss in iterator:
+            candidate_member_results[cand_idx][member_id] = (max_stress, n_days, cc_loss)
+    else:
+        # Prefer fork on WSL/Linux to avoid pickling many already-branched models.
+        mp_ctx = (
+            mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context()
+        )
+        chunksize = max(1, n_jobs // (n_workers * 8))
+
+        with mp_ctx.Pool(
+            processes=n_workers,
+            initializer=_init_two_level_worker,
+            initargs=initargs,
+        ) as pool:
+            for cand_idx, member_id, max_stress, n_days, cc_loss in pool.imap_unordered(
+                _run_two_level_candidate_member_job,
+                jobs,
+                chunksize=chunksize,
+            ):
+                candidate_member_results[cand_idx][member_id] = (max_stress, n_days, cc_loss)
+
+    results: list[CandidateResult] = []
+
+    for ci, candidate in enumerate(candidates):
+        rows = [candidate_member_results[ci][member_id] for member_id in member_ids]
+        member_max_stress = [row[0] for row in rows]
+        member_stress_days = [row[1] for row in rows]
+        member_yield_impact = [row[2] for row in rows]
+
+        arr_stress = np.asarray(member_max_stress, dtype=float)
+        arr_days = np.asarray(member_stress_days, dtype=float)
+
+        result = CandidateResult(
+            candidate=candidate,
+            member_max_stress=member_max_stress,
+            member_stress_days=member_stress_days,
+            member_yield_impact=member_yield_impact,
+            mean_max_stress=float(np.nanmean(arr_stress)),
+            median_max_stress=float(np.nanmedian(arr_stress)),
+            pct_members_avoid_stress=float(np.nanmean(arr_stress < (1.0 - stress_threshold))),
+            mean_stress_days=float(np.nanmean(arr_days)),
+        )
+        results.append(result)
+
+        logger.info(
+            "Candidate %d/%d '%s': mean_stress=%.3f, avoid_pct=%.0f%%, mean_stress_days=%.1f",
+            ci + 1,
+            len(candidates),
+            candidate.label,
+            result.mean_max_stress,
+            result.pct_members_avoid_stress * 100,
+            result.mean_stress_days,
+        )
+
+    results.sort(key=lambda r: (-r.pct_members_avoid_stress, r.mean_max_stress))
+    return results
+
+
+# Backward-compatible shorter alias for the private-internals prototype.
+evaluate_candidates_ensemble_branching = evaluate_candidates_ensemble_branching_2level
+
+
+def _evaluate_candidates_ensemble_full_reference_serial(
+    *,
+    historical_forcing: DailyForcing,
+    arome_forcing: DailyForcing,
+    member_forcings: dict[int, DailyForcing],
+    parcel: ParcelConfig,
+    terrain: TerrainParams,
+    soil_profile: SoilProfile,
+    sim_start: date,
+    today: date,
+    candidates: list[IrrigationCandidate],
+    stress_threshold: float,
+) -> list[CandidateResult]:
+    """Small, serial full-rerun reference implementation for validation only.
+
+    This intentionally avoids the older multiprocessing evaluator so that the
+    private-branching comparison is not affected by pool/stale-member bugs.
+    """
+    soil = soil_to_aquacrop(soil_profile)
+    crop = parcel_to_crop(parcel)
+    iwc = InitialWaterContent(value=["FC"])
+
+    base_forcing = historical_forcing.concat(arome_forcing)
+    base_weather = forcing_to_weather(base_forcing, terrain, parcel.lat)
+
+    member_weathers: dict[int, pd.DataFrame] = {}
+    member_end_dates: dict[int, date] = {}
+
+    for member_id, member_forcing in member_forcings.items():
+        member_weather = forcing_to_weather(member_forcing, terrain, parcel.lat)
+        full_weather = (
+            pd.concat([base_weather, member_weather])
+            .drop_duplicates("Date", keep="first")
+            .sort_values("Date")
+            .reset_index(drop=True)
+        )
+        member_weathers[member_id] = full_weather
+        member_end_dates[member_id] = pd.Timestamp(member_forcing.dates[-1]).date()
+
+    metric_days = next(iter(member_forcings.values())).n_days
+    member_ids = list(member_weathers)
+    results: list[CandidateResult] = []
+
+    for candidate in candidates:
+        member_max_stress: list[float] = []
+        member_stress_days: list[int] = []
+        member_yield_impact: list[float] = []
+
+        
+
+        for member_id in member_ids:
+            irr_mgmt = _build_candidate_irrigation(parcel, candidate, today)
+            model = AquaCropModel(
+                sim_start_time=sim_start.strftime("%Y/%m/%d"),
+                sim_end_time=member_end_dates[member_id].strftime("%Y/%m/%d"),
+                weather_df=member_weathers[member_id],
+                soil=soil,
+                crop=crop,
+                initial_water_content=iwc,
+                irrigation_management=irr_mgmt,
+            )
+            model.run_model(till_termination=True)
+
+            cg = model.get_crop_growth()
+            wf = model.get_water_flux()
+
+            n_total = min(len(cg), len(wf))
+            if n_total > 1 and cg["dap"].iloc[n_total - 1] == 0:
+                n_total -= 1
+
+            fc_start = max(0, n_total - metric_days)
+            tr = wf["Tr"].values[fc_start:n_total]
+            tr_pot = wf["TrPot"].values[fc_start:n_total]
+            ks = np.where(tr_pot > 0.01, tr / tr_pot, 1.0)
+
+            max_stress = float(1.0 - np.nanmin(ks)) if len(ks) else 0.0
+            n_stress_days = int((ks < stress_threshold).sum())
+            cc_loss = float(
+                (
+                    cg["canopy_cover_ns"].values[fc_start:n_total]
+                    - cg["canopy_cover"].values[fc_start:n_total]
+                ).mean()
+            )
+
+            member_max_stress.append(max_stress)
+            member_stress_days.append(n_stress_days)
+            member_yield_impact.append(cc_loss)
+
+        arr_stress = np.asarray(member_max_stress, dtype=float)
+        arr_days = np.asarray(member_stress_days, dtype=float)
+        results.append(
+            CandidateResult(
+                candidate=candidate,
+                member_max_stress=member_max_stress,
+                member_stress_days=member_stress_days,
+                member_yield_impact=member_yield_impact,
+                mean_max_stress=float(np.nanmean(arr_stress)),
+                median_max_stress=float(np.nanmedian(arr_stress)),
+                pct_members_avoid_stress=float(np.nanmean(arr_stress < (1.0 - stress_threshold))),
+                mean_stress_days=float(np.nanmean(arr_days)),
+            )
+        )
+
+    results.sort(key=lambda r: (-r.pct_members_avoid_stress, r.mean_max_stress))
+    return results
+
+
+def compare_full_vs_branching_2level_on_subset(
+    *,
+    historical_forcing: DailyForcing,
+    arome_forcing: DailyForcing,
+    member_forcings: dict[int, DailyForcing],
+    parcel: ParcelConfig,
+    terrain: TerrainParams,
+    soil_profile: SoilProfile,
+    sim_start: date,
+    today: date,
+    candidates: list[IrrigationCandidate],
+    n_candidates: int = 10,
+    n_members: int = 5,
+    stress_threshold: float = 0.9,
+    arome_days: int = 2,
+) -> pd.DataFrame:
+    """Compare original full-rerun evaluator with two-level branching.
+
+    Use this before making evaluate_candidates_ensemble_branching_2level the
+    default path in the pipeline.
+    """
+    sample_candidates = candidates[:n_candidates]
+    sample_member_ids = list(member_forcings)[:n_members]
+    sample_member_forcings = {
+        member_id: member_forcings[member_id] for member_id in sample_member_ids
+    }
+
+    full_results = _evaluate_candidates_ensemble_full_reference_serial(
+        historical_forcing=historical_forcing,
+        arome_forcing=arome_forcing,
+        member_forcings=sample_member_forcings,
+        parcel=parcel,
+        terrain=terrain,
+        soil_profile=soil_profile,
+        sim_start=sim_start,
+        today=today,
+        candidates=sample_candidates,
+        stress_threshold=stress_threshold,
+    )
+
+    branch_results = evaluate_candidates_ensemble_branching_2level(
+        historical_forcing=historical_forcing,
+        arome_forcing=arome_forcing,
+        member_forcings=sample_member_forcings,
+        parcel=parcel,
+        terrain=terrain,
+        soil_profile=soil_profile,
+        sim_start=sim_start,
+        today=today,
+        candidates=sample_candidates,
+        workers=1,
+        stress_threshold=stress_threshold,
+        arome_days=arome_days,
+    )
+
+    full_by_label = {result.candidate.label: result for result in full_results}
+    branch_by_label = {result.candidate.label: result for result in branch_results}
+
+    rows = []
+    for label in sorted(set(full_by_label) & set(branch_by_label)):
+        full = full_by_label[label]
+        branch = branch_by_label[label]
+        rows.append(
+            {
+                "candidate": label,
+                "full_mean_max_stress": full.mean_max_stress,
+                "branch_mean_max_stress": branch.mean_max_stress,
+                "abs_delta_mean_max_stress": abs(full.mean_max_stress - branch.mean_max_stress),
+                "full_mean_stress_days": full.mean_stress_days,
+                "branch_mean_stress_days": branch.mean_stress_days,
+                "abs_delta_mean_stress_days": abs(full.mean_stress_days - branch.mean_stress_days),
+                "full_avoid_pct": full.pct_members_avoid_stress,
+                "branch_avoid_pct": branch.pct_members_avoid_stress,
+                "abs_delta_avoid_pct": abs(
+                    full.pct_members_avoid_stress - branch.pct_members_avoid_stress
+                ),
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values("abs_delta_mean_max_stress", ascending=False)
+
+
 def recommend_from_optimizer(
     results: list[CandidateResult],
     water_cost_eur_mm: float = 2.5,
-) -> dict:
+    top_x: int = 1,
+) -> list[dict]:
     """Pick the best irrigation action from optimizer results.
 
     Selection logic:
@@ -1415,14 +2261,14 @@ def recommend_from_optimizer(
     no_irr = next((r for r in results if r.candidate.is_rainfed), None)
 
     if no_irr and no_irr.pct_members_avoid_stress > 0.80:
-        return {
+        return [{
             "action": "No irrigation needed",
             "reason": f"{no_irr.pct_members_avoid_stress:.0%} of members avoid stress without irrigation",
             "candidate": no_irr.candidate,
             "avoid_stress_pct": no_irr.pct_members_avoid_stress,
             "mean_stress_days": no_irr.mean_stress_days,
             "all_results": results,
-        }
+        }]
 
     # Find cheapest action that avoids stress in >70% of members
     good = [r for r in results if r.pct_members_avoid_stress > 0.70 and not r.candidate.is_rainfed]
@@ -1431,9 +2277,9 @@ def recommend_from_optimizer(
         good.sort(
             key=lambda r: (r.candidate.total_mm, r.candidate.n_events, r.candidate.day_offset)
         )
-        best = good[0]
+        best_results = good[:top_x]
         no_irr_days = no_irr.mean_stress_days if no_irr else float("nan")
-        return {
+        return [{
             "action": best.candidate.label,
             "reason": (
                 f"{best.pct_members_avoid_stress:.0%} of members avoid stress. "
@@ -1445,11 +2291,12 @@ def recommend_from_optimizer(
             "mean_stress_days": best.mean_stress_days,
             "cost_eur_ha": best.candidate.total_mm * water_cost_eur_mm,
             "all_results": results,
-        }
+        } for best in best_results]
 
     # Nothing avoids stress well — pick action that minimizes stress
-    best = results[0]  # already sorted by best outcome
-    return {
+    top_results = results[:top_x]
+
+    return  [{
         "action": f"{best.candidate.label} (limited benefit)",
         "reason": (
             f"No action avoids stress in >70% of members. Best option: "
@@ -1460,4 +2307,4 @@ def recommend_from_optimizer(
         "avoid_stress_pct": best.pct_members_avoid_stress,
         "mean_stress_days": best.mean_stress_days,
         "all_results": results,
-    }
+    } for best in top_results]

@@ -474,8 +474,9 @@ def run_ensemble_aquacrop(
     daily_stats: list[AquaCropEnsembleStats] = []
 
     # Pre-compute shared objects
-    soil = soil_to_aquacrop(soil_profile)
+    
     crop = parcel_to_crop(parcel)
+    soil = soil_to_aquacrop(soil_profile, min_depth_m=crop.Zmax,extrapolate_below_profile=True )
     iwc = InitialWaterContent(value=["FC"])
 
     # Base weather: historical + AROME (ET₀ computed once)
@@ -518,6 +519,8 @@ def run_ensemble_aquacrop(
     member_dates = None
 
     for member_id in member_weathers:
+        print(member_id)
+        
         weather = member_weathers[member_id]
         full_end = member_end_dates[member_id]
 
@@ -1861,8 +1864,9 @@ def evaluate_candidates_ensemble_branching_2level(
     if not candidates or not member_forcings:
         return []
 
-    soil = soil_to_aquacrop(soil_profile)
+    
     crop = parcel_to_crop(parcel)
+    soil = soil_to_aquacrop(soil_profile, min_depth_m=crop.Zmax, extrapolate_below_profile=True)
     iwc = InitialWaterContent(value=["FC"])
 
     base_forcing = historical_forcing.concat(arome_forcing)

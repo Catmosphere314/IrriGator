@@ -29,6 +29,7 @@ from pathlib import Path
 from calendar import monthrange
 
 import cdsapi
+import uuid
 import xarray as xr
 
 from irrigator.config import BBoxWGS84
@@ -110,6 +111,7 @@ def fetch_era5_land_month(
     raw_dir: str | Path = DEFAULT_RAW_DIR,
     include_validation: bool = False,
     overwrite: bool = False,
+    force_cds_refresh: bool = False
 ) -> Path:
     """Download one month of hourly ERA5-Land data.
 
@@ -120,6 +122,7 @@ def fetch_era5_land_month(
     raw_dir : output directory for ERA5 downloads
     include_validation : if True, also download soil moisture layers
     overwrite : re-download even if file exists
+    force_cds_refresh : to avoid cache issues when overwriting
 
     Returns
     -------
@@ -155,6 +158,7 @@ def fetch_era5_land_month(
                 month,
                 out_path,
             )
+            ds.close()
 
     # Build day list for the month
     first_day = date(year, month, 1)
@@ -163,6 +167,7 @@ def fetch_era5_land_month(
     else:
         last_day = date(year, month + 1, 1) - timedelta(days=1)
     days = [f"{d:02d}" for d in range(1, last_day.day + 1)]
+
 
     request = {
         "variable": list(ERA5_LAND_VARIABLES),
@@ -174,6 +179,9 @@ def fetch_era5_land_month(
         "data_format": "netcdf",
         "download_format": "unarchived",
     }
+
+    if force_cds_refresh:
+        request["nocache"] = '123'
 
     logger.info("Requesting ERA5-Land %04d-%02d from CDS...", year, month)
     client = _init_cds_client()

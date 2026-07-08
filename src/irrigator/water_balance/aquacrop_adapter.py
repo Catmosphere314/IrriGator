@@ -40,6 +40,66 @@ from irrigator.water_balance.et0 import compute_et0
 
 logger = logging.getLogger(__name__)
 
+CROP_ALLOWED_OVERRIDES = {
+    "CalendarType",
+    "GDDmethod",
+    "Tbase",
+    "Tupp",
+    "Emergence",
+    "MaxRooting",
+    "Senescence",
+    "Maturity",
+    "HIstart",
+    "Flowering",
+    "YldForm",
+    "PlantPop",
+    "SeedSize",
+    "CCx",
+    "CGC",
+    "CDC",
+    "Kcb",
+    "WP",
+    "WPy",
+    "HI0",
+    "Zmin",
+    "Zmax",
+    "fshape_r",
+    "SxTopQ",
+    "SxBotQ",
+    "p_up1",
+    "p_up2",
+    "p_up3",
+    "p_up4",
+    "p_lo1",
+    "p_lo2",
+    "p_lo3",
+    "p_lo4",
+    "fshape_w1",
+    "fshape_w2",
+    "fshape_w3",
+    "fshape_w4",
+}
+
+VARIETY_AQUACROP_PRESETS: dict[str, dict[str, Any]] = {
+    "DKC4728": {
+        # DKC documentation: GDD thresholds are base 6.
+        "CalendarType": 2,  # GDD mode
+        "GDDmethod": 2,
+        "Tbase": 6,
+        "Tupp": 30,
+        # Sowing -> flowering
+        "HIstart": 970,
+        # Sowing -> grain 32% H2O.
+        # Practical maturity proxy; not necessarily black-layer maturity.
+        "Maturity": 1900,
+        # Derived grain/yield formation duration.
+        "YldForm": 1900 - 970,
+        # Conservative scaling from built-in maize default:
+        # default Senescence/Maturity = 1420/1670 ≈ 0.85.
+        "Senescence": round(0.85 * 1900),
+        "MaxRooting": round(0.85 * 1900),
+    }
+}
 
 # ---------------------------------------------------------------------------
 # Data conversion: IrriGator → AquaCrop
@@ -83,6 +143,7 @@ def forcing_to_weather(
     weather["MaxTemp"] = weather["MaxTemp"].ffill().fillna(20.0)
 
     return weather
+
 
 def _profile_theta_s(profile: SoilProfile, i: int) -> float:
     """Return saturation water content for layer i, with a conservative fallback."""
@@ -142,6 +203,7 @@ def _weighted_profile_interval(
     th_s = max(th_s, th_fc + 0.01)
     ksat = max(ksat, 1.0)
     return th_wp, th_fc, th_s, ksat
+
 
 def soil_to_aquacrop(
     profile: SoilProfile,
@@ -235,13 +297,90 @@ def soil_to_aquacrop(
     return soil
 
 
+def _mmdd(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return pd.Timestamp(value).strftime("%m/%d")
+
+
+def _plants_per_ha(crop_cfg: dict[str, Any]) -> int:
+    """Return AquaCrop PlantPop, i.e. established plants/ha."""
+
+    if crop_cfg.get("plant_population") is not None:
+        return int(crop_cfg["plant_population"])
+
+    if crop_cfg.get("sowing_density") is not None:
+        emergence_rate = float(crop_cfg.get("emergence_rate", 1.0))
+        if not 0 < emergence_rate <= 1:
+            raise ValueError(f"Invalid emergence_rate: {emergence_rate}")
+        return round(int(crop_cfg["sowing_density"]) * emergence_rate)
+
+    # Backward compatibility with your current YAML.
+    # Your comment says seed/ha, so use emergence_rate if provided.
+    if crop_cfg.get("density") is not None:
+        emergence_rate = float(crop_cfg.get("emergence_rate", 1.0))
+        if not 0 < emergence_rate <= 1:
+            raise ValueError(f"Invalid emergence_rate: {emergence_rate}")
+        return round(int(crop_cfg["density"]) * emergence_rate)
+
+    return 75_000
+
+
+def _validate_aquacrop_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
+    unknown = set(overrides) - CROP_ALLOWED_OVERRIDES
+    if unknown:
+        raise ValueError(
+            "Unknown AquaCrop crop override(s): "
+            f"{sorted(unknown)}. Use AquaCrop Crop attribute names."
+        )
+    return overrides
+
+
+def _crop_overrides_from_config(crop_cfg: dict[str, Any]) -> dict[str, Any]:
+    variety = str(crop_cfg.get("variety", "")).upper()
+
+    overrides: dict[str, Any] = {}
+
+    # 1. Variety preset from documentation.
+    if variety in VARIETY_AQUACROP_PRESETS:
+        overrides.update(VARIETY_AQUACROP_PRESETS[variety])
+
+    # 2. Generic YAML GDD thresholds override the preset if present.
+    gdd = crop_cfg.get("gdd_thresholds") or {}
+
+    if gdd.get("base") is not None:
+        overrides["Tbase"] = float(gdd["base"])
+
+    if gdd.get("flowering") is not None:
+        overrides["HIstart"] = int(gdd["flowering"])
+
+    maturity = gdd.get("maturity") or gdd.get("harvest_32pct_h2o") or gdd.get("harvest")
+    if maturity is not None:
+        overrides["Maturity"] = int(maturity)
+
+    if "HIstart" in overrides and "Maturity" in overrides:
+        yld_form = int(overrides["Maturity"] - overrides["HIstart"])
+        if yld_form <= 0:
+            raise ValueError(
+                f"Invalid phenology: Maturity={overrides['Maturity']} "
+                f"must be greater than HIstart={overrides['HIstart']}."
+            )
+        overrides["YldForm"] = yld_form
+        overrides.setdefault("Senescence", round(0.85 * overrides["Maturity"]))
+        overrides.setdefault("MaxRooting", overrides["Senescence"])
+
+    # 3. Plant population.
+    overrides["PlantPop"] = _plants_per_ha(crop_cfg)
+
+    # 4. Manual expert overrides have final priority.
+    overrides.update(crop_cfg.get("aquacrop_overrides") or {})
+
+    return _validate_aquacrop_overrides(overrides)
+
 
 def parcel_to_crop(parcel: ParcelConfig) -> Crop:
-    """Convert parcel crop config to AquaCrop Crop object.
+    """Convert parcel crop config to AquaCrop Crop object."""
 
-    Uses AquaCrop's built-in Maize parameters (GDD thresholds,
-    canopy expansion coefficients, root deepening rate, etc.).
-    """
     crop_cfg = parcel.crop
     crop_type = crop_cfg.get("type", "grain_maize")
 
@@ -250,13 +389,20 @@ def parcel_to_crop(parcel: ParcelConfig) -> Crop:
             f"Unsupported AquaCrop crop: {crop_type}. Currently only grain_maize is supported."
         )
 
-    planting = pd.Timestamp(crop_cfg["planting_date"])
-    planting_mmdd = planting.strftime("%m/%d")
+    planting_mmdd = _mmdd(crop_cfg["planting_date"])
+    harvest_mmdd = _mmdd(crop_cfg.get("expected_harvest"))
 
-    harvest = crop_cfg.get("expected_harvest")
-    harvest_mmdd = pd.Timestamp(harvest).strftime("%m/%d") if harvest else None
+    overrides = _crop_overrides_from_config(crop_cfg)
 
-    return Crop("Maize", planting_date=planting_mmdd, harvest_date=harvest_mmdd)
+    name = "MaizeGDD" if overrides["Maturity"] else "Maize"
+    print(name)
+
+    return Crop(
+        name,
+        planting_date=planting_mmdd,
+        harvest_date=harvest_mmdd,
+        **overrides,
+    )
 
 
 def parcel_to_irrigation(parcel: ParcelConfig) -> IrrigationManagement:
@@ -345,6 +491,96 @@ class AquaCropResult:
         )
 
 
+def _prepare_aquacrop_init(
+    weather: pd.DataFrame,
+    crop: Crop,
+    sim_start: date,
+    sim_end: date,
+) -> tuple[pd.DataFrame, str, int]:
+    """Extend weather and compute init_end for AquaCrop calendar init.
+
+    AquaCrop's ``compute_variables`` calls ``compute_crop_calendar``
+    unconditionally.  In GDD mode (``CalendarType=2``), this scans the
+    weather for the calendar day when GDD reaches ``Maturity``.  If the
+    simulation period is shorter than a full growing season, the
+    assertion fails.
+
+    Fix: set ``sim_end`` to the harvest date for AquaCrop's constructor
+    (so the calendar computation succeeds), extend the weather with
+    synthetic climatological fill, and run only ``actual_sim_days``
+    timesteps.  The synthetic rows are consumed only by the calendar
+    init — never by the daily crop simulation.
+
+    Returns
+    -------
+    weather_ext : extended weather DataFrame
+    init_end_str : sim_end string for AquaCropModel constructor
+    actual_sim_days : number of real forcing days to simulate
+    """
+    actual_sim_days = (sim_end - sim_start).days
+
+    harvest_date_str = crop.harvest_date
+    if harvest_date_str is not None:
+        init_end = pd.Timestamp(f"{sim_start.year}/{harvest_date_str}")
+        if init_end <= pd.Timestamp(sim_start):
+            init_end = pd.Timestamp(f"{sim_start.year + 1}/{harvest_date_str}")
+        extend_to = init_end + pd.Timedelta(days=30)
+        last_weather_date = weather["Date"].iloc[-1]
+        if extend_to > last_weather_date:
+            extra_dates = pd.date_range(
+                last_weather_date + pd.Timedelta(days=1), extend_to, freq="D"
+            )
+            fill = pd.DataFrame(
+                {
+                    "MinTemp": weather["MinTemp"].tail(30).mean(),
+                    "MaxTemp": weather["MaxTemp"].tail(30).mean(),
+                    "Precipitation": 0.0,
+                    "ReferenceET": weather["ReferenceET"].tail(30).mean(),
+                    "Date": extra_dates,
+                }
+            )
+            weather = pd.concat([weather, fill], ignore_index=True)
+            logger.debug(
+                "Extended weather to %s (+%d synthetic days) for crop calendar init",
+                extend_to.date(),
+                len(extra_dates),
+            )
+        init_end_str = init_end.strftime("%Y/%m/%d")
+    else:
+        init_end_str = sim_end.strftime("%Y/%m/%d")
+
+    return weather, init_end_str, actual_sim_days
+
+
+def _trim_aquacrop_outputs(
+    model: AquaCropModel,
+    actual_sim_days: int,
+) -> AquaCropResult:
+    """Extract AquaCrop results trimmed to actual simulation days.
+
+    Discards rows produced from synthetic weather beyond the real
+    forcing boundary.  Uses ``time_step_counter`` for data-driven
+    trimming rather than fixed offsets.
+    """
+    cg = model.get_crop_growth()
+    wf = model.get_water_flux()
+    ws = model.get_water_storage()
+
+
+    last_nonzero = max(i for i, v in enumerate(cg["time_step_counter"]) if v != 0)
+
+    valid_mask = [
+        (i <= last_nonzero and i <= actual_sim_days) for i in range(len(cg["time_step_counter"]))
+    ]
+
+    return AquaCropResult(
+        final_results=model.get_simulation_results(),
+        crop_growth=cg[valid_mask].reset_index(drop=True),
+        water_flux=wf[valid_mask].reset_index(drop=True),
+        water_storage=ws[valid_mask].reset_index(drop=True),
+    )
+
+
 def run_aquacrop(
     forcing: DailyForcing,
     parcel: ParcelConfig,
@@ -372,15 +608,23 @@ def run_aquacrop(
         (default: field capacity)
     """
     weather = forcing_to_weather(forcing, terrain, parcel.lat)
-    soil = soil_to_aquacrop(soil_profile)
+
     crop = parcel_to_crop(parcel)
+    soil = soil_to_aquacrop(soil_profile, min_depth_m=crop.Zmax, extrapolate_below_profile=True)
+
+    weather, init_end_str, actual_sim_days = _prepare_aquacrop_init(
+        weather=weather,
+        crop=crop,
+        sim_start=sim_start,
+        sim_end=sim_end,
+    )
 
     iwc = initial_water_content or InitialWaterContent(value=["FC"])
     irr = irrigation_management or parcel_to_irrigation(parcel)
 
     model = AquaCropModel(
         sim_start_time=sim_start.strftime("%Y/%m/%d"),
-        sim_end_time=sim_end.strftime("%Y/%m/%d"),
+        sim_end_time=init_end_str,
         weather_df=weather,
         soil=soil,
         crop=crop,
@@ -388,14 +632,12 @@ def run_aquacrop(
         irrigation_management=irr,
     )
 
+    # Let AquaCrop run — it will stop at crop maturity or sim_end (harvest).
+    # We then trim outputs to the actual days with real forcing.
+    #model.run_model(till_termination=True)
     model.run_model(till_termination=True)
 
-    result = AquaCropResult(
-        final_results=model.get_simulation_results(),
-        crop_growth=model.get_crop_growth(),
-        water_flux=model.get_water_flux(),
-        water_storage=model.get_water_storage(),
-    )
+    result = _trim_aquacrop_outputs(model, actual_sim_days=actual_sim_days)
 
     n_days = len(result.crop_growth)
     logger.info(
@@ -474,9 +716,9 @@ def run_ensemble_aquacrop(
     daily_stats: list[AquaCropEnsembleStats] = []
 
     # Pre-compute shared objects
-    
+
     crop = parcel_to_crop(parcel)
-    soil = soil_to_aquacrop(soil_profile, min_depth_m=crop.Zmax,extrapolate_below_profile=True )
+    soil = soil_to_aquacrop(soil_profile, min_depth_m=crop.Zmax, extrapolate_below_profile=True)
     iwc = InitialWaterContent(value=["FC"])
 
     # Base weather: historical + AROME (ET₀ computed once)
@@ -519,40 +761,41 @@ def run_ensemble_aquacrop(
     member_dates = None
 
     for member_id in member_weathers:
-        print(member_id)
-        
         weather = member_weathers[member_id]
         full_end = member_end_dates[member_id]
 
         logger.debug("Member %d: %s → %s", member_id, sim_start, full_end)
 
+        # Extend weather for crop calendar init and get init_end
+        weather_ext, init_end_str, actual_sim_days = _prepare_aquacrop_init(
+            weather,
+            crop,
+            sim_start,
+            full_end,
+        )
+
         model = AquaCropModel(
             sim_start_time=sim_start.strftime("%Y/%m/%d"),
-            sim_end_time=full_end.strftime("%Y/%m/%d"),
-            weather_df=weather,
+            sim_end_time=init_end_str,
+            weather_df=weather_ext,
             soil=soil,
             crop=crop,
             initial_water_content=iwc,
             irrigation_management=parcel_to_irrigation(parcel),
         )
+
         model.run_model(till_termination=True)
 
-        result = AquaCropResult(
-            final_results=model.get_simulation_results(),
-            crop_growth=model.get_crop_growth(),
-            water_flux=model.get_water_flux(),
-            water_storage=model.get_water_storage(),
-        )
-
+        # Trim to real-forcing days
+        result = _trim_aquacrop_outputs(model, actual_sim_days)
         stress = result.daily_stress
 
-        # Extract forecast portion (last n_forecast days, excluding terminal zero row)
-        n_total = len(stress)
-        if n_total > 1 and stress["dap"].iloc[-1] == 0:
-            n_total -= 1
-
-        forecast_start_idx = max(0, n_total - n_forecast)
-        forecast_slice = stress.iloc[forecast_start_idx:n_total]
+        # Extract forecast portion (last n_forecast days)
+        # Drop terminal zero rows
+        n_valid = len(stress)
+        
+        forecast_start_idx = max(0, n_valid - n_forecast)
+        forecast_slice = stress.iloc[forecast_start_idx:n_valid]
 
         all_member_ks[member_id] = forecast_slice["ks"].values
         all_member_cc[member_id] = forecast_slice["canopy_cover"].values
@@ -1035,7 +1278,7 @@ def build_candidates(
     """
     irr_cfg = parcel_config.irrigation
     min_dose = irr_cfg.get("min_dose_mm", 15)
-    max_dose = irr_cfg.get("max_dose_mm",35)
+    max_dose = irr_cfg.get("max_dose_mm", 35)
     min_interval = irr_cfg.get("min_interval_days", 3)
 
     # Dose levels for single events: min, mid, max
@@ -1502,23 +1745,23 @@ def _add_candidate_to_initialized_schedule(
     *,
     today: date,
     max_dose: float,
-    earliest_idx : int,
+    earliest_idx: int,
     latest_idx_exclusive: int | None = None,
 ) -> None:
     """Inject candidate events into AquaCrop's initialized daily schedule array.
 
-        Parameters
-        ----------
-        earliest_idx
-            First AquaCrop timestep index where candidate events may be added.
-        latest_idx_exclusive
-            Optional exclusive upper bound.  This is useful for two-level branching:
-            add day+0/day+1 events while running the deterministic AROME window,
-            then add day+2+ events only after switching to the member-specific
-            weather branch.
+    Parameters
+    ----------
+    earliest_idx
+        First AquaCrop timestep index where candidate events may be added.
+    latest_idx_exclusive
+        Optional exclusive upper bound.  This is useful for two-level branching:
+        add day+0/day+1 events while running the deterministic AROME window,
+        then add day+2+ events only after switching to the member-specific
+        weather branch.
 
-        AquaCrop method 3 converts the user schedule DataFrame to a dense daily
-        array during initialization.  This function mutates that array directly.
+    AquaCrop method 3 converts the user schedule DataFrame to a dense daily
+    array during initialization.  This function mutates that array directly.
     """
     if candidate.is_rainfed:
         return
@@ -1535,7 +1778,7 @@ def _add_candidate_to_initialized_schedule(
         if idx is None or idx < earliest_idx:
             continue
         if latest_idx_exclusive is not None and idx >= latest_idx_exclusive:
-                continue
+            continue
 
         # Preserve the physical MaxIrr daily cap when a farmer event and a
         # candidate event fall on the same date.
@@ -1608,16 +1851,16 @@ def _build_candidate_arome_states(
     candidates: list[IrrigationCandidate],
     today: date,
     sim_start: date,
-    ensemble_start_date:date,
+    ensemble_start_date: date,
     metric_days: int,
     max_dose: float,
 ) -> dict[int, _TwoLevelBranchState]:
     """Run the common history once, then candidate-specific deterministic days once.
 
-        Output state is positioned at ``ensemble_start_date``, which should be the
-        first date in the ensemble-member forcing.  Do not infer this solely from
-        ``today + arome_days`` because duplicate/overlap handling can otherwise
-        create a one-day scoring mismatch at the boundary.
+    Output state is positioned at ``ensemble_start_date``, which should be the
+    first date in the ensemble-member forcing.  Do not infer this solely from
+    ``today + arome_days`` because duplicate/overlap handling can otherwise
+    create a one-day scoring mismatch at the boundary.
     """
 
     today_idx = _advance_model_to_date(
@@ -1629,9 +1872,7 @@ def _build_candidate_arome_states(
     ensemble_start_idx = _index_for_model_date(reference_model, ensemble_start_date)
     deterministic_steps = ensemble_start_idx - today_idx
     if deterministic_steps < 0:
-        raise ValueError(
-            f"ensemble_start_date={ensemble_start_date} is before today={today}."
-        )
+        raise ValueError(f"ensemble_start_date={ensemble_start_date} is before today={today}.")
     n_time = len(reference_model._clock_struct.time_span)
     metric_steps = min(metric_days, n_time - ensemble_start_idx)
     if metric_steps <= 0:
@@ -1673,7 +1914,6 @@ def _build_candidate_arome_states(
                 process_outputs=False,
             )
 
-        
         current_idx = int(model._clock_struct.time_step_counter)
         if current_idx != ensemble_start_idx:
             dates = _model_dates(model)
@@ -1812,7 +2052,6 @@ def _run_two_level_candidate_member_job(
         earliest_idx=state.branch_start_idx,
     )
 
-
     if state.branch_steps > 0:
         model.run_model(
             num_steps=state.branch_steps,
@@ -1864,7 +2103,6 @@ def evaluate_candidates_ensemble_branching_2level(
     if not candidates or not member_forcings:
         return []
 
-    
     crop = parcel_to_crop(parcel)
     soil = soil_to_aquacrop(soil_profile, min_depth_m=crop.Zmax, extrapolate_below_profile=True)
     iwc = InitialWaterContent(value=["FC"])
@@ -1992,7 +2230,6 @@ def evaluate_candidates_ensemble_branching_2level(
         stress_threshold,
     )
 
-
     if n_workers == 1:
         _init_two_level_worker(*initargs)
         iterator = map(_run_two_level_candidate_member_job, jobs)
@@ -2105,8 +2342,6 @@ def _evaluate_candidates_ensemble_full_reference_serial(
         member_max_stress: list[float] = []
         member_stress_days: list[int] = []
         member_yield_impact: list[float] = []
-
-        
 
         for member_id in member_ids:
             irr_mgmt = _build_candidate_irrigation(parcel, candidate, today)
@@ -2265,14 +2500,16 @@ def recommend_from_optimizer(
     no_irr = next((r for r in results if r.candidate.is_rainfed), None)
 
     if no_irr and no_irr.pct_members_avoid_stress > 0.80:
-        return [{
-            "action": "No irrigation needed",
-            "reason": f"{no_irr.pct_members_avoid_stress:.0%} of members avoid stress without irrigation",
-            "candidate": no_irr.candidate,
-            "avoid_stress_pct": no_irr.pct_members_avoid_stress,
-            "mean_stress_days": no_irr.mean_stress_days,
-            "all_results": results,
-        }]
+        return [
+            {
+                "action": "No irrigation needed",
+                "reason": f"{no_irr.pct_members_avoid_stress:.0%} of members avoid stress without irrigation",
+                "candidate": no_irr.candidate,
+                "avoid_stress_pct": no_irr.pct_members_avoid_stress,
+                "mean_stress_days": no_irr.mean_stress_days,
+                "all_results": results,
+            }
+        ]
 
     # Find cheapest action that avoids stress in >70% of members
     good = [r for r in results if r.pct_members_avoid_stress > 0.70 and not r.candidate.is_rainfed]
@@ -2283,32 +2520,38 @@ def recommend_from_optimizer(
         )
         best_results = good[:top_x]
         no_irr_days = no_irr.mean_stress_days if no_irr else float("nan")
-        return [{
-            "action": best.candidate.label,
-            "reason": (
-                f"{best.pct_members_avoid_stress:.0%} of members avoid stress. "
-                f"Mean stress days: {best.mean_stress_days:.1f} vs "
-                f"{no_irr_days:.1f} without irrigation"
-            ),
-            "candidate": best.candidate,
-            "avoid_stress_pct": best.pct_members_avoid_stress,
-            "mean_stress_days": best.mean_stress_days,
-            "cost_eur_ha": best.candidate.total_mm * water_cost_eur_mm,
-            "all_results": results,
-        } for best in best_results]
+        return [
+            {
+                "action": best.candidate.label,
+                "reason": (
+                    f"{best.pct_members_avoid_stress:.0%} of members avoid stress. "
+                    f"Mean stress days: {best.mean_stress_days:.1f} vs "
+                    f"{no_irr_days:.1f} without irrigation"
+                ),
+                "candidate": best.candidate,
+                "avoid_stress_pct": best.pct_members_avoid_stress,
+                "mean_stress_days": best.mean_stress_days,
+                "cost_eur_ha": best.candidate.total_mm * water_cost_eur_mm,
+                "all_results": results,
+            }
+            for best in best_results
+        ]
 
     # Nothing avoids stress well — pick action that minimizes stress
     top_results = results[:top_x]
 
-    return  [{
-        "action": f"{best.candidate.label} (limited benefit)",
-        "reason": (
-            f"No action avoids stress in >70% of members. Best option: "
-            f"{best.pct_members_avoid_stress:.0%} avoid stress, "
-            f"mean {best.mean_stress_days:.1f} stress days"
-        ),
-        "candidate": best.candidate,
-        "avoid_stress_pct": best.pct_members_avoid_stress,
-        "mean_stress_days": best.mean_stress_days,
-        "all_results": results,
-    } for best in top_results]
+    return [
+        {
+            "action": f"{best.candidate.label} (limited benefit)",
+            "reason": (
+                f"No action avoids stress in >70% of members. Best option: "
+                f"{best.pct_members_avoid_stress:.0%} avoid stress, "
+                f"mean {best.mean_stress_days:.1f} stress days"
+            ),
+            "candidate": best.candidate,
+            "avoid_stress_pct": best.pct_members_avoid_stress,
+            "mean_stress_days": best.mean_stress_days,
+            "all_results": results,
+        }
+        for best in top_results
+    ]

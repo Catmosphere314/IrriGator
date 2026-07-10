@@ -101,6 +101,31 @@ VARIETY_AQUACROP_PRESETS: dict[str, dict[str, Any]] = {
     }
 }
 
+AQUACROPMODEL_HELPER = {
+    "crop_growth" : pd.DataFrame({
+    "variable" : ["dap", "gdd", "gdd_cum", "z_root", "canopy_cover", "canopy_cover_ns", "biomass", "harvest_index"],
+    "unit" : ["days", "°C-day", "°C-day", "m", "fraction 0-1", "fraction 0-1", "kg/ha", "fraction 0-1"],
+    "meaning" : ["days after planting", "daily gdd increment", "cumulative gdd since planting", "current root depth", "actual green canopy cover", "canopy cover under no-stress conditions", "above-ground dry biomass", "ratio of grain to total biomass"],
+}),
+    "water_flux" : pd.DataFrame({
+        "variable" : ["IrrDay", "Infl", "Runoff", "DeepPerc", "CR", "GwIn", "Es", "EsPot", "Tr", "TrPot", "Wr", "z_gw", "surface_storage"],
+        "unit" : ["mm"] * 11 + ["m", "mm"],
+        "meaning" : ["Irrigation Applied today",
+                     "Infiltration into soil",
+                     "Surface runoff",
+                     "Deep percolation below root zone",
+                     "Capillary rise from groundwater",
+                     "Groundwater inflow",
+                     "Soil evaporation",
+                     "Potential soil evaporation",
+                     "Crop transpiration",
+                     "Potential transpiration",
+                     "Root zone water content",
+                     "Groundwater table depth",
+                     "Ponded water on surface"],
+    })
+}
+
 # ---------------------------------------------------------------------------
 # Data conversion: IrriGator → AquaCrop
 # ---------------------------------------------------------------------------
@@ -566,7 +591,6 @@ def _trim_aquacrop_outputs(
     wf = model.get_water_flux()
     ws = model.get_water_storage()
 
-
     last_nonzero = max(i for i, v in enumerate(cg["time_step_counter"]) if v != 0)
 
     valid_mask = [
@@ -610,7 +634,7 @@ def run_aquacrop(
     weather = forcing_to_weather(forcing, terrain, parcel.lat)
 
     crop = parcel_to_crop(parcel)
-    soil = soil_to_aquacrop(soil_profile, min_depth_m=crop.Zmax, extrapolate_below_profile=True)
+    soil = soil_to_aquacrop(soil_profile, min_depth_m=crop.Zmax+0.1, extrapolate_below_profile=True)
 
     weather, init_end_str, actual_sim_days = _prepare_aquacrop_init(
         weather=weather,
@@ -632,9 +656,10 @@ def run_aquacrop(
         irrigation_management=irr,
     )
 
+
     # Let AquaCrop run — it will stop at crop maturity or sim_end (harvest).
     # We then trim outputs to the actual days with real forcing.
-    #model.run_model(till_termination=True)
+    # model.run_model(till_termination=True)
     model.run_model(till_termination=True)
 
     result = _trim_aquacrop_outputs(model, actual_sim_days=actual_sim_days)
@@ -793,7 +818,7 @@ def run_ensemble_aquacrop(
         # Extract forecast portion (last n_forecast days)
         # Drop terminal zero rows
         n_valid = len(stress)
-        
+
         forecast_start_idx = max(0, n_valid - n_forecast)
         forecast_slice = stress.iloc[forecast_start_idx:n_valid]
 
@@ -1809,10 +1834,13 @@ def _prepare_member_future_weather(
 
     for member_id, weather in member_weathers.items():
         full_end = member_end_dates[member_id]
+        weather_next, init_end_str, actual_sim_days = _prepare_aquacrop_init(
+            weather=weather, crop=crop, sim_start=sim_start, sim_end=full_end
+        )
         model = AquaCropModel(
             sim_start_time=sim_start.strftime("%Y/%m/%d"),
-            sim_end_time=full_end.strftime("%Y/%m/%d"),
-            weather_df=weather,
+            sim_end_time=init_end_str,
+            weather_df=weather_next,
             soil=soil,
             crop=crop,
             initial_water_content=iwc,
@@ -2162,10 +2190,17 @@ def evaluate_candidates_ensemble_branching_2level(
         iwc=iwc,
     )
 
+    weather_ext, init_end_str, actual_sim_days = _prepare_aquacrop_init(
+        weather=member_weathers[reference_member_id],
+        crop=crop,
+        sim_start=sim_start,
+        sim_end=member_end_dates[reference_member_id],
+    )
+
     reference_model = AquaCropModel(
         sim_start_time=sim_start.strftime("%Y/%m/%d"),
-        sim_end_time=member_end_dates[reference_member_id].strftime("%Y/%m/%d"),
-        weather_df=member_weathers[reference_member_id],
+        sim_end_time=init_end_str,
+        weather_df=weather_ext,
         soil=soil,
         crop=crop,
         initial_water_content=iwc,
@@ -2181,8 +2216,8 @@ def evaluate_candidates_ensemble_branching_2level(
     # expects an unadvanced model and will initialize/advance it itself.
     reference_model = AquaCropModel(
         sim_start_time=sim_start.strftime("%Y/%m/%d"),
-        sim_end_time=member_end_dates[reference_member_id].strftime("%Y/%m/%d"),
-        weather_df=member_weathers[reference_member_id],
+        sim_end_time=init_end_str,
+        weather_df=weather_ext,
         soil=soil,
         crop=crop,
         initial_water_content=iwc,

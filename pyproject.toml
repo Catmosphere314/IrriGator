@@ -43,7 +43,7 @@ dependencies = [
     "pyet>=1.3",
     "netcdf4>=1.6",
     "ecmwf-opendata>=0.3.29",
-    "acquacrop>=3.1.0",
+    "aquacrop>=3.1.0",
 
     # Remote sensing
     "pygeodes>=0.1.7",

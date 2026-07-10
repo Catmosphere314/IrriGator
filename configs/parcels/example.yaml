@@ -104,16 +104,16 @@ irrigation:
 # =============================================================================
 irrigation_log:
   - date: "2026-05-15"
-    amount_mm: 50
+    amount_mm: 10
     source: "farmer"  # farmer | model_recommendation | probe_triggered
   - date: "2026-06-01"
-    amount_mm: 50
+    amount_mm: 10
   - date: "2026-06-14"
-    amount_mm: 50
-  - date: "2026-06-20"
-    amount_mm: 50
-  - date: "2026-06-28"
-    amount_mm: 50
+    amount_mm: 10
+  - date: "2026-06-23"
+    amount_mm: 10
+  - date: "2026-06-29"
+    amount_mm: 10
 
 
 

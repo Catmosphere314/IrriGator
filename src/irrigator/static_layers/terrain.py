@@ -100,6 +100,7 @@ def get_era5_elevation(cfg: RegionConfig, parcel: ParcelConfig) -> float:
 
     try:
         ds = open_era5_land()
+        return(ds)
         # ERA5-Land geopotential / orography is typically not in the standard
         # variable set.  Use the mean elevation from the terrain DEM at ERA5
         # resolution as an approximation: average the DEM over the ~9km cell.

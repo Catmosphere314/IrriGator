@@ -71,7 +71,11 @@ ERA5_LAND_VALIDATION_VARIABLES = [
 # SEAS5 variables
 SEAS5_VARIABLES = [
     "2m_temperature",
+    "2m_dewpoint_temperature",
+    "10m_u_component_of_wind",
+    "10m_v_component_of_wind",
     "total_precipitation",
+    "surface_solar_radiation_downwards",
 ]
 
 

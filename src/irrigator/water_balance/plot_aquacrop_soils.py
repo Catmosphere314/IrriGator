@@ -9,29 +9,6 @@ REQUIRED_COLUMNS = {
 }
 
 
-def read_soil_csv(path: str | Path) -> pd.DataFrame:
-    """Read and validate an AquaCrop Soil.profile CSV export."""
-    df = pd.read_csv(path)
-    df = df.loc[:, ~df.columns.str.startswith("Unnamed")].copy()
-
-    missing = REQUIRED_COLUMNS.difference(df.columns)
-    if missing:
-        raise ValueError(f"{path} is missing columns: {sorted(missing)}")
-
-    df = df.sort_values(["z_top", "zBot"]).reset_index(drop=True)
-
-    if (df["zBot"] <= df["z_top"]).any():
-        raise ValueError(f"{path} contains invalid compartment depths.")
-    if not (df["th_dry"] <= df["th_wp"]).all():
-        raise ValueError(f"{path}: expected th_dry <= th_wp.")
-    if not (df["th_wp"] <= df["th_fc"]).all():
-        raise ValueError(f"{path}: expected th_wp <= th_fc.")
-    if not (df["th_fc"] <= df["th_s"]).all():
-        raise ValueError(f"{path}: expected th_fc <= th_s.")
-    if (df["Ksat"] <= 0).any():
-        raise ValueError(f"{path}: Ksat must be strictly positive for log scaling.")
-
-    return df
 
 
 def _step_xy(df: pd.DataFrame, column: str) -> tuple[np.ndarray, np.ndarray]:
@@ -110,8 +87,8 @@ def _cumulative_taw(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
 
 
 def compare_soils(
-    soil_a_path: str | Path,
-    soil_b_path: str | Path,
+    soil_a: pd.DataFrame,
+    soil_b: pd.DataFrame,
     labels: tuple[str, str] = ("Parcel A", "Parcel B"),
     comparison_depth: float | None = None,
 ) -> tuple[plt.Figure, pd.DataFrame]:
@@ -124,7 +101,7 @@ def compare_soils(
         Depth in metres used for the summary metrics. If None, use the deepest
         depth shared by both profiles.
     """
-    soils = [read_soil_csv(soil_a_path), read_soil_csv(soil_b_path)]
+    soils = [soil_a, soil_b]
 
     common_depth = min(float(df["zBot"].max()) for df in soils)
     if comparison_depth is None:
@@ -142,6 +119,13 @@ def compare_soils(
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 10), constrained_layout=True)
 
+    fig.set_constrained_layout_pads(
+        w_pad=0.08,   # padding near figure edges, in inches
+        h_pad=0.08,
+        wspace=0.15,  # fraction of subplot width
+        hspace=0.15,  # fraction of subplot height
+    )
+
     _plot_water_profile(axes[0, 0], soils[0], labels[0], shared_xlim)
     _plot_water_profile(axes[0, 1], soils[1], labels[1], shared_xlim)
     axes[0, 1].set_ylabel("")
@@ -152,7 +136,7 @@ def compare_soils(
         handles,
         legend_labels,
         loc="upper center",
-        bbox_to_anchor=(0.5, 1.02),
+        bbox_to_anchor=(0.5, 0.55),
         ncol=3,
         frameon=False,
     )

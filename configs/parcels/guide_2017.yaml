@@ -5,19 +5,19 @@
 # Copy this template and fill in for each enrolled parcel.
 
 parcel:
-  id: "billac_001"
-  name: "Parcelle Billac - SEP des Pouyades"
+  id: "guide_001"
+  name: "Parcelle Guide - SEP des Pouyades"
   farmer: "Edouard Truffaux"
 
   # Parcel geometry — either a centroid or a polygon file
   location:
     # Simple: centroid coordinates (WGS84)
-    lat: 45.38383
-    lon: 0.41508
+    lat: 45.37163
+    lon: 0.39938
     # Or: path to a GeoJSON/shapefile polygon for the parcel boundary
     # polygon_file: "data/parcels/24_bergerac_001.geojson"
 
-  area_ha: 16.3
+  area_ha: 32.8
 
 # =============================================================================
 # Soil — farmer overrides (optional)
@@ -56,7 +56,7 @@ soil:
   # source: "probe_calibrated"
   # theta_fc_measured: 0.31   # from drainage stabilization after heavy rain
   # theta_wp_estimated: 0.14  # from pedotransfer on texture + probe minimum
-  # measurement_date: "2025-06-20"
+  # measurement_date: "2017-06-20"
 
   # Geology class (from BRGM or farmer knowledge)
   geology_class: "alluvium"  # alluvium | limestone_plateau | clay_limestone
@@ -68,13 +68,13 @@ crop:
   type: "grain_maize"
 
   # CRITICAL: farmer must provide these
-  planting_date: "2026-04-14"
-  expected_harvest: "2026-10-05"  # approximate, helps define season bounds
+  planting_date: "2017-04-06"
+  expected_harvest: "2017-10-05"  # approximate, helps define season bounds
 
   # Variety and maturity group (Arvalis index)
-  variety: "DKC4728"
+  variety: "P0710"
   maturity_group: "G3"  # Very early to very late: A, B, C1, C2, D1, D2
-  density: 86107 # seed/ha
+  density: 89205 # seed/ha
   emergence_rate: 0.92 #assumed ??
 
   # GDD thresholds — defaults by maturity group, override if known
@@ -87,8 +87,8 @@ crop:
 
   gdd_thresholds:
     base: 6
-    flowering: 970
-    harvest: 1900
+    flowering: 950
+    harvest: 1940
 
 
 
@@ -96,13 +96,13 @@ crop:
 # Irrigation system
 # =============================================================================
 irrigation:
-  system_type: "sprinkler"  # pivot | sprinkler | drip | flood
+  system_type: "PIVOT"  # pivot | sprinkler | drip | flood
   # Application rate and constraints
-  max_dose_mm: 50          # maximum per application
-  min_dose_mm: 15          # minimum worthwhile application
+  max_dose_mm: 30          # maximum per application
+  min_dose_mm: 10          # minimum worthwhile application
   application_rate_mm_h: 8 # system flow rate
   # Minimum interval between irrigations (days)
-  min_interval_days: 7
+  min_interval_days: 3
   # Irrigation window constraints (farmer's schedule)
   available_days: ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
   # Water access constraints (if applicable)
@@ -112,14 +112,60 @@ irrigation:
 # Irrigation history
 # =============================================================================
 irrigation_log:
-  - date: "2026-05-15"
+  - date: "2017-06-01"
+    amount_mm: 20
+  - date: "2017-06-04"
+    amount_mm: 20
+  - date: "2017-06-07"
+    amount_mm: 20
+  - date: "2017-06-11"
+    amount_mm: 20
+  - date: "2017-06-14"
+    amount_mm: 20
+  - date: "2017-06-18"
+    amount_mm: 20
+  - date: "2017-06-22"
+    amount_mm: 20
+  - date: "2017-06-25"
+    amount_mm: 20
+  - date: "2017-06-29"
     amount_mm: 10
-    source: "farmer"  # farmer | model_recommendation | probe_triggered
-  - date: "2026-06-01"
+  - date: "2017-07-01"
+    amount_mm: 20
+  - date: "2017-07-04"
+    amount_mm: 20
+  - date: "2017-07-07"
+    amount_mm: 20
+  - date: "2017-07-11"
+    amount_mm: 20
+  - date: "2017-07-14"
+    amount_mm: 20
+  - date: "2017-07-18"
+    amount_mm: 20
+  - date: "2017-07-22"
+    amount_mm: 20
+  - date: "2017-07-25"
+    amount_mm: 20
+  - date: "2017-07-29"
     amount_mm: 10
-  - date: "2026-06-14"
-    amount_mm: 10
-
+  - date: "2017-08-01"
+    amount_mm: 20
+  - date: "2017-08-04"
+    amount_mm: 20
+  - date: "2017-08-07"
+    amount_mm: 20
+  - date: "2017-08-11"
+    amount_mm: 20
+  - date: "2017-08-14"
+    amount_mm: 20
+  - date: "2017-08-18"
+    amount_mm: 20
+  - date: "2017-08-22"
+    amount_mm: 20
+  - date: "2017-08-25"
+    amount_mm: 20
+  - date: "2017-08-29"
+    amount_mm: 20
 
 
 

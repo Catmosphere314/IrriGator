@@ -37,6 +37,7 @@ from irrigator.config import ParcelConfig
 from irrigator.static_layers.soil import SoilProfile
 from irrigator.static_layers.terrain import TerrainParams
 from irrigator.water_balance.et0 import compute_et0
+
 from irrigator.water_balance.aquacrop_stress import (
     dynamic_water_stress_thresholds,
 )

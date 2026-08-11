@@ -173,7 +173,8 @@ def save_daily(ds: xr.Dataset, processed_dir: str | Path = DEFAULT_PROCESSED_DIR
     processed_dir = Path(processed_dir)
     out_dir = processed_dir / "atmospheric"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "era5_daily.nc"
+    year = str(ds.valid_time[0].dt.year.values)
+    out_path = out_dir / f"era5_daily_{year}.nc"
 
     encoding = {v: {"zlib": True, "complevel": 4} for v in ds.data_vars}
     ds.to_netcdf(out_path, encoding=encoding)
@@ -182,15 +183,16 @@ def save_daily(ds: xr.Dataset, processed_dir: str | Path = DEFAULT_PROCESSED_DIR
     return out_path
 
 
-def load_daily(processed_dir: str | Path = DEFAULT_PROCESSED_DIR) -> xr.Dataset:
+def load_daily(processed_dir: str | Path = DEFAULT_PROCESSED_DIR, year: int = 2025) -> xr.Dataset:
     """Load previously saved daily ERA5-Land data.
 
     Parameters
     ----------
     processed_dir : directory containing atmospheric/era5_daily.nc
+    year : year for which to load data
     """
     processed_dir = Path(processed_dir)
-    path = processed_dir / "atmospheric" / "era5_daily.nc"
+    path = processed_dir / "atmospheric" / f"era5_daily_{year}.nc"
     if not path.exists():
         raise FileNotFoundError(
             f"Daily ERA5-Land not found: {path}\nRun process_era5_to_daily first."

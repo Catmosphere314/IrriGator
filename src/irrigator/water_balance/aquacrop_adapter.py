@@ -37,6 +37,9 @@ from irrigator.config import ParcelConfig
 from irrigator.static_layers.soil import SoilProfile
 from irrigator.static_layers.terrain import TerrainParams
 from irrigator.water_balance.et0 import compute_et0
+from irrigator.water_balance.aquacrop_stress import (
+    dynamic_water_stress_thresholds,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,28 +105,75 @@ VARIETY_AQUACROP_PRESETS: dict[str, dict[str, Any]] = {
 }
 
 AQUACROPMODEL_HELPER = {
-    "crop_growth" : pd.DataFrame({
-    "variable" : ["dap", "gdd", "gdd_cum", "z_root", "canopy_cover", "canopy_cover_ns", "biomass", "harvest_index"],
-    "unit" : ["days", "°C-day", "°C-day", "m", "fraction 0-1", "fraction 0-1", "kg/ha", "fraction 0-1"],
-    "meaning" : ["days after planting", "daily gdd increment", "cumulative gdd since planting", "current root depth", "actual green canopy cover", "canopy cover under no-stress conditions", "above-ground dry biomass", "ratio of grain to total biomass"],
-}),
-    "water_flux" : pd.DataFrame({
-        "variable" : ["IrrDay", "Infl", "Runoff", "DeepPerc", "CR", "GwIn", "Es", "EsPot", "Tr", "TrPot", "Wr", "z_gw", "surface_storage"],
-        "unit" : ["mm"] * 11 + ["m", "mm"],
-        "meaning" : ["Irrigation Applied today",
-                     "Infiltration into soil",
-                     "Surface runoff",
-                     "Deep percolation below root zone",
-                     "Capillary rise from groundwater",
-                     "Groundwater inflow",
-                     "Soil evaporation",
-                     "Potential soil evaporation",
-                     "Crop transpiration",
-                     "Potential transpiration",
-                     "Root zone water content",
-                     "Groundwater table depth",
-                     "Ponded water on surface"],
-    })
+    "crop_growth": pd.DataFrame(
+        {
+            "variable": [
+                "dap",
+                "gdd",
+                "gdd_cum",
+                "z_root",
+                "canopy_cover",
+                "canopy_cover_ns",
+                "biomass",
+                "harvest_index",
+            ],
+            "unit": [
+                "days",
+                "°C-day",
+                "°C-day",
+                "m",
+                "fraction 0-1",
+                "fraction 0-1",
+                "kg/ha",
+                "fraction 0-1",
+            ],
+            "meaning": [
+                "days after planting",
+                "daily gdd increment",
+                "cumulative gdd since planting",
+                "current root depth",
+                "actual green canopy cover",
+                "canopy cover under no-stress conditions",
+                "above-ground dry biomass",
+                "ratio of grain to total biomass",
+            ],
+        }
+    ),
+    "water_flux": pd.DataFrame(
+        {
+            "variable": [
+                "IrrDay",
+                "Infl",
+                "Runoff",
+                "DeepPerc",
+                "CR",
+                "GwIn",
+                "Es",
+                "EsPot",
+                "Tr",
+                "TrPot",
+                "Wr",
+                "z_gw",
+                "surface_storage",
+            ],
+            "unit": ["mm"] * 11 + ["m", "mm"],
+            "meaning": [
+                "Irrigation Applied today",
+                "Infiltration into soil",
+                "Surface runoff",
+                "Deep percolation below root zone",
+                "Capillary rise from groundwater",
+                "Groundwater inflow",
+                "Soil evaporation",
+                "Potential soil evaporation",
+                "Crop transpiration",
+                "Potential transpiration",
+                "Root zone water content",
+                "Groundwater table depth",
+                "Ponded water on surface",
+            ],
+        }
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -474,38 +524,51 @@ class AquaCropResult:
     crop_growth: pd.DataFrame  # daily: canopy, biomass, root depth, GDD
     water_flux: pd.DataFrame  # daily: Tr, TrPot, Es, IrrDay, Wr, DeepPerc
     water_storage: pd.DataFrame  # daily: soil moisture per compartment
+    weather_daily: pd.DataFrame | None = None
+    stress_thresholds: pd.DataFrame | None = None
 
     # Derived daily stress metric (Tr/TrPot, equivalent to Ks)
     @property
     def daily_stress(self) -> pd.DataFrame:
-        """Daily stress metrics derived from AquaCrop outputs.
+        """Daily crop-water diagnostics derived from AquaCrop outputs."""
 
-        Returns DataFrame with columns: date, dap, ks, canopy_cover,
-        canopy_cover_ns, biomass, z_root, precip, irrigation, Wr.
-        """
         cg = self.crop_growth
         wf = self.water_flux
 
-        # Compute Ks equivalent: actual transpiration / potential transpiration
-        ks = np.where(
-            wf["TrPot"] > 0.01,
-            wf["Tr"] / wf["TrPot"],
-            1.0,  # no demand → no stress
-        )
-
         n = min(len(cg), len(wf))
 
-        return pd.DataFrame(
+        ks = np.where(
+            wf["TrPot"].values[:n] > 0.01,
+            wf["Tr"].values[:n] / wf["TrPot"].values[:n],
+            1.0,
+        )
+
+        # Actual forcing used by AquaCrop
+        if self.weather_daily is not None:
+            precip = self.weather_daily["Precipitation"].to_numpy(dtype=float)[:n]
+
+            et0 = self.weather_daily["ReferenceET"].to_numpy(dtype=float)[:n]
+
+        else:
+            # Fallback for older AquaCropResult objects.
+            precip = np.maximum(
+                wf["Infl"].to_numpy(dtype=float)[:n] - wf["IrrDay"].to_numpy(dtype=float)[:n],
+                0.0,
+            )
+            et0 = np.full(n, np.nan)
+
+        result = pd.DataFrame(
             {
                 "dap": cg["dap"].values[:n],
                 "gdd_cum": cg["gdd_cum"].values[:n],
-                "ks": ks[:n],
+                "ks": ks,
                 "canopy_cover": cg["canopy_cover"].values[:n],
                 "canopy_cover_ns": cg["canopy_cover_ns"].values[:n],
-                "biomass_kg_ha": cg["biomass"].values[:n],
+                "biomass_kg_ha": (cg["biomass"].values[:n] * 10.0),
                 "z_root_m": cg["z_root"].values[:n],
                 "harvest_index": cg["harvest_index"].values[:n],
-                "precip_mm": wf["Infl"].values[:n],  # infiltration ≈ effective precip
+                "precip_mm": precip,
+                "et0_mm": et0,
                 "irrigation_mm": wf["IrrDay"].values[:n],
                 "tr_mm": wf["Tr"].values[:n],
                 "tr_pot_mm": wf["TrPot"].values[:n],
@@ -514,6 +577,18 @@ class AquaCropResult:
                 "wr_mm": wf["Wr"].values[:n],
             }
         )
+
+        # Add AquaCrop dynamic thresholds
+        if self.stress_thresholds is not None:
+            if len(self.stress_thresholds) < n:
+                raise ValueError("stress_thresholds is shorter than AquaCrop outputs.")
+
+            thresholds = self.stress_thresholds.iloc[:n].reset_index(drop=True)
+
+            for column in thresholds.columns:
+                result[column] = thresholds[column].to_numpy(dtype=float)
+
+        return result
 
 
 def _prepare_aquacrop_init(
@@ -634,7 +709,9 @@ def run_aquacrop(
     weather = forcing_to_weather(forcing, terrain, parcel.lat)
 
     crop = parcel_to_crop(parcel)
-    soil = soil_to_aquacrop(soil_profile, min_depth_m=crop.Zmax+0.1, extrapolate_below_profile=True)
+    soil = soil_to_aquacrop(
+        soil_profile, min_depth_m=crop.Zmax + 0.1, extrapolate_below_profile=True
+    )
 
     weather, init_end_str, actual_sim_days = _prepare_aquacrop_init(
         weather=weather,
@@ -656,13 +733,31 @@ def run_aquacrop(
         irrigation_management=irr,
     )
 
-
     # Let AquaCrop run — it will stop at crop maturity or sim_end (harvest).
     # We then trim outputs to the actual days with real forcing.
     # model.run_model(till_termination=True)
     model.run_model(till_termination=True)
 
     result = _trim_aquacrop_outputs(model, actual_sim_days=actual_sim_days)
+
+    output_days = result.crop_growth["time_step_counter"].to_numpy(dtype=int)
+
+    if len(output_days):
+        if output_days.min() < 0 or output_days.max() >= len(weather):
+            raise RuntimeError("Cannot align AquaCrop output rows with weather DataFrame.")
+
+        result.weather_daily = weather.iloc[output_days][
+            [
+                "Date",
+                "Precipitation",
+                "ReferenceET",
+            ]
+        ].reset_index(drop=True)
+
+        result.stress_thresholds = dynamic_water_stress_thresholds(
+            crop,
+            et0=result.weather_daily["ReferenceET"].to_numpy(dtype=float),
+        )
 
     n_days = len(result.crop_growth)
     logger.info(
@@ -674,6 +769,8 @@ def run_aquacrop(
         result.crop_growth["canopy_cover"].iloc[-2] if n_days > 1 else 0,
         result.crop_growth["biomass"].iloc[-2] if n_days > 1 else 0,
     )
+
+
 
     return result
 

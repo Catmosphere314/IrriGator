@@ -292,16 +292,15 @@ def prepare_aquacrop_parcel(
     if not np.allclose(cg["dap"], ds["dap"], equal_nan=True):
         raise ValueError("daily_stress is not aligned with the raw AquaCrop outputs.")
     threshold_columns = [
-            "p_exp_start",
-            "p_sto_start",
-            "p_sen_start",
-            "p_pol_start",
-            "p_exp_full",
-            "p_sto_full",
-            "p_sen_full",
-            "p_pol_full",
-        ]
-
+        "p_exp_start",
+        "p_sto_start",
+        "p_sen_start",
+        "p_pol_start",
+        "p_exp_full",
+        "p_sto_full",
+        "p_sen_full",
+        "p_pol_full",
+    ]
 
     missing_thresholds = [c for c in threshold_columns if c not in ds.columns]
 
@@ -394,8 +393,98 @@ def prepare_aquacrop_parcel(
 
     result["stomatal_threshold_crossed"] = result["depletion_fraction"] >= result["p_sto_start"]
 
-
     return result.loc[result["active"]].reset_index(drop=True)
+
+
+def _thresholds_are_similar(
+    frames_by_parcel: Mapping[str, pd.DataFrame],
+    columns: tuple[str, ...] = ("p_exp_start", "p_sto_start", "p_sto_full"),
+    *,
+    tolerance: float = 0.02,
+) -> bool:
+    """Return whether parcel threshold curves differ by at most ``tolerance``.
+
+    Curves are compared on common active-season calendar dates. The tolerance
+    is expressed as a fraction of TAW.
+    """
+    if tolerance < 0:
+        raise ValueError("tolerance must be >= 0")
+    if len(frames_by_parcel) <= 1:
+        return True
+
+    for column in columns:
+        series = []
+        for parcel, frame in frames_by_parcel.items():
+            data = frame.loc[
+                frame["active"] & frame[column].notna(),
+                ["date", column],
+            ].drop_duplicates("date")
+            series.append(data.set_index("date")[column].rename(parcel))
+
+        aligned = pd.concat(series, axis=1, join="inner").dropna()
+        if aligned.empty:
+            return False
+        spread = aligned.max(axis=1) - aligned.min(axis=1)
+        if float(spread.max()) > tolerance:
+            return False
+
+    return True
+
+
+def _plot_crop_water_thresholds(
+    axis: plt.Axes,
+    data: pd.DataFrame,
+    *,
+    color: Any = "0.30",
+    label_prefix: str = "",
+    show_stomatal_zone: bool = True,
+) -> None:
+    """Plot canopy-expansion and stomatal water-stress thresholds."""
+    active = data.loc[data["active"]].copy()
+    if active.empty:
+        return
+
+    canopy_reference = active["canopy_cover_ns"]
+    canopy_max = float(canopy_reference.max()) if canopy_reference.notna().any() else np.nan
+    if np.isfinite(canopy_max) and canopy_max > 0:
+        expansion = active.loc[
+            active["p_exp_start"].notna() & active["canopy_cover_ns"].lt(0.98 * canopy_max)
+        ]
+        if not expansion.empty:
+            axis.plot(
+                expansion["date"],
+                expansion["p_exp_start"],
+                color=color,
+                linestyle=":",
+                linewidth=1.05,
+                alpha=0.72,
+                label=f"{label_prefix}canopy-expansion stress onset",
+            )
+
+    stomatal = active.loc[active["p_sto_start"].notna() & active["p_sto_full"].notna()]
+    if stomatal.empty:
+        return
+
+    axis.plot(
+        stomatal["date"],
+        stomatal["p_sto_start"],
+        color=color,
+        linestyle="-.",
+        linewidth=1.45,
+        alpha=0.95,
+        label=f"{label_prefix}stomatal-stress onset",
+    )
+
+    if show_stomatal_zone:
+        axis.fill_between(
+            stomatal["date"],
+            stomatal["p_sto_start"],
+            stomatal["p_sto_full"],
+            color=color,
+            alpha=0.045,
+            linewidth=0,
+            label=f"{label_prefix}increasing stomatal limitation",
+        )
 
 
 def _scenario_linestyle(scenario: str) -> str:
@@ -503,6 +592,8 @@ def plot_aquacrop_season(
     parcels: Mapping[str, Mapping[str, Any]],
     figsize: tuple[float, float] = (16, 14),
     weekly_anchor: str = "W-MON",
+    threshold_similarity_tolerance: float = 0.02,
+    show_stomatal_zone: bool = True,
 ) -> tuple[plt.Figure, dict[str, pd.DataFrame]]:
     """Plot a six-panel comparison for one or more parcel/scenario runs.
 
@@ -809,9 +900,9 @@ def plot_aquacrop_season(
     ax_inputs.set_ylabel("Water depth (mm/week)")
     ax_inputs.legend(fontsize=7, ncol=2)
 
-    # 5. Root-zone depletion and transpiration-stress timing ----------------
-    # Dr/TAW = 0 at field capacity and 1 at wilting point. Negative values mean
-    # storage above field capacity. Stress markers show days with Tr/TrPot < 0.99.
+    # 5. Root-zone reserve and physiological thresholds --------------------
+    # Positive Dr/TAW is normal use of the soil-water reserve. Water stress
+    # starts only once process-specific AquaCrop depletion thresholds are met.
     for name, data in prepared.items():
         meta = series_metadata[name]
         parcel = meta["parcel"]
@@ -840,36 +931,45 @@ def plot_aquacrop_season(
                 zorder=4,
             )
 
+    # Thresholds depend on crop parameters and ET0, not irrigation scenario.
+    # Use one representative run per parcel and collapse to one neutral set if
+    # parcel curves differ by no more than the requested tolerance.
+    thresholds_by_parcel: dict[str, pd.DataFrame] = {}
+    for parcel in parcel_order:
+        representative_name = next(
+            name for name, meta in series_metadata.items() if meta["parcel"] == parcel
+        )
+        thresholds_by_parcel[parcel] = prepared[representative_name]
+
+    shared_thresholds = _thresholds_are_similar(
+        thresholds_by_parcel,
+        tolerance=threshold_similarity_tolerance,
+    )
+    if shared_thresholds:
+        representative = thresholds_by_parcel[parcel_order[0]]
+        _plot_crop_water_thresholds(
+            ax_water,
+            representative,
+            color="0.30",
+            show_stomatal_zone=show_stomatal_zone,
+        )
+    else:
+        for parcel, data in thresholds_by_parcel.items():
+            _plot_crop_water_thresholds(
+                ax_water,
+                data,
+                color=parcel_colors[parcel],
+                label_prefix=f"{parcel} — ",
+                show_stomatal_zone=show_stomatal_zone,
+            )
+
     ax_water.axhline(0, linestyle=":", linewidth=1, color="0.35", label="Field capacity")
     ax_water.axhline(1, linestyle=":", linewidth=1, color="0.55", label="Wilting point")
-    ax_water.set_title("Root-zone depletion and transpiration-stress days")
-    ax_water.set_ylabel("Root-zone depletion, Dr/TAW (fraction)")
-    ax_water.legend(fontsize=7, ncol=2)
-
-    for parcel in parcel_order:
-
-        representative_name = next(
-            name
-            for name, meta in series_metadata.items()
-            if meta["parcel"] == parcel
-        )
-
-        data = prepared[representative_name]
-        color = parcel_colors[parcel]
-
-        ax_water.plot(
-            data["date"],
-            data["p_sto_start"],
-            color=color,
-            linestyle="-.",
-            linewidth=1.25,
-            alpha=0.85,
-            label=(
-                f"{parcel} — stomatal-stress onset"
-            ),
-        )
-        ax_water.set_title("Root-zone water reserve use and stomatal-stress threshold")
-        ax_water.set_ylabel("Fraction depleted, Dr/TAW (0 = FC, 1 = WP)")
+    ax_water.set_title("Root-zone water reserve use and crop-water stress thresholds")
+    ax_water.set_ylabel("Fraction depleted, Dr/TAW (0 = FC, 1 = WP)")
+    handles, labels = ax_water.get_legend_handles_labels()
+    deduplicated = dict(zip(labels, handles))
+    ax_water.legend(deduplicated.values(), deduplicated.keys(), fontsize=7, ncol=2)
     # 6. Cumulative seasonal water fluxes -----------------------------------
     categories = [
         ("Precipitation", "precip_mm"),

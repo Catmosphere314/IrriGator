@@ -237,6 +237,106 @@ def _safe_divide(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
     )
 
 
+def _thresholds_are_similar(
+    frames_by_parcel: Mapping[str, pd.DataFrame],
+    columns: Sequence[str] = ("p_exp_start", "p_sto_start", "p_sto_full"),
+    *,
+    tolerance: float = 0.02,
+) -> bool:
+    """Return whether parcel threshold curves are effectively interchangeable.
+
+    Curves are compared on common calendar dates while the crop is active.
+    ``tolerance`` is expressed as a fraction of TAW; 0.02 means two
+    percentage points of total available root-zone water.
+    """
+    if tolerance < 0:
+        raise ValueError("tolerance must be >= 0")
+    if len(frames_by_parcel) <= 1:
+        return True
+
+    for column in columns:
+        series = []
+        for parcel, frame in frames_by_parcel.items():
+            data = frame.loc[
+                frame["active"] & frame[column].notna(),
+                ["date", column],
+            ].drop_duplicates("date")
+            series.append(data.set_index("date")[column].rename(parcel))
+
+        aligned = pd.concat(series, axis=1, join="inner").dropna()
+        if aligned.empty:
+            return False
+
+        spread = aligned.max(axis=1) - aligned.min(axis=1)
+        if float(spread.max()) > tolerance:
+            return False
+
+    return True
+
+
+def _plot_crop_water_thresholds(
+    axis: plt.Axes,
+    data: pd.DataFrame,
+    *,
+    color: Any = "0.30",
+    label_prefix: str = "",
+    show_stomatal_zone: bool = True,
+) -> None:
+    """Plot the crop-water thresholds that are most useful for management.
+
+    Canopy-expansion onset is only shown while the no-stress canopy is still
+    expanding. Stomatal onset is shown through the active season. The region
+    from stomatal onset to maximum stomatal stress is lightly shaded instead
+    of adding another prominent line.
+    """
+    active = data.loc[data["active"]].copy()
+    if active.empty:
+        return
+
+    # Canopy-expansion stress is only relevant before canopy closure.
+    canopy_reference = active["canopy_cover_ns"]
+    canopy_max = float(canopy_reference.max()) if canopy_reference.notna().any() else np.nan
+    if np.isfinite(canopy_max) and canopy_max > 0:
+        expansion = active.loc[
+            active["p_exp_start"].notna() & active["canopy_cover_ns"].lt(0.98 * canopy_max)
+        ]
+        # if not expansion.empty:
+            # axis.plot(
+            #     expansion["date"],
+            #     expansion["p_exp_start"],
+            #     color=color,
+            #     linestyle=":",
+            #     linewidth=1.05,
+            #     alpha=0.72,
+            #     label=f"{label_prefix}canopy-expansion stress onset",
+            # )
+
+    stomatal = active.loc[active["p_sto_start"].notna() & active["p_sto_full"].notna()]
+    if stomatal.empty:
+        return
+
+    axis.plot(
+        stomatal["date"],
+        stomatal["p_sto_start"],
+        color=color,
+        linestyle="-.",
+        linewidth=1.45,
+        alpha=0.95,
+        label=f"{label_prefix}stomatal-stress onset",
+    )
+
+    # if show_stomatal_zone:
+    #     axis.fill_between(
+    #         stomatal["date"],
+    #         stomatal["p_sto_start"],
+    #         stomatal["p_sto_full"],
+    #         color=color,
+    #         alpha=0.045,
+    #         linewidth=0,
+    #         label=f"{label_prefix}increasing stomatal limitation",
+    #     )
+
+
 def prepare_aquacrop_run(
     configuration: Mapping[str, Any],
 ) -> pd.DataFrame:
@@ -927,6 +1027,8 @@ def plot_aquacrop_historical_benchmark(
     stress_threshold: float = DEFAULT_STRESS_THRESHOLD,
     figsize: tuple[float, float] = (16, 14),
     title: str | None = None,
+    threshold_similarity_tolerance: float = 0.02,
+    show_stomatal_zone: bool = True,
 ) -> tuple[plt.Figure, HistoricalBenchmarkResult]:
     """Plot a six-panel current-versus-historical AquaCrop benchmark.
 
@@ -936,7 +1038,7 @@ def plot_aquacrop_historical_benchmark(
     2. Actual canopy cover and current no-water-stress reference.
     3. Biomass and current no-water-stress reference.
     4. Cumulative precipitation and irrigation.
-    5. Root-zone depletion and current transpiration-stress days.
+    5. Root-zone reserve use with crop-water stress thresholds.
     6. Current cumulative water fluxes against historical median and IQR.
     """
     result = prepare_historical_benchmark(
@@ -1149,7 +1251,10 @@ def plot_aquacrop_historical_benchmark(
     deduplicated = dict(zip(labels, handles))
     ax_inputs.legend(deduplicated.values(), deduplicated.keys(), fontsize=6.5, ncol=2)
 
-    # 5. Depletion ---------------------------------------------------------
+    # 5. Root-zone reserve and physiological thresholds -------------------
+    # Dr/TAW = 0 at field capacity and 1 at wilting point. Positive depletion
+    # is normal reserve use; physiological limitation begins only when one of
+    # AquaCrop's crop-specific thresholds is reached.
     for parcel, current in current_by_parcel.items():
         color = colors[parcel]
         _plot_historical_band(
@@ -1162,87 +1267,48 @@ def plot_aquacrop_historical_benchmark(
             current_label=f"{parcel} — current Dr/TAW",
             history_label=f"{parcel} — historical median Dr/TAW",
         )
-        threshold = current.loc[
-            current["active"]
-            & current["p_sto_start"].notna()
-        ]
 
-        ax_depletion.plot(
-            threshold["date"],
-            threshold["p_sto_start"],
-            color=color,
-            linestyle="-.",
-            linewidth=1.3,
-            alpha=0.9,
-            label=(
-                f"{parcel} — stomatal-stress onset"
-            ),
-        )
+        # Keep the closest approach to stomatal limitation parcel-specific,
+        # even when the threshold curves themselves are shared visually.
+        # margin_data = current.loc[
+        #     current["active"]
+        #     & current["margin_to_stomatal_stress_mm"].notna()
+        #     & current["depletion_fraction"].notna()
+        # ]
+        # if not margin_data.empty:
+        #     closest_index = margin_data["margin_to_stomatal_stress_mm"].idxmin()
+        #     closest = margin_data.loc[closest_index]
+        #     margin_mm = float(closest["margin_to_stomatal_stress_mm"])
 
-        margin_data = current.loc[
-            current["active"]
-            & current[
-                "margin_to_stomatal_stress_mm"
-            ].notna()
-            & current[
-                "depletion_fraction"
-            ].notna()
-        ]
+        #     ax_depletion.scatter(
+        #         [closest["date"]],
+        #         [closest["depletion_fraction"]],
+        #         facecolors="none",
+        #         edgecolors=color,
+        #         s=40,
+        #         linewidths=1.2,
+        #         zorder=6,
+        #     )
 
-        if not margin_data.empty:
+        #     note = (
+        #         f"{parcel}: closest margin {margin_mm:.0f} mm"
+        #         if margin_mm >= 0
+        #         else f"{parcel}: onset exceeded by {-margin_mm:.0f} mm"
+        #     )
+        #     ax_depletion.annotate(
+        #         note,
+        #         xy=(closest["date"], closest["depletion_fraction"]),
+        #         xytext=(5, 7),
+        #         textcoords="offset points",
+        #         fontsize=7,
+        #         color=color,
+        #     )
 
-            closest_index = (
-                margin_data[
-                    "margin_to_stomatal_stress_mm"
-                ].idxmin()
-            )
-
-            closest = margin_data.loc[closest_index]
-
-            margin_mm = float(
-                closest[
-                    "margin_to_stomatal_stress_mm"
-                ]
-            )
-
-            ax_depletion.scatter(
-                [closest["date"]],
-                [closest["depletion_fraction"]],
-                facecolors="none",
-                edgecolors=color,
-                s=40,
-                linewidths=1.2,
-                zorder=6,
-            )
-
-            if margin_mm >= 0:
-                note = (
-                    f"{parcel}: closest margin "
-                    f"{margin_mm:.0f} mm"
-                )
-            else:
-                note = (
-                    f"{parcel}: threshold exceeded "
-                    f"by {-margin_mm:.0f} mm"
-                )
-
-            ax_depletion.annotate(
-                note,
-                xy=(
-                    closest["date"],
-                    closest["depletion_fraction"],
-                ),
-                xytext=(5, 7),
-                textcoords="offset points",
-                fontsize=7,
-                color=color,
-            )
         stressed = (
             current["active"]
             & current["tr_pot_mm"].gt(1e-8)
             & current["tr_ratio"].lt(stress_threshold)
         )
-
         if stressed.any():
             ax_depletion.scatter(
                 current.loc[stressed, "date"],
@@ -1254,11 +1320,38 @@ def plot_aquacrop_historical_benchmark(
                 zorder=5,
                 label=f"{parcel} — current transpiration-stress day",
             )
+
+    # If the parcel thresholds differ by at most the chosen tolerance, plot a
+    # single neutral crop-threshold set. Otherwise retain one set per parcel.
+    shared_thresholds = _thresholds_are_similar(
+        current_by_parcel,
+        tolerance=threshold_similarity_tolerance,
+    )
+    if shared_thresholds:
+        representative = current_by_parcel[parcels[0]]
+        _plot_crop_water_thresholds(
+            ax_depletion,
+            representative,
+            color="0.30",
+            show_stomatal_zone=show_stomatal_zone,
+        )
+    else:
+        for parcel, current in current_by_parcel.items():
+            _plot_crop_water_thresholds(
+                ax_depletion,
+                current,
+                color=colors[parcel],
+                label_prefix=f"{parcel} — ",
+                show_stomatal_zone=show_stomatal_zone,
+            )
+
     ax_depletion.axhline(0, color="0.35", linestyle=":", linewidth=1, label="Field capacity")
     ax_depletion.axhline(1, color="0.55", linestyle=":", linewidth=1, label="Wilting point")
-    ax_depletion.set_title("Root-zone water reserve use and stomatal-stress threshold")
+    ax_depletion.set_title("Root-zone water reserve use and crop-water stress thresholds")
     ax_depletion.set_ylabel("Fraction depleted, Dr/TAW (0 = FC, 1 = WP)")
-    ax_depletion.legend(fontsize=6.5, ncol=2)
+    handles, labels = ax_depletion.get_legend_handles_labels()
+    deduplicated = dict(zip(labels, handles))
+    ax_depletion.legend(deduplicated.values(), deduplicated.keys(), fontsize=6.5, ncol=2)
 
     # 6. Current fluxes versus historical median and IQR -------------------
     flux_metrics = [

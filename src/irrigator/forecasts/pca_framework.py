@@ -438,3 +438,327 @@ def select_candidate(
     )
 
     return pd.Timestamp(best), diagnostics
+
+
+# ---------------------------------------------------------------------------
+# Regional / France-level PCA
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RegionalPCA:
+    """Monthly PCA fitted to an entire multivariate regional field.
+
+    One historical month is one sample.  The features are the requested
+    variables at every retained grid cell, flattened in a stable
+    ``variable × latitude × longitude`` order.  A separate PCA is fitted for
+    each calendar month so that, for example, August forecasts are compared
+    only with historical Augusts.
+
+    This is the preferred analog model for IrriGator seasonal matching.  It
+    captures spatial covariance over the full France domain instead of fitting
+    an unrelated PCA at each grid cell and voting afterwards.
+    """
+
+    pc_scores: xr.DataArray  # (time, component)
+    pca_components: xr.DataArray  # (month, component, feature)
+    explained_variance: xr.DataArray  # (month, component)
+    explained_variance_ratio: xr.DataArray  # (month, component)
+    feature_mean: xr.DataArray  # (month, feature)
+    feature_scale: xr.DataArray  # (month, feature)
+    pca_mean: xr.DataArray  # (month, feature)
+    valid_feature: xr.DataArray  # (month, feature)
+    feature_variable: xr.DataArray  # (feature,)
+    feature_latitude: xr.DataArray  # (feature,)
+    feature_longitude: xr.DataArray  # (feature,)
+    attrs: dict
+
+
+def _regional_feature_matrix(
+    ds: xr.Dataset,
+    variables: list[str],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Flatten a gridded dataset to ``(time, feature)`` in a stable order."""
+    missing = [v for v in variables if v not in ds.data_vars]
+    if missing:
+        raise ValueError(f"Dataset is missing PCA variable(s): {missing}")
+    if "time" not in ds.dims:
+        raise ValueError("Regional PCA expects a 'time' dimension.")
+    if "latitude" not in ds.dims or "longitude" not in ds.dims:
+        raise ValueError("Regional PCA expects 'latitude' and 'longitude' dimensions.")
+
+    arr = (
+        ds[variables]
+        .to_array(dim="variable")
+        .transpose("time", "variable", "latitude", "longitude")
+    )
+    matrix = arr.values.reshape(ds.sizes["time"], -1)
+
+    n_lat = ds.sizes["latitude"]
+    n_lon = ds.sizes["longitude"]
+    feature_variable = np.repeat(np.asarray(variables, dtype=object), n_lat * n_lon)
+    feature_latitude = np.tile(np.repeat(ds.latitude.values, n_lon), len(variables))
+    feature_longitude = np.tile(np.tile(ds.longitude.values, n_lat), len(variables))
+    return matrix, feature_variable, feature_latitude, feature_longitude
+
+
+def fit_monthly_regional_pca(
+    ds: xr.Dataset,
+    variables: list[str],
+    n_components: int | None = 4,
+    standardize: bool = True,
+    min_valid_fraction: float = 1.0,
+) -> RegionalPCA:
+    """Fit one PCA per calendar month to the complete regional weather field.
+
+    Parameters
+    ----------
+    ds
+        Monthly gridded dataset with dimensions ``time, latitude, longitude``.
+        Each time step should represent one historical month.
+    variables
+        Variables to concatenate into the regional feature vector.
+    n_components
+        Maximum number of retained PCs.  It is also limited by the number of
+        historical years available for each calendar month.
+    standardize
+        Standardize every variable/grid-cell feature across historical years
+        before PCA.  This is strongly recommended for mixed meteorological
+        units.
+    min_valid_fraction
+        Fraction of historical samples that must be finite for a feature to be
+        retained.  The default (1.0) is conservative and naturally removes sea
+        cells when ERA5-Land contains missing values there.
+    """
+    if not 0 < min_valid_fraction <= 1:
+        raise ValueError("min_valid_fraction must be in (0, 1].")
+
+    matrix, f_var, f_lat, f_lon = _regional_feature_matrix(ds, variables)
+    n_features = matrix.shape[1]
+    requested_components = min(len(variables), 4) if n_components is None else int(n_components)
+    requested_components = max(1, requested_components)
+    component_names = [f"PC{i + 1}" for i in range(requested_components)]
+    months = np.arange(1, 13)
+
+    scores = np.full((ds.sizes["time"], requested_components), np.nan, dtype=np.float64)
+    components = np.full((12, requested_components, n_features), np.nan, dtype=np.float64)
+    eigenvalues = np.full((12, requested_components), np.nan, dtype=np.float64)
+    variance_ratio = np.full((12, requested_components), np.nan, dtype=np.float64)
+    means = np.full((12, n_features), np.nan, dtype=np.float64)
+    scales = np.full((12, n_features), np.nan, dtype=np.float64)
+    pca_means = np.full((12, n_features), np.nan, dtype=np.float64)
+    valid_features = np.zeros((12, n_features), dtype=bool)
+
+    time_months = ds.time.dt.month.values
+    for month in months:
+        m_idx = month - 1
+        time_idx = np.flatnonzero(time_months == month)
+        if len(time_idx) < 2:
+            continue
+
+        X = matrix[time_idx]
+        finite_fraction = np.mean(np.isfinite(X), axis=0)
+        valid = finite_fraction >= min_valid_fraction
+        if not valid.any():
+            logger.warning("No valid regional PCA features for month %d", month)
+            continue
+
+        # When min_valid_fraction < 1, fill the few remaining holes with the
+        # historical feature mean.  At 1.0 no imputation is performed.
+        Xv = X[:, valid].astype(np.float64, copy=True)
+        if not np.isfinite(Xv).all():
+            col_means = np.nanmean(Xv, axis=0)
+            bad = np.where(~np.isfinite(Xv))
+            Xv[bad] = col_means[bad[1]]
+
+        if standardize:
+            scaler = StandardScaler()
+            X_prepared = scaler.fit_transform(Xv)
+            mu = scaler.mean_.astype(float)
+            sigma = scaler.scale_.astype(float)
+        else:
+            mu = Xv.mean(axis=0)
+            sigma = np.ones(Xv.shape[1], dtype=float)
+            X_prepared = Xv - mu
+
+        ncomp = min(requested_components, X_prepared.shape[0], X_prepared.shape[1])
+        pca = PCA(n_components=ncomp)
+        month_scores = pca.fit_transform(X_prepared)
+
+        scores[time_idx, :ncomp] = month_scores
+        valid_idx = np.flatnonzero(valid)
+        components[m_idx][np.ix_(np.arange(ncomp), valid_idx)] = pca.components_
+        eigenvalues[m_idx, :ncomp] = pca.explained_variance_
+        variance_ratio[m_idx, :ncomp] = pca.explained_variance_ratio_
+        means[m_idx, valid] = mu
+        scales[m_idx, valid] = sigma
+        pca_means[m_idx, valid] = pca.mean_
+        valid_features[m_idx, valid] = True
+
+        logger.debug(
+            "Regional PCA month %02d: %d years, %d features, %d PCs, %.1f%% variance",
+            month,
+            len(time_idx),
+            int(valid.sum()),
+            ncomp,
+            100 * float(np.nansum(pca.explained_variance_ratio_)),
+        )
+
+    feature_coord = np.arange(n_features, dtype=int)
+    return RegionalPCA(
+        pc_scores=xr.DataArray(
+            scores,
+            dims=("time", "component"),
+            coords={"time": ds.time, "component": component_names},
+            name="regional_pc_scores",
+        ),
+        pca_components=xr.DataArray(
+            components,
+            dims=("month", "component", "feature"),
+            coords={"month": months, "component": component_names, "feature": feature_coord},
+        ),
+        explained_variance=xr.DataArray(
+            eigenvalues,
+            dims=("month", "component"),
+            coords={"month": months, "component": component_names},
+        ),
+        explained_variance_ratio=xr.DataArray(
+            variance_ratio,
+            dims=("month", "component"),
+            coords={"month": months, "component": component_names},
+        ),
+        feature_mean=xr.DataArray(
+            means, dims=("month", "feature"), coords={"month": months, "feature": feature_coord}
+        ),
+        feature_scale=xr.DataArray(
+            scales, dims=("month", "feature"), coords={"month": months, "feature": feature_coord}
+        ),
+        pca_mean=xr.DataArray(
+            pca_means,
+            dims=("month", "feature"),
+            coords={"month": months, "feature": feature_coord},
+        ),
+        valid_feature=xr.DataArray(
+            valid_features,
+            dims=("month", "feature"),
+            coords={"month": months, "feature": feature_coord},
+        ),
+        feature_variable=xr.DataArray(f_var, dims="feature", coords={"feature": feature_coord}),
+        feature_latitude=xr.DataArray(f_lat, dims="feature", coords={"feature": feature_coord}),
+        feature_longitude=xr.DataArray(f_lon, dims="feature", coords={"feature": feature_coord}),
+        attrs={
+            "variables": ",".join(variables),
+            "standardize": bool(standardize),
+            "scope": "regional_field",
+        },
+    )
+
+
+def transform_to_regional_pca(
+    new_ds: xr.Dataset,
+    pca_model: RegionalPCA,
+    variables: list[str],
+) -> xr.DataArray:
+    """Project one or more monthly regional fields into a fitted RegionalPCA."""
+    expected_vars = list(map(str, pca_model.attrs["variables"].split(",")))
+    if list(variables) != expected_vars:
+        raise ValueError(f"PCA variables/order mismatch: expected {expected_vars}, got {variables}")
+
+    matrix, f_var, f_lat, f_lon = _regional_feature_matrix(new_ds, variables)
+    # Exact coordinate/order agreement matters because components are spatial.
+    if not np.array_equal(f_var, pca_model.feature_variable.values):
+        raise ValueError("Variable feature order differs from fitted RegionalPCA.")
+    if not np.allclose(f_lat.astype(float), pca_model.feature_latitude.values.astype(float)):
+        raise ValueError("Latitude grid differs from fitted RegionalPCA.")
+    if not np.allclose(f_lon.astype(float), pca_model.feature_longitude.values.astype(float)):
+        raise ValueError("Longitude grid differs from fitted RegionalPCA.")
+
+    n_components = pca_model.pca_components.sizes["component"]
+    out = np.full((new_ds.sizes["time"], n_components), np.nan, dtype=np.float64)
+
+    for t_idx, t in enumerate(new_ds.time.values):
+        month = pd.Timestamp(t).month
+        valid = pca_model.valid_feature.sel(month=month).values.astype(bool)
+        if not valid.any():
+            continue
+
+        x = matrix[t_idx, valid].astype(float)
+        if not np.isfinite(x).all():
+            raise ValueError(
+                f"New regional field contains NaNs in PCA features for {pd.Timestamp(t):%Y-%m}. "
+                "Regrid/fill the SEAS5 field before projection."
+            )
+
+        mu = pca_model.feature_mean.sel(month=month).values[valid]
+        sigma = pca_model.feature_scale.sel(month=month).values[valid]
+        pca_mu = pca_model.pca_mean.sel(month=month).values[valid]
+        W = pca_model.pca_components.sel(month=month).values[:, valid]
+        valid_pc = np.isfinite(W).all(axis=1)
+        if not valid_pc.any():
+            continue
+
+        x_prepared = (x - mu) / sigma
+        out[t_idx, valid_pc] = (x_prepared - pca_mu) @ W[valid_pc].T
+
+    return xr.DataArray(
+        out,
+        dims=("time", "component"),
+        coords={"time": new_ds.time, "component": pca_model.pc_scores.component},
+        name="regional_pc_scores",
+    )
+
+
+def rank_regional_analogs(
+    pca_model: RegionalPCA,
+    new_pc_scores: xr.DataArray,
+    *,
+    top_k: int = 5,
+    temperature: float = 1.0,
+) -> pd.DataFrame:
+    """Rank historical months by Mahalanobis distance in regional PC space.
+
+    The returned ``weight`` column is a normalized sampling probability over
+    the retained top-k analogs, using ``exp(-d² / (2 * temperature²))``.
+    ``temperature=1`` corresponds to the natural Gaussian distance scale;
+    larger values deliberately diversify the sampled analogs.
+    """
+    if new_pc_scores.sizes.get("time", 0) != 1:
+        raise ValueError("rank_regional_analogs expects exactly one target month.")
+    if top_k < 1:
+        raise ValueError("top_k must be >= 1.")
+    if temperature <= 0:
+        raise ValueError("temperature must be > 0.")
+
+    target_time = pd.Timestamp(new_pc_scores.time.values[0])
+    month = target_time.month
+    hist_mask = pca_model.pc_scores.time.dt.month == month
+    hist = pca_model.pc_scores.sel(time=hist_mask)
+    target = new_pc_scores.isel(time=0).values.astype(float)
+    eigen = pca_model.explained_variance.sel(month=month).values.astype(float)
+
+    valid_pc = np.isfinite(target) & np.isfinite(eigen) & (eigen > 1e-12)
+    if not valid_pc.any():
+        raise ValueError(f"No valid PCA components for calendar month {month}.")
+
+    H = hist.values[:, valid_pc].astype(float)
+    diff = H - target[valid_pc][None, :]
+    distances = np.sqrt(np.sum((diff**2) / eigen[valid_pc][None, :], axis=1))
+    order = np.argsort(distances)[: min(top_k, len(distances))]
+    d = distances[order]
+
+    logw = -0.5 * (d / temperature) ** 2
+    logw -= np.nanmax(logw)
+    weights = np.exp(logw)
+    weights /= weights.sum()
+
+    times = pd.to_datetime(hist.time.values[order])
+    return pd.DataFrame(
+        {
+            "time": times,
+            "year": times.year,
+            "month": times.month,
+            "distance": d,
+            "weight": weights,
+            "rank": np.arange(1, len(order) + 1),
+        }
+    )

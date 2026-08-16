@@ -71,7 +71,14 @@ ERA5_LAND_VALIDATION_VARIABLES = [
 # SEAS5 variables
 SEAS5_VARIABLES = [
     "2m_temperature",
+    "minimum_2m_temperature_in_the_last_24_hours",
+    "maximum_2m_temperature_in_the_last_24_hours",
+    "2m_dewpoint_temperature",
+    "10m_wind_speed",
+    "surface_solar_radiation_downwards",
     "total_precipitation",
+    "evaporation",
+    "mean_sea_level_pressure",
 ]
 
 
@@ -350,6 +357,41 @@ def fetch_seas5(
     logger.info("Downloaded: %s (%.1f MB)", out_path, out_path.stat().st_size / 1e6)
 
     return out_path
+
+
+
+
+
+def fetch_seas5_hindcasts(
+    init_month: int,
+    *,
+    start_year: int = 1993,
+    end_year: int = 2016,
+    bounding_box: BBoxWGS84 = FRANCE_BBOX,
+    raw_dir: str | Path = DEFAULT_RAW_DIR,
+    overwrite: bool = False,
+) -> list[Path]:
+    """Download the SEAS5 retrospective initializations for one calendar month.
+
+    C3S serves 1993-2016 as hindcasts for the seasonal monthly dataset.  The
+    resulting local archive is used to estimate the lead-dependent SEAS5 model
+    climatology required for first-order bias correction.
+
+    This is intentionally explicit rather than hidden inside the correction
+    routine because it may download a substantial amount of data.
+    """
+    paths: list[Path] = []
+    for year in range(start_year, end_year + 1):
+        paths.append(
+            fetch_seas5(
+                year=year,
+                month=init_month,
+                bounding_box=bounding_box,
+                raw_dir=raw_dir,
+                overwrite=overwrite,
+            )
+        )
+    return paths
 
 
 def open_seas5(raw_dir: str | Path = DEFAULT_RAW_DIR, *, year: int, month: int) -> xr.Dataset:

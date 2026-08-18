@@ -39,13 +39,15 @@ LEAD_OFFSET = 0
 
 # Canonical IrriGator monthly variables used by PCA / analog matching.
 SEAS5_MATCHING_VARIABLES = [
-    "t_min",
-    "t_mean",
-    "t_max",
-    "dewpoint",
-    "precip_mm",
-    "rs_mj",
-    "wind_speed_10m",
+    "t2m",
+    "t2m_min",
+    "t2m_max",
+    "d2m",
+    "si10",
+    "ssrd",
+    "tp",
+    "e",
+    "msl",
 ]
 
 # ERA5 variables that can additionally be useful for ET0 reconstruction.
@@ -310,29 +312,25 @@ def open_era5_daily_archive(
 def build_era5_monthly_climatology(
     start_year: int = 1993,
     end_year: int = 2016,
-    processed_dir: str | Path = "data/processed",
     *,
-    era5_daily: xr.Dataset | None = None,
+    era5_monthly: xr.Dataset | None = None,
 ) -> xr.Dataset:
     """Build a 12-month ERA5-Land climatology in IrriGator units.
 
     Precipitation is aggregated as a monthly total before climatological
     averaging; all other variables are monthly means.
     """
-    daily = era5_daily
-    if daily is None:
-        daily = open_era5_daily_archive(processed_dir, start_year, end_year)
-
-    time_dim = "valid_time" if "valid_time" in daily.dims else "time"
-    daily = daily.sel({time_dim: slice(f"{start_year}-01-01", f"{end_year}-12-31")})
+    monthly = era5_monthly
+    time_dim = "valid_time" if "valid_time" in monthly.dims else "time"
 
     monthly_vars: dict[str, xr.DataArray] = {}
-    for var in daily.data_vars:
-        if var == "precip_mm":
-            monthly_vars[var] = daily[var].resample({time_dim: "1MS"}).sum()
-        else:
-            monthly_vars[var] = daily[var].resample({time_dim: "1MS"}).mean()
-    monthly = xr.Dataset(monthly_vars)
+    # for var in monthly.data_vars:
+        # if var == "precip_mm":
+        #     monthly_vars[var] = daily[var].resample({time_dim: "1MS"}).sum()
+        # else:
+        #     monthly_vars[var] = daily[var].resample({time_dim: "1MS"}).mean()
+        
+    # monthly = xr.Dataset(monthly_vars)
     clim = monthly.groupby(f"{time_dim}.month").mean(time_dim)
     clim.attrs.update(
         {
@@ -363,7 +361,8 @@ def build_seas5_hindcast_climatology(
     prepared = []
     for year in range(start_year, end_year + 1):
         raw = open_seas5(raw_dir=raw_dir, year=year, month=init_month)
-        p = prepare_seas5_monthly(raw, init_year=year, init_month=init_month)
+        #p = prepare_seas5_monthly(raw, init_year=year, init_month=init_month)
+        p = raw.copy()
         p = p.expand_dims(hindcast_year=[year])
         prepared.append(p)
 
@@ -438,14 +437,14 @@ def correct_seas5_monthly(
     supplied; they are normalized first with :func:`prepare_seas5_monthly`.
     """
     # Detect raw CDS input.  Canonical prepared data already has t_mean.
-    if "t_mean" not in seas5_monthly.data_vars and not any(
-        str(v).endswith("_anomaly") for v in seas5_monthly.data_vars
-    ):
-        if init_year is None:
-            raise ValueError("init_year is required when correcting raw SEAS5 monthly data.")
-        seas5_monthly = prepare_seas5_monthly(
-            seas5_monthly, init_year=init_year, init_month=init_month
-        )
+    # if "t_mean" not in seas5_monthly.data_vars and not any(
+    #     str(v).endswith("_anomaly") for v in seas5_monthly.data_vars
+    # ):
+    #     if init_year is None:
+    #         raise ValueError("init_year is required when correcting raw SEAS5 monthly data.")
+    #     seas5_monthly = prepare_seas5_monthly(
+    #         seas5_monthly, init_year=init_year, init_month=init_month
+    #     )
 
     lead_dim = _find_coord_or_dim(
         seas5_monthly,

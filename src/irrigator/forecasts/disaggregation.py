@@ -7,12 +7,14 @@ months-ahead daily SEAS5 trajectory as deterministic weather.
 
 Pipeline
 --------
-1. Aggregate historical ERA5-Land to monthly fields and regrid to the SEAS5
-   1° France grid.
-2. Fit one multivariate PCA per calendar month to the *complete France field*.
+1. Aggregate historical ERA5-Land monthly fields into the exact SEAS5 grid
+   cells and retain cells intersecting metropolitan France.
+2. Remove the calendar-month climatology, scale every feature by one residual
+   standard deviation estimated from the complete archive, and fit **one**
+   pooled France-wide PCA to all historical months.
 3. Project each bias-corrected SEAS5 member/lead into the same PCA space.
-4. Rank the closest historical months by Mahalanobis distance and sample from
-   the top-k analogs.
+4. Restrict candidate analogs to the same calendar month, rank them by PC-space
+   distance (Euclidean by default), and optionally sample from the top-k.
 5. Extract the selected ERA5-Land month at native resolution and rescale it so
    its monthly statistics match the corrected SEAS5 member.
 6. Redate the historical daily sequence to the forecast month.
@@ -29,6 +31,7 @@ import logging
 from dataclasses import dataclass
 from datetime import date
 from typing import Literal
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -37,7 +40,7 @@ import xarray as xr
 from irrigator.config import RegionConfig
 from irrigator.forecasts.pca_framework import (
     RegionalPCA,
-    fit_monthly_regional_pca,
+    fit_regional_anomaly_pca,
     rank_regional_analogs,
     transform_to_regional_pca,
 )
@@ -47,6 +50,8 @@ from irrigator.forecasts.seas5_processor import (
     compute_valid_year,
 )
 
+from irrigator.atmospheric.era5_processor import load_daily
+
 logger = logging.getLogger(__name__)
 
 # Deliberately excludes soil moisture: AquaCrop already carries the parcel's
@@ -55,6 +60,8 @@ logger = logging.getLogger(__name__)
 MATCHING_VARIABLES = list(SEAS5_MATCHING_VARIABLES)
 SEAS5_RESOLUTION_DEG = 1.0
 
+DEFAULT_RAW_DIR = Path("data/raw")
+DEFAULT_PROCESSED_DIR = Path("data/processed")
 
 @dataclass
 class AnalogMatch:
@@ -117,6 +124,131 @@ def _clip_bbox(ds: xr.Dataset, bbox_wgs84: tuple[float, float, float, float]) ->
     return ds.sel(latitude=lat_slice, longitude=slice(w, e))
 
 
+def centers_to_edges(centers: np.ndarray | list[float]) -> np.ndarray:
+    """Convert monotonically increasing grid-cell centers to bin edges."""
+    centers = np.asarray(centers, dtype=float)
+    if centers.ndim != 1 or centers.size < 2:
+        raise ValueError("centers must contain at least two 1-D coordinates.")
+    if not np.all(np.diff(centers) > 0):
+        raise ValueError("centers must be strictly increasing.")
+    mid = 0.5 * (centers[:-1] + centers[1:])
+    first = centers[0] - (mid[0] - centers[0])
+    last = centers[-1] + (centers[-1] - mid[-1])
+    return np.concatenate([[first], mid, [last]])
+
+
+def aggregate_to_target_grid(
+    ds: xr.Dataset,
+    target_latitude: np.ndarray | list[float],
+    target_longitude: np.ndarray | list[float],
+) -> xr.Dataset:
+    """Average fine-grid cells into the exact target-grid cell footprints.
+
+    This is the production version of the notebook helper.  Unlike linear
+    interpolation, each SEAS5 feature is the mean of the ERA5-Land cells whose
+    centres fall inside that SEAS5 cell.  The returned coordinates are reordered
+    to the original target-grid orientation.
+    """
+    ds = ds.sortby("latitude").sortby("longitude")
+    target_lat_original = np.asarray(target_latitude, dtype=float)
+    target_lon_original = np.asarray(target_longitude, dtype=float)
+    target_lat = np.sort(target_lat_original)
+    target_lon = np.sort(target_lon_original)
+
+    lat_edges = centers_to_edges(target_lat)
+    lon_edges = centers_to_edges(target_lon)
+
+    out = (
+        ds.groupby_bins(
+            "latitude",
+            lat_edges,
+            labels=target_lat,
+            include_lowest=True,
+        )
+        .mean("latitude")
+        .rename({"latitude_bins": "latitude"})
+    )
+    out = (
+        out.groupby_bins(
+            "longitude",
+            lon_edges,
+            labels=target_lon,
+            include_lowest=True,
+        )
+        .mean("longitude")
+        .rename({"longitude_bins": "longitude"})
+    )
+    out = out.sel(latitude=target_lat_original, longitude=target_lon_original)
+    non_spatial = [d for d in ds.dims if d not in {"latitude", "longitude"}]
+    return out.transpose(*non_spatial, "latitude", "longitude", missing_dims="ignore")
+
+
+def build_intersection_mask(ds: xr.Dataset, geometry) -> xr.DataArray:
+    """Return cells whose rectangular footprint intersects ``geometry``."""
+    from shapely.geometry import box
+
+    lat = np.asarray(ds.latitude, dtype=float)
+    lon = np.asarray(ds.longitude, dtype=float)
+    if lat.size < 2 or lon.size < 2:
+        raise ValueError("At least two latitude/longitude cells are required for a cell mask.")
+
+    dlat = float(np.median(np.abs(np.diff(lat))))
+    dlon = float(np.median(np.abs(np.diff(lon))))
+    mask = np.zeros((len(lat), len(lon)), dtype=bool)
+    for i, y in enumerate(lat):
+        for j, x in enumerate(lon):
+            cell = box(x - dlon / 2, y - dlat / 2, x + dlon / 2, y + dlat / 2)
+            mask[i, j] = cell.intersection(geometry).area > 0
+
+    return xr.DataArray(
+        mask,
+        coords={"latitude": ds.latitude, "longitude": ds.longitude},
+        dims=("latitude", "longitude"),
+        name="france_mask",
+    )
+
+
+def get_metropolitan_france_geometry():
+    """Load metropolitan France (mainland + Corsica) from Natural Earth.
+
+    Cartopy is imported lazily because only PCA fitting needs this helper.  The
+    user's PCA notebook already uses the same Natural Earth source, so the
+    production mask matches the exploratory analysis.
+    """
+    try:
+        import cartopy.io.shapereader as shpreader
+        from shapely.geometry import box
+    except ImportError as exc:  # pragma: no cover - environment specific
+        raise ImportError(
+            "cartopy and shapely are required to build the metropolitan-France PCA mask. "
+            "Pass a precomputed spatial_mask to build_historical_pca(), or install cartopy."
+        ) from exc
+
+    shp = shpreader.natural_earth(
+        resolution="10m",
+        category="cultural",
+        name="admin_0_countries",
+    )
+    france = None
+    for record in shpreader.Reader(shp).records():
+        attrs = record.attributes
+        if (
+            attrs.get("ADM0_A3") == "FRA"
+            or attrs.get("NAME") == "France"
+            or attrs.get("NAME_LONG") == "France"
+        ):
+            france = record.geometry
+            break
+    if france is None:
+        raise RuntimeError("France not found in Natural Earth.")
+    return france.intersection(box(-6.0, 41.0, 10.0, 52.0))
+
+
+def build_metropolitan_france_mask(ds: xr.Dataset) -> xr.DataArray:
+    """Keep every target grid cell intersecting metropolitan France."""
+    return build_intersection_mask(ds, get_metropolitan_france_geometry())
+
+
 def _coarsen_to_seas5(
     ds: xr.Dataset,
     target_resolution: float = SEAS5_RESOLUTION_DEG,
@@ -132,82 +264,120 @@ def _coarsen_to_seas5(
     return ds.coarsen(latitude=factor, longitude=factor, boundary="trim").mean()
 
 
-def build_historical_monthly_fields(
-    era5_daily: xr.Dataset,
-    *,
-    bbox_wgs84: tuple[float, float, float, float] | None = None,
-    variables: list[str] = MATCHING_VARIABLES,
-    target_grid: xr.Dataset | xr.DataArray | None = None,
-) -> xr.Dataset:
-    """Aggregate ERA5-Land daily data to monthly France fields for PCA.
+def get_historical_monthly_fields(
+    overwrite: bool = False,
+    # year_min : int = 1970,
+    year_min: int = 2013,
+    year_max: int = 2026,
+):
+    """Open the era5 monthly averages."""
+    out_dir = (DEFAULT_RAW_DIR / "era5_candidates")
 
-    Precipitation is a monthly sum; other matching variables are monthly means.
-    When a SEAS5 target grid is supplied the historical fields are interpolated
-    onto that exact 1° grid so PCA feature positions are identical at fit and
-    transform time.
-    """
-    ds = _standardize_latlon(era5_daily)
-    if bbox_wgs84 is not None:
-        ds = _clip_bbox(ds, bbox_wgs84)
-
-    available = [v for v in variables if v in ds.data_vars]
-    if not available:
-        raise ValueError("No requested analog variables are present in ERA5-Land.")
-
-    td = _time_dim(ds)
-    monthly: dict[str, xr.DataArray] = {}
-    for var in available:
-        if var == "precip_mm":
-            monthly[var] = ds[var].resample({td: "1MS"}).sum()
-        else:
-            monthly[var] = ds[var].resample({td: "1MS"}).mean()
-    result = xr.Dataset(monthly)
-
-    if target_grid is None:
-        result = _coarsen_to_seas5(result)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    file = list(out_dir.glob("*.nc"))[0]
+    if file.exists() and not overwrite:
+        ds = xr.open_dataset(file)
+        return ds.sel(time=slice(f"{year_min}-01-01", f"{year_max+1}-01-01"))
     else:
-        target = _standardize_latlon(
-            target_grid.to_dataset(name="_x")
-            if isinstance(target_grid, xr.DataArray)
-            else target_grid
-        )
-        result = result.interp(
-            latitude=target.latitude,
-            longitude=target.longitude,
-            method="linear",
-        )
+        from irrigator.ingestion.cds_client import fetch_era5_month
+        fetch_era5_month(year_min=year_min, year_max=year_max, raw_dir=out_dir)
+        return out_dir
 
-    if td != "time":
-        result = result.rename({td: "time"})
-    return result
+
+def month_bounds(year, month):
+    first_day = date(year, month, 1)
+    last_day = date(year, month, calendar.monthrange(year, month)[1])
+    return first_day, last_day
+
+# def build_historical_pca(
+#     overwrite_era5 : bool = False,
+#     variables: list[str] = MATCHING_VARIABLES,
+#     *,
+#     target_grid: xr.Dataset | None = None,
+#     n_components: int = 10,
+#     spatial_mask: xr.DataArray | None = None,
+#     mask_metropolitan_france: bool = True,
+#     latitude_weighting: bool = False,
+# ) -> RegionalPCA:
+#     """Fit the pooled France-level monthly-anomaly PCA analog model.
+
+#     If ``spatial_mask`` is omitted, metropolitan France is built from the same
+#     Natural Earth geometry used in the exploratory PCA notebook.  Cells are
+#     retained when their 1° footprint intersects the French polygon, including
+#     border/crossing cells.
+#     """
+#     monthly = get_historical_monthly_fields(overwrite = overwrite_era5)
+#     if spatial_mask is None and mask_metropolitan_france:
+#         spatial_mask = build_metropolitan_france_mask(monthly)
+#     return fit_regional_anomaly_pca(
+#         monthly,
+#         variables=variables,
+#         n_components=n_components,
+#         spatial_mask=spatial_mask,
+#         latitude_weighting=latitude_weighting,
+#     )
 
 
 def build_historical_pca(
-    era5_daily: xr.Dataset,
-    bbox_wgs84: tuple[float, float, float, float] | None = None,
+    overwrite_era5: bool = False,
     variables: list[str] = MATCHING_VARIABLES,
     *,
     target_grid: xr.Dataset | None = None,
-    n_components: int = 4,
+    n_components: int = 10,
+    spatial_mask: xr.DataArray | None = None,
+    mask_metropolitan_france: bool = True,
+    latitude_weighting: bool = False,
 ) -> RegionalPCA:
-    """Fit the preferred France-level monthly PCA analog model."""
-    monthly = build_historical_monthly_fields(
-        era5_daily,
-        bbox_wgs84=bbox_wgs84,
-        variables=variables,
-        target_grid=target_grid,
-    )
-    return fit_monthly_regional_pca(
+
+    monthly = get_historical_monthly_fields(overwrite=overwrite_era5)
+
+    monthly = _standardize_latlon(monthly)
+
+    if target_grid is not None:
+        target_grid = _standardize_latlon(target_grid)
+
+        monthly = aggregate_to_target_grid(
+            monthly,
+            target_latitude=target_grid.latitude.values,
+            target_longitude=target_grid.longitude.values,
+        )
+
+    if spatial_mask is None and mask_metropolitan_france:
+        spatial_mask = build_metropolitan_france_mask(monthly)
+
+    return fit_regional_anomaly_pca(
         monthly,
         variables=variables,
         n_components=n_components,
-        standardize=True,
+        spatial_mask=spatial_mask,
+        latitude_weighting=latitude_weighting,
     )
-
 
 # ---------------------------------------------------------------------------
 # PCA analog ranking
 # ---------------------------------------------------------------------------
+
+
+# def _target_as_time_dataset(
+#     cell: xr.Dataset,
+#     *,
+#     variables: list[str],
+#     target_year: int,
+#     target_month: int,
+#     pca_model: RegionalPCA,
+# ) -> xr.Dataset:
+#     target = _standardize_latlon(cell[variables])
+#     # Remove scalar coordinates/dimensions left by member/lead selection.
+#     for dim in list(target.dims):
+#         if dim not in {"latitude", "longitude"} and target.sizes[dim] == 1:
+#             target = target.isel({dim: 0}, drop=True)
+#     # Recover the PCA grid from feature metadata.  The feature vectors repeat
+#     # the same lat/lon grid for every variable.
+#     lats = np.unique(pca_model.feature_latitude.values.astype(float))[::-1]
+#     lons = np.unique(pca_model.feature_longitude.values.astype(float))
+#     target = target.interp(latitude=lats, longitude=lons, method="linear")
+#     target = target.expand_dims(time=[np.datetime64(f"{target_year:04d}-{target_month:02d}-01")])
+#     return target
 
 
 def _target_as_time_dataset(
@@ -218,19 +388,29 @@ def _target_as_time_dataset(
     target_month: int,
     pca_model: RegionalPCA,
 ) -> xr.Dataset:
+
     target = _standardize_latlon(cell[variables])
-    # Remove scalar coordinates/dimensions left by member/lead selection.
+
     for dim in list(target.dims):
         if dim not in {"latitude", "longitude"} and target.sizes[dim] == 1:
             target = target.isel({dim: 0}, drop=True)
-    # Recover the PCA grid from feature metadata.  The feature vectors repeat
-    # the same lat/lon grid for every variable.
-    lats = np.unique(pca_model.feature_latitude.values.astype(float))[::-1]
-    lons = np.unique(pca_model.feature_longitude.values.astype(float))
-    target = target.interp(latitude=lats, longitude=lons, method="linear")
-    target = target.expand_dims(time=[np.datetime64(f"{target_year:04d}-{target_month:02d}-01")])
-    return target
 
+    if pca_model.spatial_mask is not None:
+        lats = pca_model.spatial_mask.latitude.values
+        lons = pca_model.spatial_mask.longitude.values
+    else:
+        lats = np.unique(pca_model.feature_latitude.values.astype(float))[::-1]
+        lons = np.unique(pca_model.feature_longitude.values.astype(float))
+
+    target = target.interp(
+        latitude=lats,
+        longitude=lons,
+        method="linear",
+    )
+
+    target = target.expand_dims(time=[np.datetime64(f"{target_year:04d}-{target_month:02d}-01")])
+
+    return target
 
 def rank_analogs_pca(
     pca_model: RegionalPCA,
@@ -241,6 +421,7 @@ def rank_analogs_pca(
     target_month: int,
     top_k: int = 5,
     temperature: float = 1.0,
+    metric: Literal["euclidean", "mahalanobis"] = "euclidean",
 ) -> pd.DataFrame:
     """Return top-k historical analogs for one corrected SEAS5 month."""
     target = _target_as_time_dataset(
@@ -250,12 +431,15 @@ def rank_analogs_pca(
         target_month=target_month,
         pca_model=pca_model,
     )
+    
     scores = transform_to_regional_pca(target, pca_model, variables)
+    
     return rank_regional_analogs(
         pca_model,
         scores,
         top_k=top_k,
         temperature=temperature,
+        metric=metric,
     )
 
 
@@ -270,6 +454,7 @@ def find_analogs_pca(
     target_year: int | None = None,
     target_month: int | None = None,
     top_k: int = 5,
+    metric: Literal["euclidean", "mahalanobis"] = "euclidean",
 ) -> pd.DataFrame:
     del method  # legacy argument; regional PCA no longer spatial-votes cells.
     if target_month is None:
@@ -286,6 +471,7 @@ def find_analogs_pca(
         target_year=target_year,
         target_month=target_month,
         top_k=top_k,
+        metric=metric,
     )
 
 
@@ -360,6 +546,9 @@ def _redate_month(
     td = _time_dim(month_data)
     n_target = calendar.monthrange(target_year, target_month)[1]
     n_source = month_data.sizes[td]
+
+    print(n_target)
+    print(month_data)
 
     # February is the only practical month-length mismatch because analogs are
     # matched within the same calendar month.  Interpolate only when needed.
@@ -451,7 +640,6 @@ def _rescale_month_to_target(
 
 
 def extract_analog_daily_gridded(
-    era5_daily: xr.Dataset,
     analog_year: int,
     analog_month: int,
     seas5_monthly_target: xr.Dataset | dict[str, float] | None = None,
@@ -462,6 +650,11 @@ def extract_analog_daily_gridded(
     precip_scale_bounds: tuple[float, float] | None = None,
 ) -> xr.Dataset:
     """Extract, redate and optionally rescale one ERA5-Land analog month."""
+
+    era5_daily = load_daily(year=analog_year)
+    print(era5_daily)
+    print("Faily loaded")
+
     td = _time_dim(era5_daily)
     selector = (era5_daily[td].dt.year == analog_year) & (era5_daily[td].dt.month == analog_month)
     month_data = era5_daily.sel({td: selector})
@@ -530,7 +723,6 @@ def _select_member_lead(
 
 def generate_seasonal_scenarios(
     cfg: RegionConfig,
-    era5_daily: xr.Dataset,
     seas5_corrected: xr.Dataset,
     init_month: int,
     n_leads: int = 6,
@@ -540,11 +732,14 @@ def generate_seasonal_scenarios(
     init_year: int | None = None,
     analog_top_k: int = 5,
     analog_temperature: float = 1.0,
+    analog_metric: Literal["euclidean", "mahalanobis"] = "euclidean",
     random_seed: int = 42,
     start_date: date | None = None,
-    n_components: int = 4,
+    n_components: int = 10,
     precip_scale_bounds: tuple[float, float] | None = None,
     pca_bbox_wgs84: tuple[float, float, float, float] | None = None,
+    pca_spatial_mask: xr.DataArray | None = None,
+    mask_metropolitan_france: bool = True,
     pca_model: RegionalPCA | None = None,
 ) -> list[SeasonalScenario]:
     """Generate one daily ERA5-like scenario per SEAS5 ensemble member.
@@ -566,10 +761,18 @@ def generate_seasonal_scenarios(
         uses the complete ERA5/SEAS5 input domain, which is the intended
         France-level configuration.  Pass ``cfg.bbox_wgs84.as_tuple()`` only
         when deliberately building a regional PCA.
+    pca_spatial_mask
+        Optional precomputed mask on the SEAS5/PCA grid.  When omitted and
+        ``mask_metropolitan_france=True``, cells intersecting metropolitan France
+        are retained using Natural Earth.
+    analog_metric
+        PC-space distance used for same-month analog ranking.  ``"euclidean"``
+        matches the exploratory notebook and is the default; ``"mahalanobis"``
+        remains available for comparison.
     pca_model
-        Optional pre-fitted France-level PCA.  Supplying it avoids rebuilding
-        monthly historical fields on every daily run; this is useful when the
-        ERA5 analog archive is large.
+        Optional pre-fitted France-level pooled anomaly PCA.  Supplying it avoids
+        rebuilding monthly historical fields on every daily run; this is useful
+        when the ERA5 analog archive is large.
     """
     if init_year is None:
         init_year = int(seas5_corrected.attrs.get("init_year", pd.Timestamp.today().year))
@@ -584,7 +787,7 @@ def generate_seasonal_scenarios(
         raise ValueError("SEAS5 corrected dataset has no lead-month dimension.")
 
     available = [
-        v for v in variables if v in era5_daily.data_vars and v in seas5_corrected.data_vars
+        v for v in variables if v in seas5_corrected.data_vars
     ]
     if len(available) < 2:
         raise ValueError(
@@ -596,20 +799,21 @@ def generate_seasonal_scenarios(
     # PCA scope is intentionally independent from the parcel/region config.
     # With France-wide inputs the default therefore fits one France-wide PCA.
     _ = cfg
-    if pca_model is None:
-        pca_model = build_historical_pca(
-            era5_daily,
-            pca_bbox_wgs84,
-            available,
-            target_grid=seas5_corrected,
-            n_components=n_components,
-        )
+    # if pca_model is None:
+    #     pca_model = build_historical_pca(
+    #         overwrite_era5=False,
+    #         variables=available,
+    #         target_grid=seas5_corrected,
+    #         n_components=n_components,
+    #         spatial_mask=pca_spatial_mask,
+    #         mask_metropolitan_france=mask_metropolitan_france,
+    #     )
 
     member_ids = (
         [int(v) for v in seas5_corrected[member_dim].values] if member_dim is not None else [0]
     )
     lead_values = [int(v) for v in seas5_corrected[lead_dim].values][:n_leads]
-    td = _time_dim(era5_daily)
+    td = "valid_time"
     scenarios: list[SeasonalScenario] = []
 
     nearest_only = method in {"nearest", "soft", "hard"}
@@ -630,6 +834,7 @@ def generate_seasonal_scenarios(
                 lead_dim=lead_dim,
                 lead=lead,
             )
+            
 
             ranked = rank_analogs_pca(
                 pca_model,
@@ -639,6 +844,7 @@ def generate_seasonal_scenarios(
                 target_month=target_month,
                 top_k=analog_top_k,
                 temperature=analog_temperature,
+                metric=analog_metric,
             )
             if ranked.empty:
                 continue
@@ -665,8 +871,9 @@ def generate_seasonal_scenarios(
             member_analogs.append(analog)
 
             try:
+                print(analog.analog_year)
+                print(analog.analog_month)
                 month_ds = extract_analog_daily_gridded(
-                    era5_daily,
                     analog_year=analog.analog_year,
                     analog_month=analog.analog_month,
                     seas5_monthly_target=target,
@@ -681,9 +888,11 @@ def generate_seasonal_scenarios(
                 month_ds = None
                 if precip_scale_bounds is not None:
                     for _, fallback in ranked.iloc[1:].iterrows():
+                        print(fallback.year)
+                        print(fallback.month)
                         try:
+                            
                             month_ds = extract_analog_daily_gridded(
-                                era5_daily,
                                 analog_year=int(fallback.year),
                                 analog_month=int(fallback.month),
                                 seas5_monthly_target=target,
@@ -692,6 +901,7 @@ def generate_seasonal_scenarios(
                                 variables=available,
                                 precip_scale_bounds=precip_scale_bounds,
                             )
+                            print(month_ds)
                             analog.analog_year = int(fallback.year)
                             analog.analog_month = int(fallback.month)
                             analog.distance = float(fallback.distance)

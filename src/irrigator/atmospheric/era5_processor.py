@@ -145,7 +145,8 @@ def process_era5_to_daily(ds: xr.Dataset, shift_utc: int = 0) -> xr.Dataset:
     # Trim edges: the 00UTC shift creates a spurious first date (day before data start)
     # and leaves NaN on the last date (no next-day 00UTC available)
     valid_start = ds.valid_time.values[0].astype("datetime64[D]")
-    valid_end = ds.valid_time.values[-1].astype("datetime64[D]") - np.timedelta64(1, "D")
+    valid_end = ds.valid_time.values[-1].astype("datetime64[D]") #- np.timedelta64(1, "D")
+    print(valid_end)
     result = result.sel(valid_time=slice(str(valid_start), str(valid_end)))
 
     logger.info(

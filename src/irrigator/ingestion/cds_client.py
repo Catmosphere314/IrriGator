@@ -68,6 +68,15 @@ ERA5_LAND_VALIDATION_VARIABLES = [
     "volumetric_soil_water_layer_4",  # 100-289 cm
 ]
 
+ERA5_MONTH_VARIABLES=[
+    "2m_dewpoint_temperature",
+        "2m_temperature",
+        "mean_sea_level_pressure",
+        "total_precipitation",
+        "10m_wind_speed",
+        "surface_solar_radiation_downwards",
+        "evaporation"]
+
 # SEAS5 variables
 SEAS5_VARIABLES = [
     "2m_temperature",
@@ -174,6 +183,7 @@ def fetch_era5_land_month(
     else:
         last_day = date(year, month + 1, 1) - timedelta(days=1)
     days = [f"{d:02d}" for d in range(1, last_day.day + 1)]
+    print(days)
 
 
     request = {
@@ -295,6 +305,65 @@ def open_era5_land(
     logger.info("Opening %d ERA5-Land files with dask", len(files))
     ds = xr.open_mfdataset(files, chunks={"time": 24}, combine="by_coords")
     return ds
+
+# ---------------------------------------------------------------------------
+# ERA5 - Month 0.25
+# ---------------------------------------------------------------------------
+
+
+def _era5_month_output_path(raw_dir: Path, year_min: int, year_max: int) -> Path:
+    """Consistent file naming: era5land_YYYY_MM.nc"""
+    out_dir = raw_dir / "era5_candidates"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    return out_dir / f"era5land_{year_min:04d}_{year_max:04d}.nc"
+
+
+def fetch_era5_month(
+    year_min: int,
+    year_max: int,
+    *,
+    raw_dir: str | Path = DEFAULT_RAW_DIR,
+) -> Path:
+    """Download the history of ERA5 monthly averages.
+
+    Parameters
+    ----------
+    year_min, year_max : target period
+    raw_dir : output directory for ERA5 downloads
+
+    Returns
+    -------
+    Path to the downloaded NetCDF file.
+    """
+    raw_dir = Path(raw_dir)
+    out_path = _era5_month_output_path(raw_dir, year_min, year_max)
+
+
+    request = {
+        "variable": list(ERA5_MONTH_VARIABLES),
+        "year": list(range(year_min, year_max+1)),
+        "month": [
+        "01", "02", "03",
+        "04", "05", "06",
+        "07", "08", "09",
+        "10", "11", "12"
+    ],
+        "time": ["00:00"],
+        "area": [60, -20, 40, 20],
+        "data_format": "netcdf",
+        "download_format": "unarchived",
+    }
+
+   
+
+    logger.info("Requesting ERA5-Land %04d-%02d from CDS...", year_min, year_max)
+    client = _init_cds_client()
+    client.retrieve("reanalysis-era5-single-levels-monthly-means", request, str(out_path))
+    logger.info("Downloaded: %s (%.1f MB)", out_path, out_path.stat().st_size / 1e6)
+
+    return out_path
+
 
 
 # ---------------------------------------------------------------------------

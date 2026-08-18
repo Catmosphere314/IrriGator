@@ -771,8 +771,6 @@ def run_aquacrop(
         result.crop_growth["biomass"].iloc[-2] if n_days > 1 else 0,
     )
 
-
-
     return result
 
 
@@ -1835,6 +1833,7 @@ def _advance_model_to_date(
 
     if prefix_steps < 0:
         raise ValueError(f"branch_date={branch_date} is before sim_start={sim_start}.")
+    print(prefix_steps)
 
     if prefix_steps == 0:
         # Private, but needed because run_model(num_steps=0) is not allowed.
@@ -2193,6 +2192,352 @@ def _run_two_level_candidate_member_job(
     )
 
     return cand_idx, member_id, max_stress, n_stress_days, cc_loss
+
+
+@dataclass(frozen=True)
+class YieldBranchMemberResult:
+    """Final dry yield and first water-stress date for one forecast member."""
+
+    member_id: int
+    dry_yield_t_ha: float
+    first_stress_date: date | None
+
+
+def _extract_yield_branch_metrics(
+    model: AquaCropModel,
+    *,
+    stress_threshold_ks: float,
+    stress_not_before: date | None,
+) -> tuple[float, date | None]:
+    """Read yield/stress directly from AquaCrop private output arrays.
+
+    This deliberately avoids ``get_crop_growth``/``get_water_flux`` because the
+    event-driven optimizer calls this path many times.  The column positions are
+    the same ones already used by ``_extract_optimizer_metrics_from_private_outputs``.
+    In AquaCrop 3.x ``crop_growth[:, 12]`` is ``DryYield`` and water-flux columns
+    15/16 are actual/potential transpiration.
+    """
+    cg = model._outputs.crop_growth
+    wf = model._outputs.water_flux
+
+    if isinstance(cg, pd.DataFrame):
+        dry = cg["DryYield"].to_numpy(dtype=float)
+        counters = cg["time_step_counter"].to_numpy(dtype=float)
+    else:
+        cg_arr = np.asarray(cg)
+        if cg_arr.size == 0:
+            dry = np.asarray([], dtype=float)
+            counters = np.asarray([], dtype=float)
+        else:
+            counters = cg_arr[:, 0].astype(float)
+            dry = cg_arr[:, 12].astype(float)
+
+    # AquaCrop preallocates trailing zero rows. Restrict to timesteps that have
+    # actually been completed, then use the largest finite DryYield.  DryYield
+    # is cumulative within the crop season, so this is robust to terminal rows.
+    completed_stop = int(model._clock_struct.time_step_counter)
+    valid_yield = (
+        np.isfinite(counters) & np.isfinite(dry) & (counters >= 0) & (counters < completed_stop)
+    )
+    yield_t_ha = float(np.nanmax(dry[valid_yield])) if np.any(valid_yield) else 0.0
+
+    if isinstance(wf, pd.DataFrame):
+        wf_counter = wf["time_step_counter"].to_numpy(dtype=float)
+        tr = wf["Tr"].to_numpy(dtype=float)
+        tr_pot = wf["TrPot"].to_numpy(dtype=float)
+    else:
+        wf_arr = np.asarray(wf)
+        if wf_arr.size == 0:
+            return yield_t_ha, None
+        wf_counter = wf_arr[:, 0].astype(float)
+        tr = wf_arr[:, 15].astype(float)
+        tr_pot = wf_arr[:, 16].astype(float)
+
+    model_dates = _model_dates(model)
+    valid = (
+        np.isfinite(wf_counter)
+        & np.isfinite(tr)
+        & np.isfinite(tr_pot)
+        & (wf_counter >= 0)
+        & (wf_counter < completed_stop)
+        & (wf_counter < len(model_dates))
+    )
+    if not np.any(valid):
+        return yield_t_ha, None
+
+    counters_i = wf_counter[valid].astype(int)
+    tr_v = tr[valid]
+    tr_pot_v = tr_pot[valid]
+    ks = np.where(tr_pot_v > 0.01, tr_v / tr_pot_v, 1.0)
+
+    for counter, value in zip(counters_i, ks):
+        d = model_dates[int(counter)]
+        if stress_not_before is not None and d < stress_not_before:
+            continue
+        if np.isfinite(value) and value < float(stress_threshold_ks):
+            return yield_t_ha, d
+
+    return yield_t_ha, None
+
+
+_YIELD_BRANCH_WORKER_CTX: dict[str, Any] = {}
+
+
+def _init_yield_branch_worker(
+    candidate_state: _TwoLevelBranchState,
+    member_future_weather: dict[int, _MemberFutureWeather],
+    candidate: IrrigationCandidate,
+    today: date,
+    max_dose: float,
+    stress_threshold_ks: float,
+    stress_not_before: date | None,
+) -> None:
+    global _YIELD_BRANCH_WORKER_CTX
+    _YIELD_BRANCH_WORKER_CTX = {
+        "candidate_state": candidate_state,
+        "member_future_weather": member_future_weather,
+        "candidate": candidate,
+        "today": today,
+        "max_dose": float(max_dose),
+        "stress_threshold_ks": float(stress_threshold_ks),
+        "stress_not_before": stress_not_before,
+    }
+
+
+def _run_yield_branch_member_job(member_id: int) -> YieldBranchMemberResult:
+    """Run one forecast member from an already-computed deterministic state."""
+    ctx = _YIELD_BRANCH_WORKER_CTX
+    base_state: _TwoLevelBranchState = ctx["candidate_state"]
+    member_weather: _MemberFutureWeather = ctx["member_future_weather"][member_id]
+
+    model = copy.deepcopy(base_state.model)
+    model._weather = member_weather.weather_array
+
+    _add_candidate_to_initialized_schedule(
+        model,
+        ctx["candidate"],
+        today=ctx["today"],
+        max_dose=ctx["max_dose"],
+        earliest_idx=base_state.branch_start_idx,
+    )
+
+    if base_state.branch_steps > 0:
+        model.run_model(
+            num_steps=base_state.branch_steps,
+            till_termination=False,
+            initialize_model=False,
+            process_outputs=False,
+        )
+
+    dry_yield, first_stress = _extract_yield_branch_metrics(
+        model,
+        stress_threshold_ks=ctx["stress_threshold_ks"],
+        stress_not_before=ctx["stress_not_before"],
+    )
+    return YieldBranchMemberResult(
+        member_id=int(member_id),
+        dry_yield_t_ha=float(dry_yield),
+        first_stress_date=first_stress,
+    )
+
+
+class AquaCropYieldBranchingEvaluator:
+    """Reusable two-level AquaCrop evaluator for event-driven yield optimization.
+
+    The expensive season history is advanced exactly once when this object is
+    constructed.  Each schedule evaluation then performs only:
+
+    1. one deterministic AROME branch for the candidate; and
+    2. one continuation per ensemble member from the ensemble boundary.
+
+    This is the same private-internals strategy as
+    ``evaluate_candidates_ensemble_branching_2level`` but exposed as a reusable
+    evaluator because the yield optimizer chooses its next schedule adaptively.
+    """
+
+    def __init__(
+        self,
+        *,
+        historical_forcing: DailyForcing,
+        arome_forcing: DailyForcing,
+        member_forcings: dict[int, DailyForcing],
+        parcel: ParcelConfig,
+        terrain: TerrainParams,
+        soil_profile: SoilProfile,
+        sim_start: date,
+        today: date,
+        workers: int = 1,
+    ) -> None:
+        if not member_forcings:
+            raise ValueError("member_forcings is empty.")
+
+        self.today = pd.Timestamp(today).date()
+        self.parcel = parcel
+        self.max_dose = float(parcel.irrigation.get("max_dose_mm", 40.0))
+        self.member_ids = sorted(int(m) for m in member_forcings)
+        self.workers = max(1, int(workers))
+
+        crop = parcel_to_crop(parcel)
+        soil = soil_to_aquacrop(
+            soil_profile,
+            min_depth_m=crop.Zmax,
+            extrapolate_below_profile=True,
+        )
+        iwc = InitialWaterContent(value=["FC"])
+
+        base_weather = forcing_to_weather(
+            historical_forcing.concat(arome_forcing), terrain, parcel.lat
+        )
+        member_weathers: dict[int, pd.DataFrame] = {}
+        member_end_dates: dict[int, date] = {}
+        member_start_dates: dict[int, date] = {}
+
+        for member_id in self.member_ids:
+            member_forcing = member_forcings[member_id]
+            member_start_dates[member_id] = pd.Timestamp(member_forcing.dates[0]).date()
+            member_end_dates[member_id] = pd.Timestamp(member_forcing.dates[-1]).date()
+            member_weather = forcing_to_weather(member_forcing, terrain, parcel.lat)
+            member_weathers[member_id] = (
+                pd.concat([base_weather, member_weather])
+                .drop_duplicates("Date", keep="first")
+                .sort_values("Date")
+                .reset_index(drop=True)
+            )
+
+        unique_starts = set(member_start_dates.values())
+        unique_ends = set(member_end_dates.values())
+        if len(unique_starts) != 1 or len(unique_ends) != 1:
+            raise ValueError(
+                "Yield branching requires all forecast members to share the same "
+                f"start/end dates. Starts={member_start_dates}, ends={member_end_dates}"
+            )
+        self.ensemble_start_date = next(iter(unique_starts))
+        self.full_end = next(iter(unique_ends))
+
+        self.member_future_weather = _prepare_member_future_weather(
+            member_weathers=member_weathers,
+            member_end_dates=member_end_dates,
+            parcel=parcel,
+            sim_start=sim_start,
+            soil=soil,
+            crop=crop,
+            iwc=iwc,
+        )
+
+        reference_member = self.member_ids[0]
+        weather_ext, init_end_str, _ = _prepare_aquacrop_init(
+            weather=member_weathers[reference_member],
+            crop=crop,
+            sim_start=sim_start,
+            sim_end=self.full_end,
+        )
+        model = AquaCropModel(
+            sim_start_time=sim_start.strftime("%Y/%m/%d"),
+            sim_end_time=init_end_str,
+            weather_df=weather_ext,
+            soil=soil,
+            crop=crop,
+            initial_water_content=iwc,
+            irrigation_management=parcel_to_irrigation(parcel),
+        )
+        model._initialize()
+        _assert_compatible_member_time_spans(model, self.member_future_weather)
+
+        # Rebuild because the compatibility check initialized the model.  Then
+        # advance the complete observed season exactly once and retain that state.
+        model = AquaCropModel(
+            sim_start_time=sim_start.strftime("%Y/%m/%d"),
+            sim_end_time=init_end_str,
+            weather_df=weather_ext,
+            soil=soil,
+            crop=crop,
+            initial_water_content=iwc,
+            irrigation_management=parcel_to_irrigation(parcel),
+        )
+        self.today_idx = _advance_model_to_date(model, sim_start=sim_start, branch_date=self.today)
+        self.ensemble_start_idx = _index_for_model_date(model, self.ensemble_start_date)
+        self.deterministic_steps = self.ensemble_start_idx - self.today_idx
+        if self.deterministic_steps < 0:
+            raise ValueError(
+                f"Forecast members start {self.ensemble_start_date}, before today={self.today}."
+            )
+        self.branch_steps = min(
+            next(iter(member_forcings.values())).n_days,
+            len(model._clock_struct.time_span) - self.ensemble_start_idx,
+        )
+        if self.branch_steps <= 0:
+            raise ValueError("No forecast timesteps remain after the ensemble boundary.")
+        self._today_model = model
+
+    def _candidate_state(self, candidate: IrrigationCandidate) -> _TwoLevelBranchState:
+        model = copy.deepcopy(self._today_model)
+        _add_candidate_to_initialized_schedule(
+            model,
+            candidate,
+            today=self.today,
+            max_dose=self.max_dose,
+            earliest_idx=self.today_idx,
+            latest_idx_exclusive=self.ensemble_start_idx,
+        )
+        if self.deterministic_steps > 0:
+            model.run_model(
+                num_steps=self.deterministic_steps,
+                till_termination=False,
+                initialize_model=False,
+                process_outputs=False,
+            )
+        current_idx = int(model._clock_struct.time_step_counter)
+        if current_idx != self.ensemble_start_idx:
+            raise RuntimeError(
+                "Yield branch alignment failed: expected ensemble index "
+                f"{self.ensemble_start_idx}, got {current_idx}."
+            )
+        return _TwoLevelBranchState(
+            model=model,
+            branch_start_idx=self.ensemble_start_idx,
+            branch_steps=self.branch_steps,
+            metric_start_idx=max(0, self.ensemble_start_idx - 1),
+            metric_steps=self.branch_steps,
+            branch_date=self.ensemble_start_date,
+        )
+
+    def evaluate(
+        self,
+        candidate: IrrigationCandidate,
+        *,
+        stress_threshold_ks: float = 0.98,
+        stress_not_before: date | None = None,
+    ) -> dict[int, YieldBranchMemberResult]:
+        candidate_state = self._candidate_state(candidate)
+        n_workers = min(self.workers, mp.cpu_count(), len(self.member_ids))
+        initargs = (
+            candidate_state,
+            self.member_future_weather,
+            candidate,
+            self.today,
+            self.max_dose,
+            float(stress_threshold_ks),
+            stress_not_before,
+        )
+
+        if n_workers <= 1:
+            _init_yield_branch_worker(*initargs)
+            rows = [_run_yield_branch_member_job(m) for m in self.member_ids]
+        else:
+            # Fork is important here: candidate_state contains a live AquaCrop
+            # model.  On Windows/spawn this still works by pickling, but WSL/Linux
+            # avoids that extra cost.
+            mp_ctx = (
+                mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context()
+            )
+            with mp_ctx.Pool(
+                processes=n_workers,
+                initializer=_init_yield_branch_worker,
+                initargs=initargs,
+            ) as pool:
+                rows = pool.map(_run_yield_branch_member_job, self.member_ids)
+
+        return {row.member_id: row for row in rows}
 
 
 def evaluate_candidates_ensemble_branching_2level(

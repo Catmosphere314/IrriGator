@@ -77,10 +77,6 @@ crop:
   density: 86107 # seed/ha
   emergence_rate: 0.92 #assumed ??
 
-  rooting_depth:
-    at_emergence_m: 0.15
-    max_m: 1.80
-
   # GDD thresholds — defaults by maturity group, override if known
   # Leave commented to use defaults from configs/crop_parameters.yaml
   # gdd_thresholds:
@@ -127,19 +123,7 @@ irrigation_log:
   - date: "2025-07-08"
     amount_mm: 40
   - date: "2025-07-15"
-    amount_mm: 35
-  - date: "2025-07-22"
-    amount_mm: 35
-  - date: "2025-07-29"
-    amount_mm: 35
-  - date: "2025-08-05"
-    amount_mm: 35
-  - date: "2025-08-12"
-    amount_mm: 35
-  - date: "2025-08-20"
-    amount_mm: 30
-  - date: "2025-08-29"
-    amount_mm: 35
+    amount_mm: 15
   
 
 

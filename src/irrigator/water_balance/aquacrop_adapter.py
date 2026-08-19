@@ -44,6 +44,13 @@ from irrigator.water_balance.aquacrop_stress import (
 
 logger = logging.getLogger(__name__)
 
+# AquaCrop's root-development routine searches for the numerical soil
+# compartment containing the prospective expansion front.  A soil ending
+# exactly at Crop.Zmax can fail that lookup at the lower boundary because
+# of floating-point/timestep arithmetic.  Keep one standard compartment
+# below the nominal maximum root depth for every crop simulation.
+AQUACROP_ROOT_DEPTH_BUFFER_M = 0.10
+
 CROP_ALLOWED_OVERRIDES = {
     "CalendarType",
     "GDDmethod",
@@ -373,6 +380,62 @@ def soil_to_aquacrop(
     return soil
 
 
+def _soil_for_crop(
+    profile: SoilProfile,
+    crop: Crop,
+    *,
+    root_buffer_m: float = AQUACROP_ROOT_DEPTH_BUFFER_M,
+) -> Soil:
+    """Build an AquaCrop soil deep enough for root-development lookups.
+
+    AquaCrop may evaluate the prospective root-expansion front very close to
+    ``Crop.Zmax`` and then locate the containing compartment using
+    ``prof.dzsum >= ZiTmp``.  Ending the numerical soil exactly at ``Zmax`` is
+    therefore fragile.  We consistently provide one extra 10-cm compartment
+    (by default) below the nominal maximum rooting depth.
+
+    The deepest observed IrriGator hydraulic layer is extrapolated only when
+    the source soil profile is shallower than this numerical depth, matching
+    the behaviour already used by :func:`run_aquacrop`.
+    """
+    root_buffer_m = max(0.0, float(root_buffer_m))
+    requested_depth_m = float(crop.Zmax) + root_buffer_m
+    observed_depth_m = float(profile.z_layers_cm[-1][1]) / 100.0
+    if requested_depth_m > observed_depth_m + 1e-9:
+        logger.warning(
+            "Extending AquaCrop numerical soil from observed %.2fm to %.2fm "
+            "so roots with Zmax=%.2fm have a safe terminal compartment; "
+            "the deepest observed hydraulic layer is extrapolated below %.2fm.",
+            observed_depth_m,
+            requested_depth_m,
+            float(crop.Zmax),
+            observed_depth_m,
+        )
+
+    soil = soil_to_aquacrop(
+        profile,
+        min_depth_m=requested_depth_m,
+        extrapolate_below_profile=True,
+    )
+
+    available_depth_m = float(soil.profile["dz"].sum())
+    if available_depth_m + 1e-9 < requested_depth_m:
+        raise ValueError(
+            "AquaCrop soil is shallower than the required crop root domain: "
+            f"available={available_depth_m:.3f} m, "
+            f"required={requested_depth_m:.3f} m "
+            f"(Zmax={float(crop.Zmax):.3f} m)."
+        )
+
+    logger.debug(
+        "AquaCrop crop/soil depth guard: crop Zmax=%.2fm, numerical soil=%.2fm (buffer=%.2fm)",
+        float(crop.Zmax),
+        available_depth_m,
+        root_buffer_m,
+    )
+    return soil
+
+
 def _mmdd(value: str | None) -> str | None:
     if value is None:
         return None
@@ -445,6 +508,13 @@ def _crop_overrides_from_config(crop_cfg: dict[str, Any]) -> dict[str, Any]:
         overrides.setdefault("Senescence", round(0.85 * overrides["Maturity"]))
         overrides.setdefault("MaxRooting", overrides["Senescence"])
 
+    rooting = crop_cfg.get("rooting_depth") or {}
+
+    if rooting.get("at_emergence_m") is not None:
+        overrides["Zmin"] = float(rooting["at_emergence_m"])
+
+    if rooting.get("max_m") is not None:
+        overrides["Zmax"] = float(rooting["max_m"])
     # 3. Plant population.
     overrides["PlantPop"] = _plants_per_ha(crop_cfg)
 
@@ -710,9 +780,7 @@ def run_aquacrop(
     weather = forcing_to_weather(forcing, terrain, parcel.lat)
 
     crop = parcel_to_crop(parcel)
-    soil = soil_to_aquacrop(
-        soil_profile, min_depth_m=crop.Zmax + 0.1, extrapolate_below_profile=True
-    )
+    soil = _soil_for_crop(soil_profile, crop)
 
     weather, init_end_str, actual_sim_days = _prepare_aquacrop_init(
         weather=weather,
@@ -839,7 +907,7 @@ def run_ensemble_aquacrop(
     # Pre-compute shared objects
 
     crop = parcel_to_crop(parcel)
-    soil = soil_to_aquacrop(soil_profile, min_depth_m=crop.Zmax, extrapolate_below_profile=True)
+    soil = _soil_for_crop(soil_profile, crop)
     iwc = InitialWaterContent(value=["FC"])
 
     # Base weather: historical + AROME (ET₀ computed once)
@@ -964,168 +1032,6 @@ def run_ensemble_aquacrop(
     )
 
     return daily_stats
-
-
-# ---------------------------------------------------------------------------
-# Irrigation optimization
-# ---------------------------------------------------------------------------
-
-
-def evaluate_smt_strategy(
-    smt: list[float],
-    forcing: DailyForcing,
-    parcel: ParcelConfig,
-    terrain: TerrainParams,
-    soil_profile: SoilProfile,
-    sim_start: date,
-    sim_end: date,
-    *,
-    max_irr_season_mm: float = 300.0,
-    max_daily_mm: float = 40.0,
-    crop_price_eur_t: float = 180.0,
-    water_cost_eur_mm_ha: float = 2.5,
-) -> dict[str, float]:
-    """Evaluate a soil-moisture-target irrigation strategy.
-
-    AquaCrop's SMT method (method=1) irrigates when soil moisture
-    in the root zone drops below specified thresholds (as % of TAW)
-    for each growth stage.
-
-    Parameters
-    ----------
-    smt : soil moisture targets [initial, development, mid, late] as % TAW
-    forcing, parcel, terrain, soil_profile : the usual
-    sim_start, sim_end : simulation period
-    max_irr_season_mm : maximum seasonal irrigation
-    max_daily_mm : maximum per-application dose
-    crop_price_eur_t : maize price for profit calculation
-    water_cost_eur_mm_ha : water cost per mm per hectare
-
-    Returns
-    -------
-    Dict with yield_t_ha, seasonal_irrigation_mm, profit_eur_ha,
-    stress_days, max_stress.
-    """
-    irr = IrrigationManagement(
-        irrigation_method=1,
-        SMT=smt,
-        MaxIrr=max_daily_mm,
-        MaxIrrSeason=max_irr_season_mm,
-    )
-
-    result = run_aquacrop(
-        forcing=forcing,
-        parcel=parcel,
-        terrain=terrain,
-        soil_profile=soil_profile,
-        sim_start=sim_start,
-        sim_end=sim_end,
-        irrigation_management=irr,
-    )
-
-    # Extract yield
-    final = result.final_results
-    if len(final) > 0:
-        yield_t_ha = float(final.iloc[-1]["Dry yield (tonne/ha)"])
-        seasonal_irr = float(final.iloc[-1]["Seasonal irrigation (mm)"])
-    else:
-        # Crop didn't reach harvest — estimate from biomass
-        cg = result.crop_growth
-        biomass = cg["biomass"].iloc[-2] if len(cg) > 1 else 0
-        hi = cg["harvest_index"].iloc[-2] if len(cg) > 1 else 0
-        yield_t_ha = biomass * hi / 1000.0  # kg/ha → t/ha
-        wf = result.water_flux
-        seasonal_irr = float(wf["IrrDay"].sum())
-
-    # Stress metrics
-    stress = result.daily_stress
-    ks = stress["ks"].values
-    stress_days = int((ks < 0.9).sum())
-    max_stress = float(1.0 - np.nanmin(ks)) if len(ks) > 0 else 0.0
-
-    # Profit
-    area_ha = parcel.area_ha if hasattr(parcel, "area_ha") else 1.0
-    revenue = yield_t_ha * crop_price_eur_t
-    cost = seasonal_irr * water_cost_eur_mm_ha
-    profit = revenue - cost
-
-    return {
-        "yield_t_ha": yield_t_ha,
-        "seasonal_irrigation_mm": seasonal_irr,
-        "profit_eur_ha": profit,
-        "stress_days": stress_days,
-        "max_stress": max_stress,
-        "smt": smt,
-    }
-
-
-def optimize_irrigation(
-    forcing: DailyForcing,
-    parcel: ParcelConfig,
-    terrain: TerrainParams,
-    soil_profile: SoilProfile,
-    sim_start: date,
-    sim_end: date,
-    **kwargs,
-) -> dict[str, Any]:
-    """Find optimal soil-moisture-target irrigation strategy.
-
-    Uses scipy differential_evolution to search the 4-dimensional
-    SMT space (one threshold per growth stage: initial, development,
-    mid-season, late-season).
-
-    Returns the best strategy found and its performance metrics.
-    """
-    from scipy.optimize import differential_evolution
-
-    def objective(x):
-        smt = list(x)
-        metrics = evaluate_smt_strategy(
-            smt=smt,
-            forcing=forcing,
-            parcel=parcel,
-            terrain=terrain,
-            soil_profile=soil_profile,
-            sim_start=sim_start,
-            sim_end=sim_end,
-            **kwargs,
-        )
-        return -metrics["profit_eur_ha"]  # minimize negative profit
-
-    # Bounds: SMT thresholds as % TAW [0-100] per growth stage
-    bounds = [(30, 100), (30, 100), (50, 100), (20, 80)]
-
-    logger.info("Optimizing irrigation strategy (differential evolution)...")
-    result = differential_evolution(
-        objective,
-        bounds,
-        maxiter=20,
-        seed=42,
-        tol=0.01,
-        polish=False,
-    )
-
-    optimal_smt = list(result.x)
-    metrics = evaluate_smt_strategy(
-        smt=optimal_smt,
-        forcing=forcing,
-        parcel=parcel,
-        terrain=terrain,
-        soil_profile=soil_profile,
-        sim_start=sim_start,
-        sim_end=sim_end,
-        **kwargs,
-    )
-
-    logger.info(
-        "Optimization complete: SMT=%s, yield=%.1f t/ha, irrigation=%d mm, profit=€%.0f/ha",
-        [f"{s:.0f}" for s in optimal_smt],
-        metrics["yield_t_ha"],
-        metrics["seasonal_irrigation_mm"],
-        metrics["profit_eur_ha"],
-    )
-
-    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -1362,103 +1268,6 @@ class IrrigationCandidate:
         return self.total_mm
 
 
-@dataclass
-class CandidateResult:
-    """Ensemble evaluation of one irrigation candidate."""
-
-    candidate: IrrigationCandidate
-    # Per-member outcomes
-    member_max_stress: list[float]  # max(1-Ks) per member over forecast
-    member_stress_days: list[int]  # days with Ks < 0.9 per member
-    member_yield_impact: list[float]  # CC reduction vs no-stress (proxy)
-    # Ensemble summary
-    mean_max_stress: float
-    median_max_stress: float
-    pct_members_avoid_stress: float  # fraction with max Ks > 0.9
-    mean_stress_days: float
-
-
-def build_candidates(
-    parcel_config: ParcelConfig,
-    max_days_ahead: int = 7,
-    max_events: int = 3,
-) -> list[IrrigationCandidate]:
-    """Build candidate irrigation schedules to evaluate.
-
-    Generates:
-    - 0 events: rainfed baseline
-    - 1 event:  every (day, dose) combination
-    - 2 events: pairs separated by ≥ min_interval, using min/max doses
-    - 3 events: triples separated by ≥ min_interval, max dose only
-
-    Parameters
-    ----------
-    parcel_config : parcel with irrigation constraints
-    max_days_ahead : furthest day to consider for irrigation
-    max_events : maximum number of irrigations per candidate (1–3)
-    """
-    irr_cfg = parcel_config.irrigation
-    min_dose = irr_cfg.get("min_dose_mm", 15)
-    max_dose = irr_cfg.get("max_dose_mm", 35)
-    min_interval = irr_cfg.get("min_interval_days", 3)
-
-    # Dose levels for single events: min, mid, max
-    doses_single = sorted(set([min_dose, (min_dose + max_dose) / 2, max_dose]))
-    # Dose levels for multi-event: just min and max to limit combinatorics
-    doses_multi = sorted(set([min_dose, max_dose]))
-
-    days = list(range(0, max_days_ahead + 1))
-
-    candidates: list[IrrigationCandidate] = [
-        IrrigationCandidate(events=[], label="No irrigation"),
-    ]
-
-    # --- Single events ---
-    for d in days:
-        for dose in doses_single:
-            candidates.append(
-                IrrigationCandidate(
-                    events=[(d, dose)],
-                    label=f"{dose:.0f}mm on day+{d}",
-                )
-            )
-
-    # --- Double events ---
-    if max_events >= 2:
-        for d1 in days:
-            for d2 in days:
-                if d2 < d1 + min_interval:
-                    continue
-                for dose in doses_multi:
-                    candidates.append(
-                        IrrigationCandidate(
-                            events=[(d1, dose), (d2, dose)],
-                            label=f"2×{dose:.0f}mm on day+{d1} & +{d2}",
-                        )
-                    )
-
-    # --- Triple events (max dose only to keep count manageable) ---
-    if max_events >= 3:
-        for d1 in range(0, min(4, max_days_ahead + 1)):
-            for d2 in range(d1 + min_interval, max_days_ahead + 1):
-                for d3 in range(d2 + min_interval, max_days_ahead + 1):
-                    candidates.append(
-                        IrrigationCandidate(
-                            events=[(d1, max_dose), (d2, max_dose), (d3, max_dose)],
-                            label=f"3×{max_dose:.0f}mm on day+{d1},{d2},{d3}",
-                        )
-                    )
-
-    logger.info(
-        "Built %d candidates (1-event: %d, 2-event: %d, 3-event: %d)",
-        len(candidates),
-        sum(1 for c in candidates if c.n_events == 1),
-        sum(1 for c in candidates if c.n_events == 2),
-        sum(1 for c in candidates if c.n_events == 3),
-    )
-    return candidates
-
-
 def _build_candidate_irrigation(
     parcel: ParcelConfig,
     candidate: IrrigationCandidate,
@@ -1493,278 +1302,6 @@ def _build_candidate_irrigation(
         return IrrigationManagement(irrigation_method=3, Schedule=extra, MaxIrr=max_dose)
 
 
-_CANDIDATE_WORKER_CTX: dict[str, Any] = {}
-
-
-def _init_candidate_worker(
-    candidates: list[IrrigationCandidate],
-    member_weathers: dict[int, pd.DataFrame],
-    member_end_dates: dict[int, date],
-    parcel: ParcelConfig,
-    today: date,
-    sim_start: date,
-    soil: Soil,
-    crop: Crop,
-    iwc: InitialWaterContent,
-    stress_threshold: float,
-    n_forecast: int,
-) -> None:
-    """Initialize process-local state for candidate evaluation workers.
-
-    The pool calls this once per worker process.  Jobs can then stay tiny:
-    only (candidate_index, member_id) needs to be sent for each AquaCrop run.
-    This avoids repeatedly pickling the same weather DataFrames, soil, crop,
-    parcel, and candidate list for every job.
-    """
-    global _CANDIDATE_WORKER_CTX
-    _CANDIDATE_WORKER_CTX = {
-        "candidates": candidates,
-        "member_weathers": member_weathers,
-        "member_end_dates": member_end_dates,
-        "parcel": parcel,
-        "today": today,
-        "sim_start": sim_start,
-        "soil": soil,
-        "crop": crop,
-        "iwc": iwc,
-        "stress_threshold": stress_threshold,
-        "n_forecast": n_forecast,
-    }
-
-
-def _run_single_candidate_job(job: tuple[int, int]) -> tuple[int, int, float, int, float]:
-    """Run one candidate × ensemble-member AquaCrop simulation.
-
-    Returns
-    -------
-    tuple
-        (candidate_index, member_id, max_stress, n_stress_days, cc_loss)
-    """
-    cand_idx, m_id = job
-    ctx = _CANDIDATE_WORKER_CTX
-
-    cand = ctx["candidates"][cand_idx]
-    weather = ctx["member_weathers"][m_id]
-    full_end = ctx["member_end_dates"][m_id]
-
-    irr_mgmt = _build_candidate_irrigation(ctx["parcel"], cand, ctx["today"])
-
-    model = AquaCropModel(
-        sim_start_time=ctx["sim_start"].strftime("%Y/%m/%d"),
-        sim_end_time=full_end.strftime("%Y/%m/%d"),
-        weather_df=weather,
-        soil=ctx["soil"],
-        crop=ctx["crop"],
-        initial_water_content=ctx["iwc"],
-        irrigation_management=irr_mgmt,
-    )
-    model.run_model(till_termination=True)
-
-    # Avoid constructing AquaCropResult and avoid calling get_water_storage().
-    # The optimizer only needs stress and canopy-loss metrics.
-    cg = model.get_crop_growth()
-    wf = model.get_water_flux()
-
-    n_total = min(len(cg), len(wf))
-    if n_total > 1 and cg["dap"].iloc[n_total - 1] == 0:
-        n_total -= 1
-
-    n_forecast = ctx["n_forecast"]
-    fc_start = max(0, n_total - n_forecast)
-
-    tr = wf["Tr"].values[fc_start:n_total]
-    tr_pot = wf["TrPot"].values[fc_start:n_total]
-    ks = np.where(tr_pot > 0.01, tr / tr_pot, 1.0)
-
-    max_stress = float(1.0 - np.nanmin(ks)) if len(ks) > 0 else 0.0
-    n_stress_days = int((ks < ctx["stress_threshold"]).sum())
-
-    if "canopy_cover_ns" in cg and "canopy_cover" in cg:
-        cc_ns = cg["canopy_cover_ns"].values[fc_start:n_total]
-        cc = cg["canopy_cover"].values[fc_start:n_total]
-        cc_loss = float(np.nanmean(cc_ns - cc))
-    else:
-        cc_loss = 0.0
-
-    return cand_idx, m_id, max_stress, n_stress_days, cc_loss
-
-
-def evaluate_candidates_ensemble(
-    historical_forcing: DailyForcing,
-    arome_forcing: DailyForcing,
-    member_forcings: dict[int, DailyForcing],
-    parcel: ParcelConfig,
-    terrain: TerrainParams,
-    soil_profile: SoilProfile,
-    sim_start: date,
-    today: date,
-    candidates: list[IrrigationCandidate] | None = None,
-    workers: int | None = 3,
-    stress_threshold: float = 0.9,
-) -> list[CandidateResult]:
-    """Evaluate irrigation candidates across the IFS ENS ensemble.
-
-    Optimized: weather DataFrames (including ET₀) are pre-computed once
-    per member.  The historical + AROME portion (Jan 1 → today+2) is
-    shared by all candidates — only the irrigation schedule varies.
-
-    Immediate runtime fix:
-    - build all candidate × member jobs once
-    - create only one process pool
-    - send only small job tuples to workers
-    - avoid full AquaCropResult/water_storage extraction inside optimizer jobs
-    """
-    if candidates is None:
-        candidates = build_candidates(parcel)
-
-    if not candidates:
-        return []
-    if not member_forcings:
-        return []
-
-    # ------------------------------------------------------------------
-    # Pre-compute shared objects (computed once, reused for all runs)
-    # ------------------------------------------------------------------
-    soil = soil_to_aquacrop(soil_profile)
-    crop = parcel_to_crop(parcel)
-    iwc = InitialWaterContent(value=["FC"])
-
-    # Base weather: historical + AROME (includes ET₀ computation)
-    base_forcing = historical_forcing.concat(arome_forcing)
-    base_weather = forcing_to_weather(base_forcing, terrain, parcel.lat)
-
-    # Per-member weather: base + IFS ENS forecast.
-    # ET₀ is computed once per member here, not once per candidate.
-    member_weathers: dict[int, pd.DataFrame] = {}
-    member_end_dates: dict[int, date] = {}
-
-    for m_id, m_forcing in member_forcings.items():
-        m_weather = forcing_to_weather(m_forcing, terrain, parcel.lat)
-
-        # Concat with base taking precedence on overlapping dates
-        full = (
-            pd.concat([base_weather, m_weather])
-            .drop_duplicates("Date", keep="first")
-            .sort_values("Date")
-            .reset_index(drop=True)
-        )
-        member_weathers[m_id] = full
-        member_end_dates[m_id] = pd.Timestamp(m_forcing.dates[-1]).date()
-
-    n_forecast = next(iter(member_forcings.values())).n_days
-    member_ids = list(member_weathers.keys())
-
-    jobs: list[tuple[int, int]] = [
-        (cand_idx, m_id) for cand_idx in range(len(candidates)) for m_id in member_ids
-    ]
-
-    n_jobs = len(jobs)
-    if workers is None or workers <= 0:
-        n_workers = min(mp.cpu_count(), n_jobs)
-    else:
-        n_workers = min(workers, mp.cpu_count(), n_jobs)
-
-    logger.info(
-        "Evaluating %d candidates × %d members = %d AquaCrop runs "
-        "(%d worker%s, weather pre-computed, %d historical + %d forecast days)",
-        len(candidates),
-        len(member_forcings),
-        n_jobs,
-        n_workers,
-        "s" if n_workers != 1 else "",
-        base_forcing.n_days,
-        n_forecast,
-    )
-
-    # candidate_member_results[candidate_index][member_id] =
-    #     (max_stress, n_stress_days, cc_loss)
-    candidate_member_results: list[dict[int, tuple[float, int, float]]] = [{} for _ in candidates]
-
-    initargs = (
-        candidates,
-        member_weathers,
-        member_end_dates,
-        parcel,
-        today,
-        sim_start,
-        soil,
-        crop,
-        iwc,
-        stress_threshold,
-        n_forecast,
-    )
-
-    if n_workers == 1:
-        _init_candidate_worker(*initargs)
-        iterator = map(_run_single_candidate_job, jobs)
-        for cand_idx, m_id, max_stress, n_stress_days, cc_loss in iterator:
-            candidate_member_results[cand_idx][m_id] = (
-                max_stress,
-                n_stress_days,
-                cc_loss,
-            )
-    else:
-        # AquaCrop jobs are relatively heavy.  A small chunksize keeps load
-        # balancing good while reducing IPC overhead versus chunksize=1.
-        chunksize = max(1, n_jobs // (n_workers * 8))
-        with mp.Pool(
-            processes=n_workers,
-            initializer=_init_candidate_worker,
-            initargs=initargs,
-        ) as pool:
-            for cand_idx, m_id, max_stress, n_stress_days, cc_loss in pool.imap_unordered(
-                _run_single_candidate_job,
-                jobs,
-                chunksize=chunksize,
-            ):
-                candidate_member_results[cand_idx][m_id] = (
-                    max_stress,
-                    n_stress_days,
-                    cc_loss,
-                )
-
-    # ------------------------------------------------------------------
-    # Aggregate per candidate
-    # ------------------------------------------------------------------
-    results: list[CandidateResult] = []
-
-    for ci, cand in enumerate(candidates):
-        member_rows = [candidate_member_results[ci][m_id] for m_id in member_ids]
-
-        member_max_stress = [row[0] for row in member_rows]
-        member_stress_days = [row[1] for row in member_rows]
-        member_yield_impact = [row[2] for row in member_rows]
-
-        arr_stress = np.asarray(member_max_stress, dtype=float)
-        arr_days = np.asarray(member_stress_days, dtype=float)
-
-        result = CandidateResult(
-            candidate=cand,
-            member_max_stress=member_max_stress,
-            member_stress_days=member_stress_days,
-            member_yield_impact=member_yield_impact,
-            mean_max_stress=float(np.nanmean(arr_stress)),
-            median_max_stress=float(np.nanmedian(arr_stress)),
-            pct_members_avoid_stress=float(np.nanmean(arr_stress < (1.0 - stress_threshold))),
-            mean_stress_days=float(np.nanmean(arr_days)),
-        )
-        results.append(result)
-
-        logger.info(
-            "Candidate %d/%d '%s': mean_stress=%.3f, avoid_pct=%.0f%%, mean_stress_days=%.1f",
-            ci + 1,
-            len(candidates),
-            cand.label,
-            result.mean_max_stress,
-            result.pct_members_avoid_stress * 100,
-            result.mean_stress_days,
-        )
-
-    # Sort by best outcome: highest pct_members_avoid_stress, then lowest mean_stress
-    results.sort(key=lambda r: (-r.pct_members_avoid_stress, r.mean_max_stress))
-    return results
-
-
 # ---------------------------------------------------------------------------
 # Two-level private-internals candidate evaluator
 # ---------------------------------------------------------------------------
@@ -1786,6 +1323,7 @@ class _TwoLevelBranchState:
     metric_start_idx: int
     metric_steps: int
     branch_date: date
+    crop_finished: bool = False
 
 
 @dataclass
@@ -1833,8 +1371,6 @@ def _advance_model_to_date(
 
     if prefix_steps < 0:
         raise ValueError(f"branch_date={branch_date} is before sim_start={sim_start}.")
-    print(prefix_steps)
-
     if prefix_steps == 0:
         # Private, but needed because run_model(num_steps=0) is not allowed.
         model._initialize()
@@ -1970,228 +1506,8 @@ def _assert_compatible_member_time_spans(
             )
 
 
-def _build_candidate_arome_states(
-    *,
-    reference_model: AquaCropModel,
-    candidates: list[IrrigationCandidate],
-    today: date,
-    sim_start: date,
-    ensemble_start_date: date,
-    metric_days: int,
-    max_dose: float,
-) -> dict[int, _TwoLevelBranchState]:
-    """Run the common history once, then candidate-specific deterministic days once.
-
-    Output state is positioned at ``ensemble_start_date``, which should be the
-    first date in the ensemble-member forcing.  Do not infer this solely from
-    ``today + arome_days`` because duplicate/overlap handling can otherwise
-    create a one-day scoring mismatch at the boundary.
-    """
-
-    today_idx = _advance_model_to_date(
-        reference_model,
-        sim_start=sim_start,
-        branch_date=today,
-    )
-
-    ensemble_start_idx = _index_for_model_date(reference_model, ensemble_start_date)
-    deterministic_steps = ensemble_start_idx - today_idx
-    if deterministic_steps < 0:
-        raise ValueError(f"ensemble_start_date={ensemble_start_date} is before today={today}.")
-    n_time = len(reference_model._clock_struct.time_span)
-    metric_steps = min(metric_days, n_time - ensemble_start_idx)
-    if metric_steps <= 0:
-        raise RuntimeError(
-            f"No metric timesteps available from ensemble_start_date={ensemble_start_date}."
-        )
-    # AquaCrop private output arrays label completed timesteps with the
-    # pre-increment time_step_counter.  Therefore, when the model is positioned
-    # at ensemble_start_idx, the output row for the first ensemble timestep is
-    # stored with counter ensemble_start_idx - 1.  The full-rerun reference uses
-    # public DataFrame positions, so the private-output scorer must shift the
-    # metric window back by one internal counter to include the first ensemble
-    # day instead of starting at day+3.
-    metric_output_start_idx = max(0, ensemble_start_idx - 1)
-    candidate_states: dict[int, _TwoLevelBranchState] = {}
-
-    for cand_idx, candidate in enumerate(candidates):
-        model = copy.deepcopy(reference_model)
-
-        # Only inject events that belong to the deterministic shared window.
-        # Events on the boundary date itself (e.g. day+2 when ensemble starts at
-        # day+2) are injected later inside the member-specific branch, before
-        # that timestep is processed.
-
-        _add_candidate_to_initialized_schedule(
-            model,
-            candidate,
-            today=today,
-            max_dose=max_dose,
-            earliest_idx=today_idx,
-            latest_idx_exclusive=ensemble_start_idx,
-        )
-
-        if deterministic_steps > 0:
-            model.run_model(
-                num_steps=deterministic_steps,
-                till_termination=False,
-                initialize_model=False,
-                process_outputs=False,
-            )
-
-        current_idx = int(model._clock_struct.time_step_counter)
-        if current_idx != ensemble_start_idx:
-            dates = _model_dates(model)
-            current_date = dates[current_idx] if 0 <= current_idx < len(dates) else None
-            raise RuntimeError(
-                "Candidate deterministic branch alignment failed: "
-                f"expected index {ensemble_start_idx} for {ensemble_start_date}, "
-                f"but model is at index {current_idx} ({current_date})."
-            )
-
-        candidate_states[cand_idx] = _TwoLevelBranchState(
-            model=model,
-            branch_start_idx=ensemble_start_idx,
-            branch_steps=metric_steps,
-            metric_start_idx=metric_output_start_idx,
-            metric_steps=metric_steps,
-            branch_date=ensemble_start_date,
-        )
-
-    return candidate_states
-
-
-def _extract_optimizer_metrics_from_private_outputs(
-    model: AquaCropModel,
-    state: _TwoLevelBranchState,
-    *,
-    stress_threshold: float,
-) -> tuple[float, int, float]:
-    """Extract optimizer metrics directly from AquaCrop private outputs."""
-    start = state.metric_start_idx
-    stop = start + state.metric_steps
-
-    wf = model._outputs.water_flux
-    cg = model._outputs.crop_growth
-
-    if isinstance(wf, pd.DataFrame):
-        wf_slice = wf[(wf["time_step_counter"] >= start) & (wf["time_step_counter"] < stop)]
-        cg_slice = cg[(cg["time_step_counter"] >= start) & (cg["time_step_counter"] < stop)]
-
-        tr = wf_slice["Tr"].to_numpy(dtype=float)
-        tr_pot = wf_slice["TrPot"].to_numpy(dtype=float)
-        cc_loss_arr = cg_slice["canopy_cover_ns"].to_numpy(dtype=float) - cg_slice[
-            "canopy_cover"
-        ].to_numpy(dtype=float)
-    else:
-        wf_arr = np.asarray(wf)
-        cg_arr = np.asarray(cg)
-
-        if wf_arr.size == 0 or cg_arr.size == 0:
-            return 1.0, state.metric_steps, 1.0
-
-        # Use AquaCrop's time_step_counter column instead of raw row positions.
-        # This avoids off-by-one errors at branch boundaries and avoids including
-        # any terminal/zero rows that AquaCrop may append after the last timestep.
-        wf_mask = (wf_arr[:, 0] >= start) & (wf_arr[:, 0] < stop)
-        cg_mask = (cg_arr[:, 0] >= start) & (cg_arr[:, 0] < stop)
-        wf_slice = wf_arr[wf_mask]
-        cg_slice = cg_arr[cg_mask]
-
-        if wf_slice.size == 0 or cg_slice.size == 0:
-            return 1.0, state.metric_steps, 1.0
-
-        # Raw AquaCrop output columns, from aquacrop.timestep:
-        # water_flux: 15=Tr, 16=TrPot
-        # crop_growth: 6=canopy_cover, 7=canopy_cover_ns
-        tr = wf_slice[:, 15].astype(float)
-        tr_pot = wf_slice[:, 16].astype(float)
-        cc_loss_arr = cg_slice[:, 7].astype(float) - cg_slice[:, 6].astype(float)
-
-    if len(tr) == 0:
-        return 1.0, state.metric_steps, 1.0
-
-    ks = np.where(tr_pot > 0.01, tr / tr_pot, 1.0)
-    max_stress = float(1.0 - np.nanmin(ks))
-    n_stress_days = int(np.sum(ks < stress_threshold))
-    cc_loss = float(np.nanmean(cc_loss_arr)) if len(cc_loss_arr) else 0.0
-
-    return max_stress, n_stress_days, cc_loss
-
 
 _TWO_LEVEL_WORKER_CTX: dict[str, Any] = {}
-
-
-def _init_two_level_worker(
-    candidate_states: dict[int, _TwoLevelBranchState],
-    member_future_weather: dict[int, _MemberFutureWeather],
-    candidates: list[IrrigationCandidate],
-    today: date,
-    max_dose: float,
-    stress_threshold: float,
-) -> None:
-    """Initialize process-local context for two-level branching workers."""
-    global _TWO_LEVEL_WORKER_CTX
-    _TWO_LEVEL_WORKER_CTX = {
-        "candidate_states": candidate_states,
-        "member_future_weather": member_future_weather,
-        "candidates": candidates,
-        "today": today,
-        "max_dose": float(max_dose),
-        "stress_threshold": float(stress_threshold),
-    }
-
-
-def _run_two_level_candidate_member_job(
-    job: tuple[int, int],
-) -> tuple[int, int, float, int, float]:
-    """Run one candidate × member from the candidate-specific AROME state."""
-    cand_idx, member_id = job
-    ctx = _TWO_LEVEL_WORKER_CTX
-
-    base_state = ctx["candidate_states"][cand_idx]
-    member_weather = ctx["member_future_weather"][member_id]
-
-    model = copy.deepcopy(base_state.model)
-    # At this point the model is already at ensemble_start.  Replace only the
-    # internal weather array so that today+arome_days onward follows the member.
-    model._weather = member_weather.weather_array
-
-    state = _TwoLevelBranchState(
-        model=model,
-        branch_start_idx=base_state.branch_start_idx,
-        branch_steps=base_state.branch_steps,
-        metric_start_idx=base_state.metric_start_idx,
-        metric_steps=base_state.metric_steps,
-        branch_date=base_state.branch_date,
-    )
-
-    # Inject events on/after the ensemble boundary only after the member weather
-    # has been selected.  This fixes boundary candidates such as day+2 when the
-    # ensemble also starts at day+2.
-    _add_candidate_to_initialized_schedule(
-        model,
-        ctx["candidates"][cand_idx],
-        today=ctx["today"],
-        max_dose=ctx["max_dose"],
-        earliest_idx=state.branch_start_idx,
-    )
-
-    if state.branch_steps > 0:
-        model.run_model(
-            num_steps=state.branch_steps,
-            till_termination=False,
-            initialize_model=False,
-            process_outputs=False,
-        )
-
-    max_stress, n_stress_days, cc_loss = _extract_optimizer_metrics_from_private_outputs(
-        model,
-        state,
-        stress_threshold=ctx["stress_threshold"],
-    )
-
-    return cand_idx, member_id, max_stress, n_stress_days, cc_loss
 
 
 @dataclass(frozen=True)
@@ -2378,11 +1694,7 @@ class AquaCropYieldBranchingEvaluator:
         self.workers = max(1, int(workers))
 
         crop = parcel_to_crop(parcel)
-        soil = soil_to_aquacrop(
-            soil_profile,
-            min_depth_m=crop.Zmax,
-            extrapolate_below_profile=True,
-        )
+        soil = _soil_for_crop(soil_profile, crop)
         iwc = InitialWaterContent(value=["FC"])
 
         base_weather = forcing_to_weather(
@@ -2454,7 +1766,34 @@ class AquaCropYieldBranchingEvaluator:
             initial_water_content=iwc,
             irrigation_management=parcel_to_irrigation(parcel),
         )
-        self.today_idx = _advance_model_to_date(model, sim_start=sim_start, branch_date=self.today)
+        self.crop_finished_before_today = False
+        self.finished_date: date | None = None
+        try:
+            self.today_idx = _advance_model_to_date(
+                model, sim_start=sim_start, branch_date=self.today
+            )
+        except RuntimeError:
+            # AquaCrop can terminate before the requested branch date when the
+            # crop has already reached maturity. In that case there is no
+            # future irrigation decision left to optimize: every forecast
+            # member has the same already-realized final yield.
+            if not model._clock_struct.model_is_finished:
+                raise
+
+            self.crop_finished_before_today = True
+            self.today_idx = int(model._clock_struct.time_step_counter)
+            dates = _model_dates(model)
+            if 0 <= self.today_idx < len(dates):
+                self.finished_date = dates[self.today_idx]
+            elif dates:
+                self.finished_date = dates[-1]
+
+            self.ensemble_start_idx = self.today_idx
+            self.deterministic_steps = 0
+            self.branch_steps = 0
+            self._today_model = model
+            return
+
         self.ensemble_start_idx = _index_for_model_date(model, self.ensemble_start_date)
         self.deterministic_steps = self.ensemble_start_idx - self.today_idx
         if self.deterministic_steps < 0:
@@ -2486,6 +1825,17 @@ class AquaCropYieldBranchingEvaluator:
                 initialize_model=False,
                 process_outputs=False,
             )
+
+        if model._clock_struct.model_is_finished:
+            return _TwoLevelBranchState(
+                model=model,
+                branch_start_idx=int(model._clock_struct.time_step_counter),
+                branch_steps=0,
+                metric_start_idx=self.today_idx,
+                metric_steps=0,
+                branch_date=self.today,
+                crop_finished=True,
+            )
         current_idx = int(model._clock_struct.time_step_counter)
         if current_idx != self.ensemble_start_idx:
             raise RuntimeError(
@@ -2499,6 +1849,7 @@ class AquaCropYieldBranchingEvaluator:
             metric_start_idx=max(0, self.ensemble_start_idx - 1),
             metric_steps=self.branch_steps,
             branch_date=self.ensemble_start_date,
+            crop_finished=False
         )
 
     def evaluate(
@@ -2508,7 +1859,39 @@ class AquaCropYieldBranchingEvaluator:
         stress_threshold_ks: float = 0.98,
         stress_not_before: date | None = None,
     ) -> dict[int, YieldBranchMemberResult]:
+        if self.crop_finished_before_today:
+            dry_yield, _ = _extract_yield_branch_metrics(
+                self._today_model,
+                stress_threshold_ks=stress_threshold_ks,
+                stress_not_before=stress_not_before,
+            )
+            return {
+                member_id: YieldBranchMemberResult(
+                    member_id=member_id,
+                    dry_yield_t_ha=float(dry_yield),
+                    first_stress_date=None,
+                )
+                for member_id in self.member_ids
+            }
+
         candidate_state = self._candidate_state(candidate)
+        if candidate_state.crop_finished:
+            dry_yield, first_stress = _extract_yield_branch_metrics(
+                candidate_state.model,
+                stress_threshold_ks=stress_threshold_ks,
+                stress_not_before=stress_not_before,
+            )
+
+            return {
+                member_id: YieldBranchMemberResult(
+                    member_id=member_id,
+                    dry_yield_t_ha=float(dry_yield),
+                    first_stress_date=first_stress,
+                )
+                for member_id in self.member_ids
+            }
+
+
         n_workers = min(self.workers, mp.cpu_count(), len(self.member_ids))
         initargs = (
             candidate_state,
@@ -2539,497 +1922,3 @@ class AquaCropYieldBranchingEvaluator:
 
         return {row.member_id: row for row in rows}
 
-
-def evaluate_candidates_ensemble_branching_2level(
-    historical_forcing: DailyForcing,
-    arome_forcing: DailyForcing,
-    member_forcings: dict[int, DailyForcing],
-    parcel: ParcelConfig,
-    terrain: TerrainParams,
-    soil_profile: SoilProfile,
-    sim_start: date,
-    today: date,
-    candidates: list[IrrigationCandidate] | None = None,
-    workers: int | None = 3,
-    stress_threshold: float = 0.9,
-    arome_days: int = 2,
-) -> list[CandidateResult]:
-    """Evaluate candidates using two-level AquaCrop branching.
-
-    Pipeline:
-    1. Build full weather per member: historical + deterministic AROME + member.
-    2. Initialize one reference full-weather model and run sim_start -> today - 1.
-    3. For each candidate, add its full future schedule and run the shared
-       deterministic AROME window once: today -> today + arome_days - 1.
-    4. For each candidate × member, copy that candidate state, swap in the
-       member-specific internal weather array, run ensemble_start -> full_end,
-       and score the same final IFS horizon as the original evaluator.
-
-    This is a private-internals prototype.  Keep the original
-    evaluate_candidates_ensemble() available for equivalence checks.
-    """
-    if candidates is None:
-        candidates = build_candidates(parcel)
-
-    if not candidates or not member_forcings:
-        return []
-
-    crop = parcel_to_crop(parcel)
-    soil = soil_to_aquacrop(soil_profile, min_depth_m=crop.Zmax, extrapolate_below_profile=True)
-    iwc = InitialWaterContent(value=["FC"])
-
-    base_forcing = historical_forcing.concat(arome_forcing)
-    base_weather = forcing_to_weather(base_forcing, terrain, parcel.lat)
-
-    member_weathers: dict[int, pd.DataFrame] = {}
-    member_end_dates: dict[int, date] = {}
-
-    for member_id, member_forcing in member_forcings.items():
-        member_weather = forcing_to_weather(member_forcing, terrain, parcel.lat)
-        full_weather = (
-            pd.concat([base_weather, member_weather])
-            .drop_duplicates("Date", keep="first")
-            .sort_values("Date")
-            .reset_index(drop=True)
-        )
-        member_weathers[member_id] = full_weather
-        member_end_dates[member_id] = pd.Timestamp(member_forcing.dates[-1]).date()
-
-    metric_days = next(iter(member_forcings.values())).n_days
-    member_start_dates = {
-        member_id: pd.Timestamp(member_forcings[member_id].dates[0]).date()
-        for member_id in member_weathers
-    }
-    unique_member_start_dates = set(member_start_dates.values())
-    if len(unique_member_start_dates) != 1:
-        raise ValueError(
-            "Two-level branching requires all ensemble members to start on the same date. "
-            f"Got: {member_start_dates}"
-        )
-    ensemble_start_date = next(iter(unique_member_start_dates))
-    inferred_arome_days = (pd.Timestamp(ensemble_start_date) - pd.Timestamp(today).normalize()).days
-    if inferred_arome_days != arome_days:
-        logger.warning(
-            "arome_days=%d but first ensemble member date implies %d deterministic days "
-            "(%s -> %s). Using the member forcing date as source of truth.",
-            arome_days,
-            inferred_arome_days,
-            today,
-            ensemble_start_date,
-        )
-
-    max_dose = float(parcel.irrigation.get("max_dose_mm", 40.0))
-    member_ids = list(member_weathers.keys())
-    reference_member_id = member_ids[0]
-
-    # Initialize members once to get AquaCrop-prepared weather arrays.
-    member_future_weather = _prepare_member_future_weather(
-        member_weathers=member_weathers,
-        member_end_dates=member_end_dates,
-        parcel=parcel,
-        sim_start=sim_start,
-        soil=soil,
-        crop=crop,
-        iwc=iwc,
-    )
-
-    weather_ext, init_end_str, actual_sim_days = _prepare_aquacrop_init(
-        weather=member_weathers[reference_member_id],
-        crop=crop,
-        sim_start=sim_start,
-        sim_end=member_end_dates[reference_member_id],
-    )
-
-    reference_model = AquaCropModel(
-        sim_start_time=sim_start.strftime("%Y/%m/%d"),
-        sim_end_time=init_end_str,
-        weather_df=weather_ext,
-        soil=soil,
-        crop=crop,
-        initial_water_content=iwc,
-        irrigation_management=parcel_to_irrigation(parcel),
-    )
-
-    # Initialize reference before time-span compatibility check.
-    reference_model._initialize()
-    _assert_compatible_member_time_spans(reference_model, member_future_weather)
-
-    # Rebuild reference_model after the compatibility check because _initialize()
-    # above was only needed to inspect the time axis; _build_candidate_arome_states
-    # expects an unadvanced model and will initialize/advance it itself.
-    reference_model = AquaCropModel(
-        sim_start_time=sim_start.strftime("%Y/%m/%d"),
-        sim_end_time=init_end_str,
-        weather_df=weather_ext,
-        soil=soil,
-        crop=crop,
-        initial_water_content=iwc,
-        irrigation_management=parcel_to_irrigation(parcel),
-    )
-
-    candidate_states = _build_candidate_arome_states(
-        reference_model=reference_model,
-        candidates=candidates,
-        today=today,
-        sim_start=sim_start,
-        ensemble_start_date=ensemble_start_date,
-        metric_days=metric_days,
-        max_dose=max_dose,
-    )
-
-    jobs = [
-        (cand_idx, member_id) for cand_idx in range(len(candidates)) for member_id in member_ids
-    ]
-    n_jobs = len(jobs)
-
-    if workers is None or workers <= 0:
-        n_workers = min(mp.cpu_count(), n_jobs)
-    else:
-        n_workers = min(int(workers), mp.cpu_count(), n_jobs)
-
-    logger.info(
-        "Evaluating %d candidates × %d members = %d AquaCrop branches "
-        "(two-level branching, arome_days=%d, workers=%d)",
-        len(candidates),
-        len(member_ids),
-        n_jobs,
-        arome_days,
-        n_workers,
-    )
-
-    candidate_member_results: list[dict[int, tuple[float, int, float]]] = [{} for _ in candidates]
-
-    initargs = (
-        candidate_states,
-        member_future_weather,
-        candidates,
-        today,
-        max_dose,
-        stress_threshold,
-    )
-
-    if n_workers == 1:
-        _init_two_level_worker(*initargs)
-        iterator = map(_run_two_level_candidate_member_job, jobs)
-        for cand_idx, member_id, max_stress, n_days, cc_loss in iterator:
-            candidate_member_results[cand_idx][member_id] = (max_stress, n_days, cc_loss)
-    else:
-        # Prefer fork on WSL/Linux to avoid pickling many already-branched models.
-        mp_ctx = (
-            mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context()
-        )
-        chunksize = max(1, n_jobs // (n_workers * 8))
-
-        with mp_ctx.Pool(
-            processes=n_workers,
-            initializer=_init_two_level_worker,
-            initargs=initargs,
-        ) as pool:
-            for cand_idx, member_id, max_stress, n_days, cc_loss in pool.imap_unordered(
-                _run_two_level_candidate_member_job,
-                jobs,
-                chunksize=chunksize,
-            ):
-                candidate_member_results[cand_idx][member_id] = (max_stress, n_days, cc_loss)
-
-    results: list[CandidateResult] = []
-
-    for ci, candidate in enumerate(candidates):
-        rows = [candidate_member_results[ci][member_id] for member_id in member_ids]
-        member_max_stress = [row[0] for row in rows]
-        member_stress_days = [row[1] for row in rows]
-        member_yield_impact = [row[2] for row in rows]
-
-        arr_stress = np.asarray(member_max_stress, dtype=float)
-        arr_days = np.asarray(member_stress_days, dtype=float)
-
-        result = CandidateResult(
-            candidate=candidate,
-            member_max_stress=member_max_stress,
-            member_stress_days=member_stress_days,
-            member_yield_impact=member_yield_impact,
-            mean_max_stress=float(np.nanmean(arr_stress)),
-            median_max_stress=float(np.nanmedian(arr_stress)),
-            pct_members_avoid_stress=float(np.nanmean(arr_stress < (1.0 - stress_threshold))),
-            mean_stress_days=float(np.nanmean(arr_days)),
-        )
-        results.append(result)
-
-        logger.info(
-            "Candidate %d/%d '%s': mean_stress=%.3f, avoid_pct=%.0f%%, mean_stress_days=%.1f",
-            ci + 1,
-            len(candidates),
-            candidate.label,
-            result.mean_max_stress,
-            result.pct_members_avoid_stress * 100,
-            result.mean_stress_days,
-        )
-
-    results.sort(key=lambda r: (-r.pct_members_avoid_stress, r.mean_max_stress))
-    return results
-
-
-# Backward-compatible shorter alias for the private-internals prototype.
-evaluate_candidates_ensemble_branching = evaluate_candidates_ensemble_branching_2level
-
-
-def _evaluate_candidates_ensemble_full_reference_serial(
-    *,
-    historical_forcing: DailyForcing,
-    arome_forcing: DailyForcing,
-    member_forcings: dict[int, DailyForcing],
-    parcel: ParcelConfig,
-    terrain: TerrainParams,
-    soil_profile: SoilProfile,
-    sim_start: date,
-    today: date,
-    candidates: list[IrrigationCandidate],
-    stress_threshold: float,
-) -> list[CandidateResult]:
-    """Small, serial full-rerun reference implementation for validation only.
-
-    This intentionally avoids the older multiprocessing evaluator so that the
-    private-branching comparison is not affected by pool/stale-member bugs.
-    """
-    soil = soil_to_aquacrop(soil_profile)
-    crop = parcel_to_crop(parcel)
-    iwc = InitialWaterContent(value=["FC"])
-
-    base_forcing = historical_forcing.concat(arome_forcing)
-    base_weather = forcing_to_weather(base_forcing, terrain, parcel.lat)
-
-    member_weathers: dict[int, pd.DataFrame] = {}
-    member_end_dates: dict[int, date] = {}
-
-    for member_id, member_forcing in member_forcings.items():
-        member_weather = forcing_to_weather(member_forcing, terrain, parcel.lat)
-        full_weather = (
-            pd.concat([base_weather, member_weather])
-            .drop_duplicates("Date", keep="first")
-            .sort_values("Date")
-            .reset_index(drop=True)
-        )
-        member_weathers[member_id] = full_weather
-        member_end_dates[member_id] = pd.Timestamp(member_forcing.dates[-1]).date()
-
-    metric_days = next(iter(member_forcings.values())).n_days
-    member_ids = list(member_weathers)
-    results: list[CandidateResult] = []
-
-    for candidate in candidates:
-        member_max_stress: list[float] = []
-        member_stress_days: list[int] = []
-        member_yield_impact: list[float] = []
-
-        for member_id in member_ids:
-            irr_mgmt = _build_candidate_irrigation(parcel, candidate, today)
-            model = AquaCropModel(
-                sim_start_time=sim_start.strftime("%Y/%m/%d"),
-                sim_end_time=member_end_dates[member_id].strftime("%Y/%m/%d"),
-                weather_df=member_weathers[member_id],
-                soil=soil,
-                crop=crop,
-                initial_water_content=iwc,
-                irrigation_management=irr_mgmt,
-            )
-            model.run_model(till_termination=True)
-
-            cg = model.get_crop_growth()
-            wf = model.get_water_flux()
-
-            n_total = min(len(cg), len(wf))
-            if n_total > 1 and cg["dap"].iloc[n_total - 1] == 0:
-                n_total -= 1
-
-            fc_start = max(0, n_total - metric_days)
-            tr = wf["Tr"].values[fc_start:n_total]
-            tr_pot = wf["TrPot"].values[fc_start:n_total]
-            ks = np.where(tr_pot > 0.01, tr / tr_pot, 1.0)
-
-            max_stress = float(1.0 - np.nanmin(ks)) if len(ks) else 0.0
-            n_stress_days = int((ks < stress_threshold).sum())
-            cc_loss = float(
-                (
-                    cg["canopy_cover_ns"].values[fc_start:n_total]
-                    - cg["canopy_cover"].values[fc_start:n_total]
-                ).mean()
-            )
-
-            member_max_stress.append(max_stress)
-            member_stress_days.append(n_stress_days)
-            member_yield_impact.append(cc_loss)
-
-        arr_stress = np.asarray(member_max_stress, dtype=float)
-        arr_days = np.asarray(member_stress_days, dtype=float)
-        results.append(
-            CandidateResult(
-                candidate=candidate,
-                member_max_stress=member_max_stress,
-                member_stress_days=member_stress_days,
-                member_yield_impact=member_yield_impact,
-                mean_max_stress=float(np.nanmean(arr_stress)),
-                median_max_stress=float(np.nanmedian(arr_stress)),
-                pct_members_avoid_stress=float(np.nanmean(arr_stress < (1.0 - stress_threshold))),
-                mean_stress_days=float(np.nanmean(arr_days)),
-            )
-        )
-
-    results.sort(key=lambda r: (-r.pct_members_avoid_stress, r.mean_max_stress))
-    return results
-
-
-def compare_full_vs_branching_2level_on_subset(
-    *,
-    historical_forcing: DailyForcing,
-    arome_forcing: DailyForcing,
-    member_forcings: dict[int, DailyForcing],
-    parcel: ParcelConfig,
-    terrain: TerrainParams,
-    soil_profile: SoilProfile,
-    sim_start: date,
-    today: date,
-    candidates: list[IrrigationCandidate],
-    n_candidates: int = 10,
-    n_members: int = 5,
-    stress_threshold: float = 0.9,
-    arome_days: int = 2,
-) -> pd.DataFrame:
-    """Compare original full-rerun evaluator with two-level branching.
-
-    Use this before making evaluate_candidates_ensemble_branching_2level the
-    default path in the pipeline.
-    """
-    sample_candidates = candidates[:n_candidates]
-    sample_member_ids = list(member_forcings)[:n_members]
-    sample_member_forcings = {
-        member_id: member_forcings[member_id] for member_id in sample_member_ids
-    }
-
-    full_results = _evaluate_candidates_ensemble_full_reference_serial(
-        historical_forcing=historical_forcing,
-        arome_forcing=arome_forcing,
-        member_forcings=sample_member_forcings,
-        parcel=parcel,
-        terrain=terrain,
-        soil_profile=soil_profile,
-        sim_start=sim_start,
-        today=today,
-        candidates=sample_candidates,
-        stress_threshold=stress_threshold,
-    )
-
-    branch_results = evaluate_candidates_ensemble_branching_2level(
-        historical_forcing=historical_forcing,
-        arome_forcing=arome_forcing,
-        member_forcings=sample_member_forcings,
-        parcel=parcel,
-        terrain=terrain,
-        soil_profile=soil_profile,
-        sim_start=sim_start,
-        today=today,
-        candidates=sample_candidates,
-        workers=1,
-        stress_threshold=stress_threshold,
-        arome_days=arome_days,
-    )
-
-    full_by_label = {result.candidate.label: result for result in full_results}
-    branch_by_label = {result.candidate.label: result for result in branch_results}
-
-    rows = []
-    for label in sorted(set(full_by_label) & set(branch_by_label)):
-        full = full_by_label[label]
-        branch = branch_by_label[label]
-        rows.append(
-            {
-                "candidate": label,
-                "full_mean_max_stress": full.mean_max_stress,
-                "branch_mean_max_stress": branch.mean_max_stress,
-                "abs_delta_mean_max_stress": abs(full.mean_max_stress - branch.mean_max_stress),
-                "full_mean_stress_days": full.mean_stress_days,
-                "branch_mean_stress_days": branch.mean_stress_days,
-                "abs_delta_mean_stress_days": abs(full.mean_stress_days - branch.mean_stress_days),
-                "full_avoid_pct": full.pct_members_avoid_stress,
-                "branch_avoid_pct": branch.pct_members_avoid_stress,
-                "abs_delta_avoid_pct": abs(
-                    full.pct_members_avoid_stress - branch.pct_members_avoid_stress
-                ),
-            }
-        )
-
-    return pd.DataFrame(rows).sort_values("abs_delta_mean_max_stress", ascending=False)
-
-
-def recommend_from_optimizer(
-    results: list[CandidateResult],
-    water_cost_eur_mm: float = 2.5,
-    top_x: int = 1,
-) -> list[dict]:
-    """Pick the best irrigation action from optimizer results.
-
-    Selection logic:
-    1. If no-irrigation already avoids stress in >80% of members → don't irrigate
-    2. Otherwise, pick the cheapest action that avoids stress in >70% of members
-       (cheapest = lowest total water, then fewest events)
-    3. If no action avoids stress in >70%, pick the one that minimizes mean stress
-
-    Returns a dict with the recommendation and comparison.
-    """
-    no_irr = next((r for r in results if r.candidate.is_rainfed), None)
-
-    if no_irr and no_irr.pct_members_avoid_stress > 0.80:
-        return [
-            {
-                "action": "No irrigation needed",
-                "reason": f"{no_irr.pct_members_avoid_stress:.0%} of members avoid stress without irrigation",
-                "candidate": no_irr.candidate,
-                "avoid_stress_pct": no_irr.pct_members_avoid_stress,
-                "mean_stress_days": no_irr.mean_stress_days,
-                "all_results": results,
-            }
-        ]
-
-    # Find cheapest action that avoids stress in >70% of members
-    good = [r for r in results if r.pct_members_avoid_stress > 0.70 and not r.candidate.is_rainfed]
-    if good:
-        # Sort by total water (cheapest), then fewest events, then earliest start
-        good.sort(
-            key=lambda r: (r.candidate.total_mm, r.candidate.n_events, r.candidate.day_offset)
-        )
-        best_results = good[:top_x]
-        no_irr_days = no_irr.mean_stress_days if no_irr else float("nan")
-        return [
-            {
-                "action": best.candidate.label,
-                "reason": (
-                    f"{best.pct_members_avoid_stress:.0%} of members avoid stress. "
-                    f"Mean stress days: {best.mean_stress_days:.1f} vs "
-                    f"{no_irr_days:.1f} without irrigation"
-                ),
-                "candidate": best.candidate,
-                "avoid_stress_pct": best.pct_members_avoid_stress,
-                "mean_stress_days": best.mean_stress_days,
-                "cost_eur_ha": best.candidate.total_mm * water_cost_eur_mm,
-                "all_results": results,
-            }
-            for best in best_results
-        ]
-
-    # Nothing avoids stress well — pick action that minimizes stress
-    top_results = results[:top_x]
-
-    return [
-        {
-            "action": f"{best.candidate.label} (limited benefit)",
-            "reason": (
-                f"No action avoids stress in >70% of members. Best option: "
-                f"{best.pct_members_avoid_stress:.0%} avoid stress, "
-                f"mean {best.mean_stress_days:.1f} stress days"
-            ),
-            "candidate": best.candidate,
-            "avoid_stress_pct": best.pct_members_avoid_stress,
-            "mean_stress_days": best.mean_stress_days,
-            "all_results": results,
-        }
-        for best in top_results
-    ]

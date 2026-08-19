@@ -883,11 +883,7 @@ def optimize_operational_irrigation(
     expected_harvest = _expected_harvest(parcel)
 
     # First check that enough forecast weather exists to cover the crop season.
-    if (
-        require_harvest_horizon
-        and expected_harvest is not None
-        and sim_end < expected_harvest
-    ):
+    if require_harvest_horizon and expected_harvest is not None and sim_end < expected_harvest:
         raise ValueError(
             f"Yield optimization needs weather through expected harvest {expected_harvest}, "
             f"but the common forecast horizon ends {sim_end}. Extend IFS members with the "

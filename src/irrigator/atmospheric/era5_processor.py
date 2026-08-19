@@ -145,7 +145,8 @@ def process_era5_to_daily(ds: xr.Dataset, shift_utc: int = 0) -> xr.Dataset:
     # Trim edges: the 00UTC shift creates a spurious first date (day before data start)
     # and leaves NaN on the last date (no next-day 00UTC available)
     valid_start = ds.valid_time.values[0].astype("datetime64[D]")
-    valid_end = ds.valid_time.values[-1].astype("datetime64[D]") - np.timedelta64(1, "D")
+    valid_end = ds.valid_time.values[-1].astype("datetime64[D]") #- np.timedelta64(1, "D")
+    print(valid_end)
     result = result.sel(valid_time=slice(str(valid_start), str(valid_end)))
 
     logger.info(
@@ -173,7 +174,8 @@ def save_daily(ds: xr.Dataset, processed_dir: str | Path = DEFAULT_PROCESSED_DIR
     processed_dir = Path(processed_dir)
     out_dir = processed_dir / "atmospheric"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "era5_daily.nc"
+    year = str(ds.valid_time[0].dt.year.values)
+    out_path = out_dir / f"era5_daily_{year}.nc"
 
     encoding = {v: {"zlib": True, "complevel": 4} for v in ds.data_vars}
     ds.to_netcdf(out_path, encoding=encoding)
@@ -182,15 +184,16 @@ def save_daily(ds: xr.Dataset, processed_dir: str | Path = DEFAULT_PROCESSED_DIR
     return out_path
 
 
-def load_daily(processed_dir: str | Path = DEFAULT_PROCESSED_DIR) -> xr.Dataset:
+def load_daily(processed_dir: str | Path = DEFAULT_PROCESSED_DIR, year: int = 2025) -> xr.Dataset:
     """Load previously saved daily ERA5-Land data.
 
     Parameters
     ----------
     processed_dir : directory containing atmospheric/era5_daily.nc
+    year : year for which to load data
     """
     processed_dir = Path(processed_dir)
-    path = processed_dir / "atmospheric" / "era5_daily.nc"
+    path = processed_dir / "atmospheric" / f"era5_daily_{year}.nc"
     if not path.exists():
         raise FileNotFoundError(
             f"Daily ERA5-Land not found: {path}\nRun process_era5_to_daily first."

@@ -68,8 +68,8 @@ crop:
   type: "grain_maize"
 
   # CRITICAL: farmer must provide these
-  planting_date: "2026-04-06"
-  expected_harvest: "2026-10-05"  # approximate, helps define season bounds
+  planting_date: "2025-04-06"
+  expected_harvest: "2025-10-05"  # approximate, helps define season bounds
 
   # Variety and maturity group (Arvalis index)
   variety: "P0710"
@@ -111,16 +111,6 @@ irrigation:
   # =============================================================================
 # Irrigation history
 # =============================================================================
-irrigation_log:
-  - date: "2026-05-15"
-    amount_mm: 10
-    source: "farmer"  # farmer | model_recommendation | probe_triggered
-  - date: "2026-06-01"
-    amount_mm: 10
-  - date: "2026-06-14"
-    amount_mm: 10
-
-
 
 
 

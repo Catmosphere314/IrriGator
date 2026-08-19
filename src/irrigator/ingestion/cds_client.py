@@ -68,10 +68,26 @@ ERA5_LAND_VALIDATION_VARIABLES = [
     "volumetric_soil_water_layer_4",  # 100-289 cm
 ]
 
+ERA5_MONTH_VARIABLES=[
+    "2m_dewpoint_temperature",
+        "2m_temperature",
+        "mean_sea_level_pressure",
+        "total_precipitation",
+        "10m_wind_speed",
+        "surface_solar_radiation_downwards",
+        "evaporation"]
+
 # SEAS5 variables
 SEAS5_VARIABLES = [
     "2m_temperature",
+    "minimum_2m_temperature_in_the_last_24_hours",
+    "maximum_2m_temperature_in_the_last_24_hours",
+    "2m_dewpoint_temperature",
+    "10m_wind_speed",
+    "surface_solar_radiation_downwards",
     "total_precipitation",
+    "evaporation",
+    "mean_sea_level_pressure",
 ]
 
 
@@ -167,6 +183,7 @@ def fetch_era5_land_month(
     else:
         last_day = date(year, month + 1, 1) - timedelta(days=1)
     days = [f"{d:02d}" for d in range(1, last_day.day + 1)]
+    print(days)
 
 
     request = {
@@ -289,6 +306,65 @@ def open_era5_land(
     ds = xr.open_mfdataset(files, chunks={"time": 24}, combine="by_coords")
     return ds
 
+# ---------------------------------------------------------------------------
+# ERA5 - Month 0.25
+# ---------------------------------------------------------------------------
+
+
+def _era5_month_output_path(raw_dir: Path, year_min: int, year_max: int) -> Path:
+    """Consistent file naming: era5land_YYYY_MM.nc"""
+    out_dir = raw_dir / "era5_candidates"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    return out_dir / f"era5land_{year_min:04d}_{year_max:04d}.nc"
+
+
+def fetch_era5_month(
+    year_min: int,
+    year_max: int,
+    *,
+    raw_dir: str | Path = DEFAULT_RAW_DIR,
+) -> Path:
+    """Download the history of ERA5 monthly averages.
+
+    Parameters
+    ----------
+    year_min, year_max : target period
+    raw_dir : output directory for ERA5 downloads
+
+    Returns
+    -------
+    Path to the downloaded NetCDF file.
+    """
+    raw_dir = Path(raw_dir)
+    out_path = _era5_month_output_path(raw_dir, year_min, year_max)
+
+
+    request = {
+        "variable": list(ERA5_MONTH_VARIABLES),
+        "year": list(range(year_min, year_max+1)),
+        "month": [
+        "01", "02", "03",
+        "04", "05", "06",
+        "07", "08", "09",
+        "10", "11", "12"
+    ],
+        "time": ["00:00"],
+        "area": [60, -20, 40, 20],
+        "data_format": "netcdf",
+        "download_format": "unarchived",
+    }
+
+   
+
+    logger.info("Requesting ERA5-Land %04d-%02d from CDS...", year_min, year_max)
+    client = _init_cds_client()
+    client.retrieve("reanalysis-era5-single-levels-monthly-means", request, str(out_path))
+    logger.info("Downloaded: %s (%.1f MB)", out_path, out_path.stat().st_size / 1e6)
+
+    return out_path
+
+
 
 # ---------------------------------------------------------------------------
 # SEAS5
@@ -350,6 +426,41 @@ def fetch_seas5(
     logger.info("Downloaded: %s (%.1f MB)", out_path, out_path.stat().st_size / 1e6)
 
     return out_path
+
+
+
+
+
+def fetch_seas5_hindcasts(
+    init_month: int,
+    *,
+    start_year: int = 1993,
+    end_year: int = 2016,
+    bounding_box: BBoxWGS84 = FRANCE_BBOX,
+    raw_dir: str | Path = DEFAULT_RAW_DIR,
+    overwrite: bool = False,
+) -> list[Path]:
+    """Download the SEAS5 retrospective initializations for one calendar month.
+
+    C3S serves 1993-2016 as hindcasts for the seasonal monthly dataset.  The
+    resulting local archive is used to estimate the lead-dependent SEAS5 model
+    climatology required for first-order bias correction.
+
+    This is intentionally explicit rather than hidden inside the correction
+    routine because it may download a substantial amount of data.
+    """
+    paths: list[Path] = []
+    for year in range(start_year, end_year + 1):
+        paths.append(
+            fetch_seas5(
+                year=year,
+                month=init_month,
+                bounding_box=bounding_box,
+                raw_dir=raw_dir,
+                overwrite=overwrite,
+            )
+        )
+    return paths
 
 
 def open_seas5(raw_dir: str | Path = DEFAULT_RAW_DIR, *, year: int, month: int) -> xr.Dataset:

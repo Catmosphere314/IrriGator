@@ -1261,6 +1261,40 @@ class IrrigationCandidate:
         return self.total_mm
 
 
+def _build_candidate_irrigation(
+    parcel: ParcelConfig,
+    candidate: IrrigationCandidate,
+    today: date,
+) -> IrrigationManagement:
+    """Build AquaCrop IrrigationManagement from parcel log + candidate events."""
+    base = parcel_to_irrigation(parcel)
+    max_dose = parcel.irrigation.get("max_dose_mm", 40.0)
+
+    if candidate.is_rainfed:
+        return base
+
+    extra_rows = []
+    for day_offset, dose_mm in candidate.events:
+        if dose_mm > 0 and day_offset >= 0:
+            event_date = today + pd.Timedelta(days=day_offset)
+            extra_rows.append({"Date": pd.Timestamp(event_date), "Depth": dose_mm})
+
+    if not extra_rows:
+        return base
+
+    extra = pd.DataFrame(extra_rows)
+
+    if base.irrigation_method == 3:
+        combined = (
+            pd.concat([base.Schedule, extra], ignore_index=True)
+            .sort_values("Date")
+            .reset_index(drop=True)
+        )
+        return IrrigationManagement(irrigation_method=3, Schedule=combined, MaxIrr=max_dose)
+    else:
+        return IrrigationManagement(irrigation_method=3, Schedule=extra, MaxIrr=max_dose)
+
+
 # ---------------------------------------------------------------------------
 # Two-level private-internals candidate evaluator
 # ---------------------------------------------------------------------------

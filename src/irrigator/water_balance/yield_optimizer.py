@@ -870,17 +870,44 @@ def optimize_operational_irrigation(
         raise ValueError("max_events must be >= 1.")
 
     base_forcing = historical_forcing.concat(arome_forcing)
-    common_end = _end_date_from_forcings(base_forcing, future_member_forcings)
+
+    # Maximum date supported by every forecast member.
+    common_end = _end_date_from_forcings(
+        base_forcing,
+        future_member_forcings,
+    )
+
+    # User-requested horizon, constrained by available weather.
     sim_end = common_end if sim_end is None else min(sim_end, common_end)
 
     expected_harvest = _expected_harvest(parcel)
-    if require_harvest_horizon and expected_harvest is not None and sim_end < expected_harvest:
+
+    # First check that enough forecast weather exists to cover the crop season.
+    if (
+        require_harvest_horizon
+        and expected_harvest is not None
+        and sim_end < expected_harvest
+    ):
         raise ValueError(
             f"Yield optimization needs weather through expected harvest {expected_harvest}, "
             f"but the common forecast horizon ends {sim_end}. Extend IFS members with the "
             "SEAS5-conditioned scenarios first (or set require_harvest_horizon=False for a "
             "diagnostic partial-horizon run)."
         )
+
+    # There is no reason to optimize beyond the configured harvest date.
+    if expected_harvest is not None:
+        sim_end = min(sim_end, expected_harvest)
+
+    # Truncate IFS+SEAS5 scenarios to the useful crop horizon.
+    # This also keeps the fast branching evaluator active because member_end == sim_end.
+    future_member_forcings = {
+        member: forcing.slice(
+            start=pd.Timestamp(forcing.dates[0]).date(),
+            end=sim_end,
+        )
+        for member, forcing in future_member_forcings.items()
+    }
 
     min_interval = int(parcel.irrigation.get("min_interval_days", 3))
     min_dose = float(parcel.irrigation.get("min_dose_mm", 0.0))

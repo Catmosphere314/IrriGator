@@ -508,6 +508,13 @@ def _crop_overrides_from_config(crop_cfg: dict[str, Any]) -> dict[str, Any]:
         overrides.setdefault("Senescence", round(0.85 * overrides["Maturity"]))
         overrides.setdefault("MaxRooting", overrides["Senescence"])
 
+    rooting = crop_cfg.get("rooting_depth") or {}
+
+    if rooting.get("at_emergence_m") is not None:
+        overrides["Zmin"] = float(rooting["at_emergence_m"])
+
+    if rooting.get("max_m") is not None:
+        overrides["Zmax"] = float(rooting["max_m"])
     # 3. Plant population.
     overrides["PlantPop"] = _plants_per_ha(crop_cfg)
 

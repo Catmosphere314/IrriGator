@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_RAW_DIR = Path("data/raw")
+DEFAULT_STATIC_DIR = Path("data/static")
 DEFAULT_PROCESSED_DIR = Path("data/processed")
 
 # ---------------------------------------------------------------------------
@@ -61,7 +62,7 @@ ERA5_LAND_VARIABLES = [
 ]
 
 # Additional ERA5-Land variables for soil moisture validation
-ERA5_LAND_VALIDATION_VARIABLES = [
+ERA5_LAND_SOIL_VARIABLES = [
     "volumetric_soil_water_layer_1",  # 0-7 cm
     "volumetric_soil_water_layer_2",  # 7-28 cm
     "volumetric_soil_water_layer_3",  # 28-100 cm

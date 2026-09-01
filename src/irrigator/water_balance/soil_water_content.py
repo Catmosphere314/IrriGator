@@ -3,7 +3,7 @@ import pandas as pd
 
 
 from irrigator.static_layers.soil import SoilProfile
-from irrigator.static_layers.terrain import ParcelConfig
+from irrigator.config import ParcelConfig
 from irrigator.ingestion.cds_client import (
     DEFAULT_STATIC_DIR,
     DEFAULT_RAW_DIR,
@@ -19,7 +19,6 @@ from datetime import date
 from pathlib import Path
 import xarray as xr
 import numpy as np
-from irrigator.static_layers.soil import SoilProfile
 
 logger = logging.getLogger(__name__)
 

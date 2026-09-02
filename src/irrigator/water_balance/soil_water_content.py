@@ -57,6 +57,18 @@ ERA5_SOIL_HYDRAULICS = {
 
 
 
+def cast_longitude(ds, lon_name="longitude"):
+    """Convert longitude from [0, 360) to [-180, 180) if necessary."""
+    lon = ds[lon_name]
+
+    # Only recast if longitude values extend beyond 180°
+    if lon.max().item() > 180:
+        new_lon = ((lon + 180) % 360) - 180
+
+        ds = ds.assign_coords({lon_name: new_lon}).sortby(lon_name)
+
+    return ds
+
 def extract_and_remove_zip(zip_path):
     """Extracts a ZIP file and removes the original ZIP file.
     
@@ -209,7 +221,6 @@ def open_era5_soil_water(folder):
     layers = []
 
     for path in sorted(folder.glob("*.nc")):
-        print(path)
         ds = xr.open_dataset(path)
 
         # Find which soil-water variable is present
@@ -423,6 +434,7 @@ def get_era5_soil_type(
         )
 
     with xr.open_dataset(static_soil_file) as era5_static_soil:
+        era5_static_soil = cast_longitude(era5_static_soil, lon_name="longitude")
         soil_type = (
             era5_static_soil["slt"]
             .sel(

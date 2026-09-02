@@ -1,5 +1,10 @@
 import logging
 import pandas as pd
+from datetime import date
+from pathlib import Path
+import xarray as xr
+import numpy as np
+import zipfile
 
 
 from irrigator.static_layers.soil import SoilProfile
@@ -15,20 +20,10 @@ from irrigator.ingestion.cds_client import (
     FRANCE_BBOX,
     BBoxWGS84,
 )
-from datetime import date
-from pathlib import Path
-import xarray as xr
-import numpy as np
+
 
 logger = logging.getLogger(__name__)
 
-ERA5_SOIL_DEPTHS = pd.DataFrame(
-    {"depth_min": [0.0, 0.07, 0.28, 1.0], "depth_max": [0.07, 0.28, 1.0, 2.89]}
-)  # in meters
-
-DEFAULT_SOIL_DEPTHS = pd.DataFrame(
-    {"depth_min": [i/10 for i in range(20)], "depth_max": [i/10 for i in range(1, 21)]}
-)  # in meters
 
 SOIL_LAYERS = {
     "swvl1": {
@@ -62,8 +57,6 @@ ERA5_SOIL_HYDRAULICS = {
     6: {"name": "organic", "theta_s": 0.766, "theta_fc": 0.663, "theta_wp": 0.267},
 }
 
-from pathlib import Path
-import zipfile
 
 
 def extract_and_remove_zip(zip_path):
@@ -120,7 +113,7 @@ def fetch_era5_land_soil(
     overwrite: bool = False,
     force_cds_refresh: bool = False,
 ) -> Path:
-    """Download one month of hourly ERA5-Land data.
+    """Download daily-mean ERA5-Land soil moisture for one date.
 
     Parameters
     ----------
@@ -440,7 +433,15 @@ def get_era5_soil_type(
         method="nearest",
     ).item()
 
-    return int(soil_type)
+    soil_type = int(round(float(soil_type)))
+
+    if soil_type not in ERA5_SOIL_HYDRAULICS:
+        raise ValueError(
+            f"Unsupported ERA5-Land soil type {soil_type} "
+            f"at ({lat:.4f}, {lon:.4f})"
+        )
+
+    return soil_type
 
 
 
@@ -473,14 +474,14 @@ def process_era5_soil(
     return processed_file_path
 
 
-def build_initial_water_content_from_era5_land(
+def build_initial_soil_water_profile_from_era5_land(
     soil_profile: SoilProfile,
     parcel_profile: ParcelConfig,
     date: date,
     processed_dir: Path = DEFAULT_PROCESSED_DIR,
     raw_dir: Path = DEFAULT_RAW_DIR,
     static_dir: Path = DEFAULT_STATIC_DIR,
-):
+) -> xr.Dataset:
     # Load daily ERA5-Land moisture
     soil_file = (
         Path(processed_dir)
@@ -535,19 +536,36 @@ def build_initial_water_content_from_era5_land(
     smi_profile = remap_era5_layers_to_profile(
         era5_smi,
         soil_profile,
+        name="relative_wetness",
     )
 
     theta_wp = xr.DataArray(
         np.asarray(soil_profile.theta_wp, dtype=float),
         dims="profile_layer",
+        coords={"profile_layer": smi_profile["profile_layer"]},
     )
 
     theta_fc = xr.DataArray(
         np.asarray(soil_profile.theta_fc, dtype=float),
         dims="profile_layer",
+        coords={"profile_layer": smi_profile["profile_layer"]},
     )
 
     theta_initial = theta_wp + smi_profile * (theta_fc - theta_wp)
+    theta_initial.name = "theta_initial"
+    theta_initial.attrs.update(
+        {
+            "long_name": "Initial volumetric soil water content",
+            "units": "m3 m-3",
+        }
+    )
+
+    smi_profile.attrs.update(
+        {
+            "long_name": "ERA5-Land relative plant-available soil water",
+            "units": "1",
+        }
+    )
 
     return xr.Dataset(
         {

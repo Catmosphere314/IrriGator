@@ -15,8 +15,6 @@ from irrigator.ingestion.cds_client import (
     DEFAULT_PROCESSED_DIR,
     ERA5_LAND_SOIL_VARIABLES,
     _init_cds_client,
-    _era5_output_path,
-    monthrange,
     FRANCE_BBOX,
     BBoxWGS84,
 )
@@ -165,11 +163,10 @@ def fetch_era5_static_soil(
     overwrite: bool = False,
     force_cds_refresh: bool = False,
 ) -> Path:
-    """Download one month of hourly ERA5-Land data.
+    """Download static ERA5-Land data.
 
     Parameters
     ----------
-    year, month, day : target period
     bounding_box : spatial extent (default: France metropolitan)
     static_dir : output directory for ERA5 downloads
     overwrite : re-download even if file exists
@@ -290,8 +287,8 @@ def remap_era5_layers_to_profile(
 
     Returns
     -------
-    xr.Dataset
-        Dataset containing ``soil_water`` remapped onto ``profile_layer``.
+    xr.DataArray
+        DataArray containing ``name`` remapped onto ``profile_layer``.
     """
     
     da = data
@@ -425,13 +422,16 @@ def get_era5_soil_type(
             static_dir=static_dir,
         )
 
-    era5_static_soil = xr.open_dataset(static_soil_file)
-
-    soil_type = era5_static_soil["slt"].sel(
-        latitude=lat,
-        longitude=lon,
-        method="nearest",
-    ).item()
+    with xr.open_dataset(static_soil_file) as era5_static_soil:
+        soil_type = (
+            era5_static_soil["slt"]
+            .sel(
+                latitude=lat,
+                longitude=lon,
+                method="nearest",
+            )
+            .item()
+        )
 
     soil_type = int(round(float(soil_type)))
 
@@ -502,16 +502,21 @@ def build_initial_soil_water_profile_from_era5_land(
             processed_dir=processed_dir,
         )
 
-    era5_soil = xr.open_dataset(soil_file)
 
     lat = parcel_profile.lat
     lon = parcel_profile.lon
 
-    parcel_soil = era5_soil.sel(
-        latitude=lat,
-        longitude=lon,
-        method="nearest",
-    )
+    with xr.open_dataset(soil_file) as era5_soil:
+        parcel_soil = era5_soil.sel(
+            latitude=lat,
+            longitude=lon,
+            method="nearest",
+        )
+
+        if "valid_time" in parcel_soil.dims:
+            parcel_soil = parcel_soil.mean("valid_time")
+
+        parcel_soil = parcel_soil.load()
 
     # Ideally average over the requested day if valid_time remains hourly.
     if "valid_time" in parcel_soil.dims:

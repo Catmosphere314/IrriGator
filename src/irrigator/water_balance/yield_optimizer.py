@@ -33,6 +33,7 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
+import xarray as xr
 
 from irrigator.atmospheric.forcing import DailyForcing
 from irrigator.config import ParcelConfig
@@ -261,6 +262,7 @@ def _init_yield_worker(
     sim_start: date,
     sim_end: date,
     anchor: date,
+    initial_soil_water_profile: xr.Dataset | None = None,
 ) -> None:
     _YIELD_WORKER_CTX.clear()
     _YIELD_WORKER_CTX.update(
@@ -273,6 +275,7 @@ def _init_yield_worker(
             "sim_start": sim_start,
             "sim_end": sim_end,
             "anchor": anchor,
+            "initial_soil_water_profile": initial_soil_water_profile,
         }
     )
 
@@ -296,6 +299,7 @@ def _yield_worker(
         sim_start=ctx["sim_start"],  # type: ignore[arg-type]
         sim_end=ctx["sim_end"],  # type: ignore[arg-type]
         irrigation_management=irrigation,
+        initial_soil_water_profile=ctx["initial_soil_water_profile"],  # type: ignore[arg-type]
     )
     return (
         int(member),
@@ -322,6 +326,7 @@ class _YieldEvaluator:
         sim_start: date,
         sim_end: date,
         anchor: date,
+        initial_soil_water_profile: xr.Dataset | None = None,
         n_workers: int = 1,
         branching_historical_forcing: DailyForcing | None = None,
         branching_arome_forcing: DailyForcing | None = None,
@@ -334,6 +339,7 @@ class _YieldEvaluator:
         self.sim_start = sim_start
         self.sim_end = sim_end
         self.anchor = anchor
+        self.initial_soil_water_profile = initial_soil_water_profile
         self.n_workers = max(1, int(n_workers))
         self.cache: dict[tuple, YieldScheduleEvaluation] = {}
         self.pool: mp.pool.Pool | None = None
@@ -366,6 +372,7 @@ class _YieldEvaluator:
                     terrain=terrain,
                     soil_profile=soil_profile,
                     sim_start=sim_start,
+                    initial_soil_water_profile=initial_soil_water_profile,
                     today=anchor,
                     workers=self.n_workers,
                 )
@@ -384,6 +391,7 @@ class _YieldEvaluator:
                     sim_start,
                     sim_end,
                     anchor,
+                    self.initial_soil_water_profile,
                 ),
             )
 
@@ -457,6 +465,7 @@ class _YieldEvaluator:
                         sim_start=self.sim_start,
                         sim_end=self.sim_end,
                         irrigation_management=irrigation,
+                        initial_soil_water_profile=self.initial_soil_water_profile
                     )
                     outputs.append(
                         (
@@ -479,6 +488,7 @@ class _YieldEvaluator:
                 sim_start=self.sim_start,
                 sim_end=self.sim_end,
                 irrigation_management=irrigation,
+                initial_soil_water_profile=self.initial_soil_water_profile,
             )
             outputs = [
                 (
@@ -721,6 +731,7 @@ def optimize_historical_irrigation_amounts(
     sim_start: date,
     *,
     sim_end: date | None = None,
+    initial_soil_water_profile: xr.Dataset | None = None,
     future_member_forcings: dict[int, DailyForcing] | None = None,
     shared_future_events: list[tuple[date, float]] | None = None,
     constraint: YieldConstraint = YieldConstraint(
@@ -768,6 +779,7 @@ def optimize_historical_irrigation_amounts(
         sim_start=sim_start,
         sim_end=sim_end,
         anchor=anchor,
+        initial_soil_water_profile=initial_soil_water_profile,
         n_workers=n_workers,
     ) as evaluator:
         reference_eval = evaluator.evaluate(
@@ -853,6 +865,7 @@ def optimize_operational_irrigation(
     max_events: int = 8,
     n_workers: int = 1,
     require_harvest_horizon: bool = True,
+    initial_soil_water_profile: xr.Dataset | None = None,
 ) -> OperationalOptimizationResult:
     """Find a sparse, yield-preserving forecast irrigation plan.
 
@@ -923,6 +936,7 @@ def optimize_operational_irrigation(
         n_workers=n_workers,
         branching_historical_forcing=historical_forcing,
         branching_arome_forcing=arome_forcing,
+        initial_soil_water_profile=initial_soil_water_profile,
     ) as evaluator:
         no_candidate = IrrigationCandidate(events=[], label="No future irrigation")
         no_eval = evaluator.evaluate(

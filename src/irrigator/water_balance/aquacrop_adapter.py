@@ -23,6 +23,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import multiprocessing as mp
+import xarray as xr
 
 from aquacrop import (
     AquaCropModel,
@@ -581,6 +582,129 @@ def parcel_to_irrigation(parcel: ParcelConfig) -> IrrigationManagement:
     )
 
 
+
+def soil_water_profile_to_aquacrop_iwc(
+    soil_water_profile: xr.Dataset,
+    aquacrop_soil: Soil,
+) -> InitialWaterContent:
+    """Convert an IrriGator initial soil-water profile to AquaCrop IWC.
+
+    ``soil_water_profile`` is the output of
+    build_initial_soil_water_profile_from_era5_land().
+
+    Its theta_initial values are layer means over the original SoilProfile
+    horizons. They are remapped by depth overlap onto AquaCrop's numerical
+    compartments, then supplied at the exact compartment midpoints.
+    """
+    if "theta_initial" not in soil_water_profile:
+        raise ValueError("soil_water_profile must contain 'theta_initial'.")
+
+    for coord in ("depth_top_cm", "depth_bottom_cm"):
+        if coord not in soil_water_profile.coords:
+            raise ValueError(f"soil_water_profile is missing {coord!r}.")
+
+    theta = np.asarray(
+        soil_water_profile["theta_initial"].values,
+        dtype=float,
+    )
+
+    src_top = (
+        np.asarray(
+            soil_water_profile["depth_top_cm"].values,
+            dtype=float,
+        )
+        / 100.0
+    )
+
+    src_bottom = (
+        np.asarray(
+            soil_water_profile["depth_bottom_cm"].values,
+            dtype=float,
+        )
+        / 100.0
+    )
+
+    if theta.ndim != 1:
+        raise ValueError("theta_initial must be one-dimensional over profile_layer.")
+
+    if not (len(theta) == len(src_top) == len(src_bottom)):
+        raise ValueError("theta_initial and depth coordinates have incompatible lengths.")
+
+    if not np.all(np.isfinite(theta)):
+        raise ValueError("theta_initial contains non-finite values.")
+
+    # AquaCrop numerical compartments.
+    prof = aquacrop_soil.profile
+
+    comp_top = prof["z_top"].to_numpy(dtype=float)
+    comp_bottom = prof["zBot"].to_numpy(dtype=float)
+    comp_mid = (comp_top + comp_bottom) / 2.0
+
+    src_min = float(src_top.min())
+    src_max = float(src_bottom.max())
+
+    theta_comp = np.empty(len(prof), dtype=float)
+
+    for j, (top, bottom) in enumerate(zip(comp_top, comp_bottom, strict=True)):
+        thickness = bottom - top
+
+        overlap = np.maximum(
+            0.0,
+            np.minimum(bottom, src_bottom) - np.maximum(top, src_top),
+        )
+
+        numerator = float(np.sum(theta * overlap))
+        covered = float(overlap.sum())
+
+        # Constant extrapolation if the numerical AquaCrop soil extends
+        # outside the available initial-water profile.
+        if top < src_min:
+            extra = max(
+                0.0,
+                min(bottom, src_min) - top,
+            )
+            numerator += float(theta[0]) * extra
+            covered += extra
+
+        if bottom > src_max:
+            extra = max(
+                0.0,
+                bottom - max(top, src_max),
+            )
+            numerator += float(theta[-1]) * extra
+            covered += extra
+
+        if not np.isclose(covered, thickness):
+            raise RuntimeError(
+                f"Could not map initial water content onto "
+                f"AquaCrop compartment {top:.2f}-{bottom:.2f} m."
+            )
+
+        theta_comp[j] = numerator / thickness
+
+    # Current ERA5-SMI transformation is constrained to WP <= theta <= FC.
+    th_wp = prof["th_wp"].to_numpy(dtype=float)
+    th_fc = prof["th_fc"].to_numpy(dtype=float)
+
+    tol = 1e-6
+    if np.any(theta_comp < th_wp - tol):
+        raise ValueError("Mapped initial water content is below AquaCrop wilting point.")
+
+    if np.any(theta_comp > th_fc + tol):
+        raise ValueError(
+            "Mapped initial water content is above AquaCrop field capacity. "
+            "This is unexpected while ERA5 SMI is clipped to [0, 1]."
+        )
+
+    return InitialWaterContent(
+        wc_type="Num",
+        method="Depth",
+        depth_layer=comp_mid.tolist(),
+        value=theta_comp.tolist(),
+    )
+
+
+
 # ---------------------------------------------------------------------------
 # AquaCrop runner
 # ---------------------------------------------------------------------------
@@ -761,6 +885,7 @@ def run_aquacrop(
     *,
     irrigation_management: IrrigationManagement | None = None,
     initial_water_content: InitialWaterContent | None = None,
+    initial_soil_water_profile: xr.Dataset | None = None,
 ) -> AquaCropResult:
     """Run AquaCrop simulation.
 
@@ -776,6 +901,8 @@ def run_aquacrop(
     irrigation_management : override irrigation (default: from parcel log)
     initial_water_content : override initial soil moisture
         (default: field capacity)
+    initial_soil_water_profile : compute InitialWaterContent from this ERA5-SMI-based profile
+        (default: None)
     """
     weather = forcing_to_weather(forcing, terrain, parcel.lat)
 
@@ -789,7 +916,27 @@ def run_aquacrop(
         sim_end=sim_end,
     )
 
-    iwc = initial_water_content or InitialWaterContent(value=["FC"])
+    if (
+        initial_water_content is not None
+        and initial_soil_water_profile is not None
+    ):
+        raise ValueError(
+            "Provide either initial_water_content or "
+            "initial_soil_water_profile, not both."
+        )
+
+    if initial_water_content is not None:
+        iwc = initial_water_content
+    elif initial_soil_water_profile is not None:
+        iwc = soil_water_profile_to_aquacrop_iwc(
+            initial_soil_water_profile,
+            soil,
+        )
+    else:
+        iwc = InitialWaterContent(value=["FC"])
+
+
+
     irr = irrigation_management or parcel_to_irrigation(parcel)
 
     model = AquaCropModel(
@@ -799,6 +946,7 @@ def run_aquacrop(
         soil=soil,
         crop=crop,
         initial_water_content=iwc,
+
         irrigation_management=irr,
     )
 
@@ -883,6 +1031,7 @@ def run_ensemble_aquacrop(
     today: date,
     *,
     stress_threshold: float = 0.9,
+    initial_soil_water_profile: xr.Dataset | None = None,
 ) -> list[AquaCropEnsembleStats]:
     """Run AquaCrop for each IFS ENS member and compute ensemble statistics.
 
@@ -901,6 +1050,7 @@ def run_ensemble_aquacrop(
     sim_start : simulation start (typically Jan 1)
     today : current date (forecast branches from here)
     stress_threshold : Ks below this counts as "stressed"
+    initial_soil_water_profile : ERA5-SMI-based soil water profile for AquaCrop IWC
     """
     daily_stats: list[AquaCropEnsembleStats] = []
 
@@ -908,7 +1058,11 @@ def run_ensemble_aquacrop(
 
     crop = parcel_to_crop(parcel)
     soil = _soil_for_crop(soil_profile, crop)
-    iwc = InitialWaterContent(value=["FC"])
+
+    iwc = InitialWaterContent(value=["FC"]) if initial_soil_water_profile is None else soil_water_profile_to_aquacrop_iwc(
+        initial_soil_water_profile,
+        soil,
+    )
 
     # Base weather: historical + AROME (ET₀ computed once)
     deter_forcing = historical_forcing.concat(arome_forcing)
@@ -1682,6 +1836,7 @@ class AquaCropYieldBranchingEvaluator:
         soil_profile: SoilProfile,
         sim_start: date,
         today: date,
+        initial_soil_water_profile: xr.Dataset | None = None,
         workers: int = 1,
     ) -> None:
         if not member_forcings:
@@ -1695,7 +1850,10 @@ class AquaCropYieldBranchingEvaluator:
 
         crop = parcel_to_crop(parcel)
         soil = _soil_for_crop(soil_profile, crop)
-        iwc = InitialWaterContent(value=["FC"])
+        iwc = InitialWaterContent(value=["FC"]) if initial_soil_water_profile is None else soil_water_profile_to_aquacrop_iwc(
+            initial_soil_water_profile,
+            soil,
+        )
 
         base_weather = forcing_to_weather(
             historical_forcing.concat(arome_forcing), terrain, parcel.lat

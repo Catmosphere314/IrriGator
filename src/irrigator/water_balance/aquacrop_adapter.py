@@ -1741,7 +1741,15 @@ def _extract_yield_branch_metrics(
     counters_i = wf_counter[valid].astype(int)
     tr_v = tr[valid]
     tr_pot_v = tr_pot[valid]
-    ks = np.where(tr_pot_v > 0.01, tr_v / tr_pot_v, 1.0)
+
+    result = np.ones_like(tr_pot_v, dtype=float)
+
+    ks = np.divide(
+        tr_v,
+        tr_pot_v,
+        out=result,
+        where=tr_pot_v > 0.01,
+    )
 
     for counter, value in zip(counters_i, ks):
         d = model_dates[int(counter)]

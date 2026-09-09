@@ -73,6 +73,8 @@ CFGRIB_VAR_NAMES = {
     "sp": "sp",
     "tp": "tp",
     "ssrd": "ssrd",
+    "ssr": "ssr",
+    "str": "str",
 }
 
 
@@ -537,17 +539,39 @@ def open_ifs_ens(path: Path, bbox: BBoxWGS84 = FRANCE_BBOX) -> xr.Dataset:
     )
 
     # Optional: warn if something is missing.
-    expected = set(CFGRIB_VAR_NAMES.values())
-    missing = sorted(expected - set(ds.data_vars))
+    required = {
+        "t2m",
+        "d2m",
+        "u10",
+        "v10",
+        "sp",
+        "tp",
+    }
+
+    missing = required - set(ds.data_vars)
 
     if missing:
         raise RuntimeError(
             f"Opened file but missing variables {missing}. "
             f"Available variables: {sorted(ds.data_vars)}"
         )
+    if "ssrd" not in ds and "ssr" not in ds:
+        raise RuntimeError(
+            "IFS dataset has neither ssrd nor ssr radiation."
+        )
 
     return ds
 
+def _precip_to_mm_factor(da: xr.DataArray) -> float:
+    units = str(da.attrs.get("units", "")).lower()
+
+    if units in {"m", "m of water equivalent"}:
+        return 1000.0
+
+    if "kg m**-2" in units or "kg m^-2" in units or "kg m-2" in units or units == "mm":
+        return 1.0
+
+    raise ValueError(f"Unknown precipitation units: {da.attrs.get('units')!r}")
 
 def process_ifs_ens_to_daily(ds: xr.Dataset, shift_utc: int = 0) -> xr.Dataset:
     """Convert IFS ENS hourly/6-hourly data to daily format.
@@ -566,8 +590,13 @@ def process_ifs_ens_to_daily(ds: xr.Dataset, shift_utc: int = 0) -> xr.Dataset:
 
     ds = ds.assign_coords(valid_time=ds.valid_time + pd.Timedelta(f"{shift_utc}h"))
 
+    tp_factor = None
+
+    if "tp" in ds:
+        tp_factor = _precip_to_mm_factor(ds["tp"])
     # Handle accumulated variables (tp, ssrd) — diff to get per-step values
-    for acc_var in ["tp", "ssrd"]:
+
+    for acc_var in ["tp", "ssrd", "ssr", "str"]:
         if acc_var in ds:
             # Check if accumulated (monotonically increasing per forecast)
             da = ds[acc_var]
@@ -611,8 +640,11 @@ def process_ifs_ens_to_daily(ds: xr.Dataset, shift_utc: int = 0) -> xr.Dataset:
 
     # Precipitation: m → mm (already de-accumulated above)
     if "tp" in ds:
-        daily_vars["precip_mm"] = ds["tp"].resample({time_dim: "1D"}).sum() * 1000.0
-        daily_vars["precip_mm"] = daily_vars["precip_mm"].clip(min=0)
+        # daily_vars["precip_mm"] = ds["tp"].resample({time_dim: "1D"}).sum() * 1000.0
+        # daily_vars["precip_mm"] = daily_vars["precip_mm"].clip(min=0)
+        daily_vars["precip_mm"] = (ds["tp"].resample({time_dim: "1D"}).sum() * tp_factor).clip(
+            min=0
+        )
 
     # Solar radiation: J/m² → MJ/m²/day (already de-accumulated above)
     if "ssrd" in ds:

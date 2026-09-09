@@ -29,7 +29,7 @@ import logging
 import multiprocessing as mp
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
-from typing import Iterable
+from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
@@ -197,12 +197,15 @@ class OperationalOptimizationResult:
                 {
                     "date": pd.Timestamp(d),
                     "day_offset": (d - self.today).days,
-                    "dose_mm": float(q),
+                    "amount_mm": float(q),
                     "committed": d in self.committed_dates,
                 }
                 for d, q in self.recommended_events
             ]
         )
+
+    def to_irrigation_log(self) -> list[dict[str, Any]]:
+        return [{"date": d.isoformat(), "amount_mm": float(q)} for d, q in self.recommended_events]
 
 
 # ---------------------------------------------------------------------------
@@ -862,7 +865,7 @@ def optimize_operational_irrigation(
     trigger_quantile: float = 0.25,
     irrigation_lead_days: int = 1,
     dose_resolution_mm: float = 2.0,
-    max_events: int = 8,
+    max_events: int = 99,
     n_workers: int = 1,
     require_harvest_horizon: bool = True,
     initial_soil_water_profile: xr.Dataset | None = None,
@@ -990,7 +993,9 @@ def optimize_operational_irrigation(
         commitment_limit = today + timedelta(days=max(0, commitment_days))
         committed_dates: set[date] = set()
         current_events: list[tuple[date, float]] = []
-        for event_date, _dose in previous_plan or []:
+        for event in previous_plan or []:
+            event_date = event["date"]
+            dose = event["amount_mm"]
             if today < event_date <= commitment_limit and event_date <= sim_end:
                 committed_dates.add(event_date)
                 # Keep the date, but start high and let the dose search adjust it.

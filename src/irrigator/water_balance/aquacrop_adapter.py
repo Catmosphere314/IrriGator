@@ -732,10 +732,13 @@ class AquaCropResult:
 
         n = min(len(cg), len(wf))
 
-        ks = np.where(
-            wf["TrPot"].values[:n] > 0.01,
-            wf["Tr"].values[:n] / wf["TrPot"].values[:n],
-            1.0,
+        result = np.ones_like(wf["TrPot"].values[:n] , dtype=float)
+
+        ks = np.divide(
+            wf["Tr"].values[:n],
+            wf["TrPot"].values[:n],
+            out=result,
+            where=wf["TrPot"].values[:n] > 0.01,
         )
 
         # Actual forcing used by AquaCrop

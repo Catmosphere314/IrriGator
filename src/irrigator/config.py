@@ -145,6 +145,24 @@ class ParcelConfig:
         pf = self.raw.get("parcel", {}).get("location", {}).get("polygon_file")
         return Path(pf) if pf else None
 
+    def add_irrigation_event(self, event: dict[str, Any]) -> ParcelConfig:
+        """Return a new ParcelConfig with an additional irrigation event."""
+        new_log = [*self.irrigation_log, *event]
+        return ParcelConfig(
+            id=self.id,
+            name=self.name,
+            farmer=self.farmer,
+            lat=self.lat,
+            lon=self.lon,
+            area_ha=self.area_ha,
+            soil=self.soil,
+            crop=self.crop,
+            irrigation=self.irrigation,
+            irrigation_log=new_log,
+            sensors=self.sensors,
+            raw=self.raw,
+        )
+
 
 def load_parcel_config(path: str | Path) -> ParcelConfig:
     """Load and parse a parcel YAML config file."""
@@ -171,3 +189,55 @@ def load_parcel_config(path: str | Path) -> ParcelConfig:
         sensors=raw.get("sensors", {}),
         raw=raw,
     )
+
+
+from copy import deepcopy
+
+
+def parcel_config_to_dict(config: ParcelConfig) -> dict[str, Any]:
+    """Convert ParcelConfig back to YAML while preserving unknown fields."""
+    raw = deepcopy(config.raw)
+
+    parcel = raw.setdefault("parcel", {})
+    location = parcel.setdefault("location", {})
+
+    parcel["id"] = config.id
+    parcel["name"] = config.name
+    parcel["farmer"] = config.farmer
+    parcel["area_ha"] = config.area_ha
+
+    location["lat"] = config.lat
+    location["lon"] = config.lon
+
+    if config.polygon_file is not None:
+        location["polygon_file"] = str(config.polygon_file)
+    else:
+        location.pop("polygon_file", None)
+
+    raw["soil"] = config.soil
+    raw["crop"] = config.crop
+    raw["irrigation"] = config.irrigation
+    raw["irrigation_log"] = config.irrigation_log
+    raw["sensors"] = config.sensors
+
+    return raw
+
+
+def save_parcel_config(
+    config: ParcelConfig,
+    path: str | Path,
+) -> None:
+    """Write a ParcelConfig to a YAML file."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    raw = parcel_config_to_dict(config)
+
+    with open(path, "w") as f:
+        yaml.safe_dump(
+            raw,
+            f,
+            sort_keys=False,
+            default_flow_style=False,
+            allow_unicode=True,
+        )

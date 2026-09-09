@@ -2,17 +2,14 @@
 
 It is used for backtesting, because TIGGE IFS is not providing SSRD (Surface Solar Radiation Downwards)
 but rather radiation and heat with already processed albedo."""
-
-from pathlib import Path
 from __future__ import annotations
 
+from pathlib import Path
 import logging
 from datetime import date, timedelta
-from pathlib import Path
 from calendar import monthrange
 
 import cdsapi
-import uuid
 import xarray as xr
 
 from irrigator.config import BBoxWGS84
@@ -30,9 +27,9 @@ ALBEDO_VAR = ["forecast_albedo"]
 
 
 def _albedo_output_path(
-    raw_dir: Path, year_min: int, year_max: int, *, validation: bool = False
+    raw_dir: Path = DEFAULT_RAW_DIR, year_min: int = 2007, year_max: int = 2026,
 ) -> Path:
-    """Consistent file naming: albedo_YYYY_MM.nc"""
+    """Consistent file naming: albedo_era5_YYYY_YYYY.nc"""
     out_dir = raw_dir / "era5_albedo"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -48,7 +45,7 @@ def fetch_era5_albedo(
     overwrite: bool = False,
     force_cds_refresh: bool = False,
 ) -> Path:
-    """Download one month of hourly ERA5-Land data.
+    """Download one month of hourly ERA5 albedo 00:00 data.
 
     Parameters
     ----------
@@ -109,13 +106,13 @@ def process_era5_forecast_albedo(
     output_path = _albedo_output_path(
         raw_dir=processed_dir, year_min=year_range[0], year_max=year_range[1]
     )
-    if not input_path.exists():
+    if not input_path.exists() or force_refresh:
         fetch_era5_albedo(
             year_min=year_range[0],
             year_max=year_range[1],
             bounding_box=bounding_box,
             raw_dir=raw_dir,
-            overwrite=overwrite,
+            overwrite=overwrite or force_refresh,
             force_cds_refresh=force_refresh,
         )
 
@@ -126,13 +123,7 @@ def process_era5_forecast_albedo(
             f"'fal' not found in {input_path}. Available variables: {list(ds.data_vars)}"
         )
 
-    fal = (
-        ds["fal"]
-        .resample(valid_time="1D")
-        .mean(skipna=True)
-        .clip(0.0, 1.0)
-        .rename("forecast_albedo")
-    )
+    fal = ds["fal"].rename("forecast_albedo").clip(0.0, 1.0)
 
     out = fal.to_dataset()
 
@@ -141,9 +132,9 @@ def process_era5_forecast_albedo(
             "long_name": "ERA5-Land daily mean forecast albedo",
             "units": "1",
             "description": (
-                "Daily mean ERA5-Land forecast albedo used to "
-                "reconstruct downward shortwave radiation from "
-                "TIGGE surface net solar radiation."
+                "Daily ERA5 forecast albedo sampled at 00 UTC, "
+                "used to reconstruct downward shortwave radiation "
+                "from TIGGE surface net solar radiation."
             ),
         }
     )
@@ -167,3 +158,5 @@ def process_era5_forecast_albedo(
     ds.close()
 
     return output_path
+
+

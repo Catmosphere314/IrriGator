@@ -383,20 +383,45 @@ def _deaccumulate(da: xr.DataArray) -> xr.DataArray:
     return increments
 
 
+def load_albedo_for_tigge(
+    albedo_path: str | Path,
+    tigge_ds: xr.Dataset | xr.DataArray,
+) -> xr.DataArray:
+    """Load ERA5 albedo needed for a TIGGE forecast."""
+
+    with xr.open_dataset(albedo_path) as ds:
+        albedo = ds["forecast_albedo"]
+
+        albedo = albedo.sel(valid_time=tigge_ds.valid_time).load()
+
+    albedo = albedo.sortby("latitude").sortby("longitude")
+
+    albedo = albedo.interp(
+        latitude=tigge_ds.latitude,
+        longitude=tigge_ds.longitude,
+        method="linear",
+    )
+
+    return albedo
+
+
 def process_tigge_to_daily(
     ds: xr.Dataset,
     *,
     shift_utc: int = 0,
-    reference_albedo: float = 0.23,
+    albedo_path: Path | None = None,
 ) -> xr.Dataset:
     """Convert one TIGGE control/PF Dataset to IrriGator daily fields.
 
     The first accumulated value is a baseline only.  For the default +48 h
     retrieval, precipitation/radiation increments start at +54 h and form a
     complete +48 -> +72 h total for issue_date + 2.
+
+    Use the albedo from ERA5 at daily level.
     """
-    if not 0 <= reference_albedo < 1:
-        raise ValueError("reference_albedo must be in [0, 1)")
+    if albedo_path is None:
+        from irrigator.atmospheric.albedo import _albedo_output_path
+        albedo_path = _albedo_output_path(DEFAULT_PROCESSED_DIR)
 
     ds = _to_valid_time(ds, shift_utc=shift_utc)
 
@@ -422,9 +447,24 @@ def process_tigge_to_daily(
 
     # TIGGE ssr is net shortwave energy accumulated from forecast start.
     # W m-2 s is dimensionally J m-2.  Convert to incoming shortwave so the
-    # existing FAO-56 implementation can apply its 0.23 reference albedo.
-    net_shortwave_mj = ssr_step.resample(valid_time="1D").sum() / 1e6
-    daily["rs_mj"] = (net_shortwave_mj / (1.0 - reference_albedo)).clip(min=0)
+    # FAO-56 works fine.
+    ssr_daily = (
+        ssr_step
+        .resample(valid_time="1D")
+        .sum()
+        / 1e6
+    )
+
+    albedo = load_albedo_for_tigge(
+        albedo_path,
+        ssr_daily,
+    )
+
+
+    daily["rs_mj"] = (
+        ssr_daily
+        / (1.0 - albedo)
+    )
 
     result = xr.Dataset(daily)
 
@@ -442,8 +482,9 @@ def process_tigge_to_daily(
         {
             "source": "ECMWF IFS ENS historical operational forecast (TIGGE)",
             "radiation_source": "TIGGE surface net solar radiation (ssr)",
-            "radiation_conversion": "rs_mj = ssr_mj / (1 - reference_albedo)",
-            "reference_albedo": float(reference_albedo),
+            "radiation_conversion": ("rs_mj = ssr_mj / (1 - ERA5 forecast_albedo)"),
+            "albedo_source": "ERA5 forecast_albedo",
+            "albedo_file": str(albedo_path),
             "precipitation_source_units": "kg m-2 (numerically mm)",
             "n_members": int(ds.sizes.get("number", 1)),
         }
@@ -528,7 +569,7 @@ def process_tigge_run(
     step_hours: int = 6,
     grid: float = 0.25,
     shift_utc: int = 0,
-    reference_albedo: float = 0.23,
+    albedo_path: Path |None = None,
     key: str | None = None,
     overwrite: bool = False,
     keep_raw: bool = False,
@@ -557,7 +598,7 @@ def process_tigge_run(
     control_daily = process_tigge_to_daily(
         control_raw,
         shift_utc=shift_utc,
-        reference_albedo=reference_albedo,
+        albedo_path=albedo_path,
     )
 
     logger.info("Opening TIGGE perturbed forecast...")
@@ -565,7 +606,7 @@ def process_tigge_run(
     perturbed_daily = process_tigge_to_daily(
         perturbed_raw,
         shift_utc=shift_utc,
-        reference_albedo=reference_albedo,
+        albedo_path=albedo_path,
     )
 
     combined = combine_tigge_members(control_daily, perturbed_daily)
@@ -608,7 +649,7 @@ def run_tigge_pipeline(
     step_hours: int = 6,
     grid: float = 0.25,
     shift_utc: int = 0,
-    reference_albedo: float = 0.23,
+    albedo_path: Path | None = None,
     key: str | None = None,
     overwrite: bool = False,
     keep_raw: bool = False,
@@ -635,7 +676,7 @@ def run_tigge_pipeline(
                 step_hours=step_hours,
                 grid=grid,
                 shift_utc=shift_utc,
-                reference_albedo=reference_albedo,
+                albedo_path=albedo_path,
                 key=key,
                 overwrite=overwrite,
                 keep_raw=keep_raw,

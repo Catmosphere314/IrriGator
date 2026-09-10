@@ -55,19 +55,39 @@ DEFAULT_PROCESSED_DIR = Path("data/processed")
 
 # TIGGE / ecCodes parameter identifiers.
 # https://confluence.ecmwf.int/spaces/TIGGE/pages/40109884/Parameters
-TIGGE_PARAMS = {
-    "sp": "134",  # surface pressure [Pa]
-    "u10": "165",  # 10 m U wind [m/s]
-    "v10": "166",  # 10 m V wind [m/s]
-    "t2m": "167",  # 2 m temperature [K]
-    "d2m": "168",  # 2 m dewpoint [K]
-    "ssr": "176",  # surface net solar radiation [W m-2 s], accumulated
-    "tp": "228228",  # total precipitation [kg m-2], accumulated
-}
-TIGGE_PARAM_STRING = "/".join(TIGGE_PARAMS.values())
+# TIGGE_PARAMS = {
+#     "sp": "134",  # surface pressure [Pa]
+#     "u10": "165",  # 10 m U wind [m/s]
+#     "v10": "166",  # 10 m V wind [m/s]
+#     "t2m": "167",  # 2 m temperature [K]
+#     "d2m": "168",  # 2 m dewpoint [K]
+#     "ssr": "176",  # surface net solar radiation [W m-2 s], accumulated
+#     "tp": "228228",  # total precipitation [kg m-2], accumulated
+#     "mx2t6": "121",
+#     "mn2t6": "122",
+# }
 
-TIGGE_CFGRIB_NAMES = set(TIGGE_PARAMS)
-REQUIRED_TIGGE_VARS = {"sp", "u10", "v10", "t2m", "d2m", "ssr", "tp"}
+TIGGE_VARIABLES = [
+    "10_m_u_component_of_wind",
+    "10_m_v_component_of_wind",
+    "2_m_dewpoint_temperature",
+    "2_m_temperature",
+    "maximum_2_m_temperature_in_the_last_6_hours",
+    "minimum_2_m_temperature_in_the_last_6_hours",
+    "surface_pressure",
+    "surface_net_solar_radiation",
+    "total_precipitation",
+]
+
+PARAM_ID_RENAMES = {
+    121: "mx2t6",
+    122: "mn2t6",
+}
+
+TIGGE_CFGRIB_NAMES = set(TIGGE_VARIABLES)
+TIGGE_CFGRIB_NAMES = {"sp", "u10", "v10", "t2m", "d2m", "ssr", "tp", "mx2t6", "mn2t6"}
+
+REQUIRED_TIGGE_VARS = {"sp", "u10", "v10", "t2m", "d2m", "ssr", "tp", "mx2t6", "mn2t6"}
 
 
 def _tigge_raw_dir(raw_dir: Path, run_date: date, run_hour: int) -> Path:
@@ -114,6 +134,20 @@ def _get_ecds_client(key: str | None = None):
     if key is not None:
         kwargs["key"] = key
     return cdsapi.Client(**kwargs)
+
+def _leadtime_hours(
+    first_step: int,
+    last_step: int,
+    step_hours: int,
+) -> list[str]:
+    return [
+        str(step)
+        for step in range(
+            first_step,
+            last_step + 1,
+            step_hours,
+        )
+    ]
 
 
 def fetch_tigge_type(
@@ -167,23 +201,36 @@ def fetch_tigge_type(
 
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    request: dict[str, str] = {
-        "class": "ti",
-        "date": run_date.isoformat(),
-        "expver": "prod",
+    forecast_type_ecds = {
+            "cf": "control_forecast",
+            "pf": "perturbed_forecast",
+        }[forecast_type]
+
+    request = {
+        "origin": "ecmwf",
+        "year": str(run_date.year),
+        "month": f"{run_date.month:02d}",
+        "day": f"{run_date.day:02d}",
+        "time": f"{run_hour:02d}:00",
+        "level_type": "single_level",
+        "variable": TIGGE_VARIABLES,
+        "forecast_type": forecast_type_ecds,
+        "leadtime_hour": _leadtime_hours(
+            first_step,
+            last_step,
+            step_hours,
+        ),
+        "area": [
+            bbox.north,
+            bbox.west,
+            bbox.south,
+            bbox.east,
+        ],
         "grid": f"{grid}/{grid}",
-        "levtype": "sfc",
-        "origin": "ecmf",
-        "param": TIGGE_PARAM_STRING,
-        "step": _step_spec(first_step, last_step, step_hours),
-        "time": f"{run_hour:02d}:00:00",
-        "type": forecast_type,
-        "area": _mars_area(bbox, grid),
+        "data_format": "grib",
     }
 
-    # Explicit member selection makes the intended 51-member result clear.
-    if forecast_type == "pf":
-        request["number"] = "1/to/50/by/1"
+    
 
     logger.info(
         "Retrieving TIGGE %s: %s %02dZ, steps %d-%d h, area=%s",
@@ -309,6 +356,20 @@ def _open_cfgrib_group(
         return None
 
     ds = _slice_bbox(ds, bbox)
+
+    # cfgrib exposes the TIGGE 6-hour extrema as `t2m`.
+    # Rename according to GRIB stepType so they remain distinct
+    # from instantaneous 2 m temperature.
+    step_type = filter_by_keys.get("stepType")
+
+    for name in list(ds.data_vars):
+        param_id = ds[name].attrs.get("GRIB_paramId")
+
+        if param_id in PARAM_ID_RENAMES:
+            ds = ds.rename(
+                {name: PARAM_ID_RENAMES[param_id]}
+            )
+
     present = [name for name in ds.data_vars if name in TIGGE_CFGRIB_NAMES]
     if not present:
         ds.close()
@@ -325,10 +386,34 @@ def open_tigge_ifs(path: Path, bbox: BBoxWGS84 = FRANCE_BBOX) -> xr.Dataset:
     """Open TIGGE IFS GRIB fields into a single xarray Dataset."""
     path = Path(path)
     groups = [
-        {"typeOfLevel": "heightAboveGround", "level": 2},
-        {"typeOfLevel": "heightAboveGround", "level": 10},
-        {"typeOfLevel": "surface", "stepType": "instant"},
-        {"typeOfLevel": "surface", "stepType": "accum"},
+        {
+            "typeOfLevel": "heightAboveGround",
+            "level": 2,
+            "stepType": "instant",
+        },
+        {
+            "typeOfLevel": "heightAboveGround",
+            "level": 2,
+            "stepType": "max",
+        },
+        {
+            "typeOfLevel": "heightAboveGround",
+            "level": 2,
+            "stepType": "min",
+        },
+        {
+            "typeOfLevel": "heightAboveGround",
+            "level": 10,
+            "stepType": "instant",
+        },
+        {
+            "typeOfLevel": "surface",
+            "stepType": "instant",
+        },
+        {
+            "typeOfLevel": "surface",
+            "stepType": "accum",
+        },
     ]
 
     datasets = [ds for keys in groups if (ds := _open_cfgrib_group(path, keys, bbox)) is not None]
@@ -341,6 +426,8 @@ def open_tigge_ifs(path: Path, bbox: BBoxWGS84 = FRANCE_BBOX) -> xr.Dataset:
         join="outer",
         combine_attrs="override",
     )
+
+    
 
     missing = sorted(REQUIRED_TIGGE_VARS - set(ds.data_vars))
     if missing:
@@ -405,6 +492,12 @@ def load_albedo_for_tigge(
     return albedo
 
 
+def _interval_end_to_previous_day(
+    da: xr.DataArray,
+) -> xr.DataArray:
+    return da.assign_coords(valid_time=(da.valid_time - np.timedelta64(1, "ns")))
+
+
 def process_tigge_to_daily(
     ds: xr.Dataset,
     *,
@@ -430,10 +523,36 @@ def process_tigge_to_daily(
 
     daily: dict[str, xr.DataArray] = {}
 
-    temperature = ds["t2m"].resample(valid_time="1D")
-    daily["t_min"] = temperature.min() - 273.15
-    daily["t_max"] = temperature.max() - 273.15
-    daily["t_mean"] = temperature.mean() - 273.15
+    # temperature = ds["t2m"].resample(valid_time="1D")
+    # daily["t_min"] = temperature.min() - 273.15
+    # daily["t_max"] = temperature.max() - 273.15
+    # daily["t_mean"] = temperature.mean() - 273.15
+
+    mn2t6 = _interval_end_to_previous_day(
+        ds["mn2t6"]
+    )
+
+    mx2t6 = _interval_end_to_previous_day(
+        ds["mx2t6"]
+    )
+
+
+    daily["t_min"] = (
+        mn2t6
+        .resample(valid_time="1D")
+        .min()
+        - 273.15
+    )
+
+    daily["t_max"] = (
+        mx2t6
+        .resample(valid_time="1D")
+        .max()
+        - 273.15
+    )
+
+    daily["t_mean"] = ds["t2m"].resample(valid_time="1D").mean() - 273.15
+
 
     daily["dewpoint"] = ds["d2m"].resample(valid_time="1D").mean() - 273.15
 

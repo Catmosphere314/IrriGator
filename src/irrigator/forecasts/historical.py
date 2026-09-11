@@ -194,6 +194,7 @@ def load_historical_hres_forcing(
     run_hour: int = 0,
     n_days: int = 2,
     model: str = DEFAULT_HRES_MODEL,
+    silent: bool = False,
 ) -> tuple[DailyForcing, str]:
     """Load deterministic HRES forcing for one historical issue date.
 
@@ -238,6 +239,7 @@ def load_historical_hres_forcing(
             parcel,
             terrain,
             precip_correction=None,
+            silent=silent
         )
     finally:
         ds.close()
@@ -267,6 +269,7 @@ def load_historical_ifs_members(
     end_date: date,
     processed_dir: str | Path = DEFAULT_PROCESSED_DIR,
     run_hour: int = 0,
+    silent: bool = False,
 ) -> tuple[dict[int, DailyForcing], str]:
     """Load TIGGE ENS members for the medium-range historical horizon.
 
@@ -283,6 +286,8 @@ def load_historical_ifs_members(
         IrriGator processed-data root.
     run_hour
         TIGGE initialization hour, normally 00Z.
+    silent
+        to silence the logger INFO
 
     Returns
     -------
@@ -342,6 +347,7 @@ def load_historical_ifs_members(
                 parcel,
                 terrain,
                 precip_correction=None,
+                silent=silent
             )
 
             _validate_forcing_dates(
@@ -383,6 +389,7 @@ def get_historical_forecast(
     forecast_days: int = 15,
     hres_days: int = 2,
     hres_model: str = DEFAULT_HRES_MODEL,
+    silent: bool = False,
 ) -> HistoricalForecast:
     """Build the retrospective HRES -> TIGGE forecast for one decision date.
 
@@ -406,6 +413,8 @@ def get_historical_forecast(
         then TIGGE begins on D+2.
     hres_model
         Open-Meteo HRES model identifier used when locating the cached file.
+    silent
+        To silence the logger INFO
 
     Returns
     -------
@@ -434,6 +443,7 @@ def get_historical_forecast(
         run_hour=run_hour,
         n_days=deterministic_days,
         model=hres_model,
+        silent=silent,
     )
 
     forecast_end = issue_date + timedelta(days=forecast_days - 1)
@@ -448,19 +458,24 @@ def get_historical_forecast(
             end_date=forecast_end,
             processed_dir=processed_dir,
             run_hour=run_hour,
+            silent=silent,
         )
     else:
         members = {}
         ifs_source = "ECMWF TIGGE historical IFS ENS (not required)"
 
-    logger.info(
-        "Historical forecast %s parcel=%s: HRES=%d day(s), TIGGE=%d member(s), horizon=%d day(s)",
-        issue_date,
-        parcel.id,
-        hres.n_days,
-        len(members),
-        forecast_days,
-    )
+    
+    if not silent:
+        logger.info(
+            "Historical forecast %s parcel=%s: HRES=%d day(s), TIGGE=%d member(s), horizon=%d day(s)",
+            issue_date,
+            parcel.id,
+            hres.n_days,
+            len(members),
+            forecast_days,
+        )
+    
+
 
     result = HistoricalForecast(
         issue_date=issue_date,

@@ -392,7 +392,7 @@ def _payload_to_daily(
     # partial days for non-00Z initialisations.  Users wanting 06/12/18Z runs
     # can request enough hours to span complete subsequent UTC days.
     count_columns = [c for c in frame.columns if c.startswith("_n_")]
-    complete = (frame[count_columns] == 24).all(axis=1)
+    complete = (frame[count_columns] >= 23).all(axis=1)
     frame = frame.loc[complete].drop(columns=count_columns)
 
     if frame.empty:
@@ -471,7 +471,7 @@ def fetch_hres_run(
     lat: float,
     lon: float,
     run_hour: int = 0,
-    forecast_hours: int = 48,
+    forecast_hours: int = 70,
     model: str = DEFAULT_MODEL,
     timeout: float = 120.0,
     api_key: str | None = None,

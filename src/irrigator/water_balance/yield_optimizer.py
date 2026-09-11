@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 from dataclasses import dataclass, replace
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from typing import Any, Iterable
 
 import numpy as np
@@ -869,6 +869,7 @@ def optimize_operational_irrigation(
     n_workers: int = 1,
     require_harvest_horizon: bool = True,
     initial_soil_water_profile: xr.Dataset | None = None,
+    silent: bool = True,
 ) -> OperationalOptimizationResult:
     """Find a sparse, yield-preserving forecast irrigation plan.
 
@@ -994,7 +995,7 @@ def optimize_operational_irrigation(
         committed_dates: set[date] = set()
         current_events: list[tuple[date, float]] = []
         for event in previous_plan or []:
-            event_date = event["date"]
+            event_date = datetime.strptime(event["date"], "%Y-%m-%d").date()
             dose = event["amount_mm"]
             if today < event_date <= commitment_limit and event_date <= sim_end:
                 committed_dates.add(event_date)

@@ -186,6 +186,23 @@ class ParcelConfig:
             raw=self.raw,
         )
 
+    def replace_irrigation(self, irrigation_log : list[dict[str, Any]]) -> ParcelConfig:
+        """Return the same parcel but with a replaced irrigation log."""
+        return ParcelConfig(
+                    id=self.id,
+                    name=self.name,
+                    farmer=self.farmer,
+                    lat=self.lat,
+                    lon=self.lon,
+                    area_ha=self.area_ha,
+                    soil=self.soil,
+                    crop=self.crop,
+                    irrigation=self.irrigation,
+                    irrigation_log=irrigation_log,
+                    sensors=self.sensors,
+                    raw=self.raw,
+                )
+
 
 def load_parcel_config(path: str | Path) -> ParcelConfig:
     """Load and parse a parcel YAML config file."""

@@ -177,6 +177,7 @@ def extract_parcel_forcing(
     parcel: ParcelConfig,
     terrain: TerrainParams,
     precip_correction: BiasCorrection | None = None,
+    silent: bool = False,
 ) -> DailyForcing:
     """Extract and downscale daily forcing at a parcel location.
 
@@ -194,6 +195,7 @@ def extract_parcel_forcing(
     parcel : ParcelConfig
     terrain : TerrainParams (with era5_elevation_m set)
     precip_correction : fitted BiasCorrection (optional)
+    silent : to remove the logger info (optional)
 
     Returns
     -------
@@ -214,13 +216,14 @@ def extract_parcel_forcing(
     rs = cell["rs_mj"].values.astype(np.float64)
     precip = cell["precip_mm"].values.astype(np.float64)
 
-    logger.info(
-        "Parcel %s: extracted %d days from ERA5-Land at grid cell (%.0f, %.0f)",
-        parcel.id,
-        n,
-        parcel.lon,
-        parcel.lat,
-    )
+    if not silent:
+        logger.info(
+            "Parcel %s: extracted %d days from ERA5-Land at grid cell (%.0f, %.0f)",
+            parcel.id,
+            n,
+            parcel.lon,
+            parcel.lat,
+        )
 
     # Step 2: temperature lapse-rate correction
     if terrain.era5_elevation_m is not None:
@@ -231,22 +234,24 @@ def extract_parcel_forcing(
         t_mean = correct_temperature(t_mean, z_era5, z_local)
         dewpoint = correct_temperature(dewpoint, z_era5, z_local)
         dz = z_local - z_era5
-        logger.info(
-            "Lapse correction: Δz=%.0f m, ΔT=%.2f°C",
-            dz,
-            -0.0065 * dz,
-        )
+        if not silent:
+            logger.info(
+                "Lapse correction: Δz=%.0f m, ΔT=%.2f°C",
+                dz,
+                -0.0065 * dz,
+            )
 
     # Step 3: precipitation bias correction
     if precip_correction is not None and precip_correction.method != "none":
         precip_raw = precip.copy()
         precip = precip_correction.correct(precip)
-        logger.info(
-            "Precip correction (%s): raw total=%.0f mm → corrected=%.0f mm",
-            precip_correction.method,
-            precip_raw.sum(),
-            precip.sum(),
-        )
+        if not silent:
+            logger.info(
+                "Precip correction (%s): raw total=%.0f mm → corrected=%.0f mm",
+                precip_correction.method,
+                precip_raw.sum(),
+                precip.sum(),
+            )
 
     # Step 4: radiation terrain correction
     for i in range(n):
@@ -268,16 +273,16 @@ def extract_parcel_forcing(
         rs_mj=rs,
         precip_mm=precip,
     )
-
-    logger.info(
-        "Parcel %s forcing: %d days, T=[%.1f, %.1f]°C, "
-        "total precip=%.0f mm, mean Rs=%.1f MJ/m²/day",
-        parcel.id,
-        n,
-        float(t_min.min()),
-        float(t_max.max()),
-        float(precip.sum()),
-        float(rs.mean()),
-    )
+    if not silent:
+        logger.info(
+            "Parcel %s forcing: %d days, T=[%.1f, %.1f]°C, "
+            "total precip=%.0f mm, mean Rs=%.1f MJ/m²/day",
+            parcel.id,
+            n,
+            float(t_min.min()),
+            float(t_max.max()),
+            float(precip.sum()),
+            float(rs.mean()),
+        )
 
     return forcing

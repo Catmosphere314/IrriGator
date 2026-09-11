@@ -163,6 +163,29 @@ class ParcelConfig:
             raw=self.raw,
         )
 
+    def replace_future_irrigation_event(self, event: dict[str, Any]) -> ParcelConfig:
+        """Return a new ParcelConfig with only replacing future events."""
+        filtered_log = [
+            x
+            for x in self.irrigation_log
+            if x["date"] < min([irr["date"] for irr in event])
+        ]
+        new_log = [*filtered_log, *event]
+        return ParcelConfig(
+            id=self.id,
+            name=self.name,
+            farmer=self.farmer,
+            lat=self.lat,
+            lon=self.lon,
+            area_ha=self.area_ha,
+            soil=self.soil,
+            crop=self.crop,
+            irrigation=self.irrigation,
+            irrigation_log=new_log,
+            sensors=self.sensors,
+            raw=self.raw,
+        )
+
 
 def load_parcel_config(path: str | Path) -> ParcelConfig:
     """Load and parse a parcel YAML config file."""

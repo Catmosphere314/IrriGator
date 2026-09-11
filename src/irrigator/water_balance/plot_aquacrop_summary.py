@@ -486,10 +486,16 @@ def _plot_crop_water_thresholds(
             label=f"{label_prefix}increasing stomatal limitation",
         )
 
-
+SCENARIO_STYLE = {"Non Irrigated" : ":", 
+                  "Irrigated True" : "-.",
+                  "Irrigated Opt" : "-",
+                  "Irrigated Algo" : "--"
+                  }
 def _scenario_linestyle(scenario: str) -> str:
     """Return a stable line style for common irrigation scenario names."""
     scenario_lower = scenario.lower()
+    # SHORT CHANGE FOR OPTIMIZATION
+    return SCENARIO_STYLE.get(scenario,"-")
     if any(
         token in scenario_lower
         for token in ("no irrigation", "without irrigation", "rainfed", "unirrigated", "past")
@@ -642,7 +648,7 @@ def plot_aquacrop_season(
         phenology.setdefault("planting", pd.Timestamp(data["date"].min()))
         phenology.setdefault("harvest", pd.Timestamp(data["date"].max()))
         series_metadata[name] = {
-            "parcel": parcel,
+            "parcel": parcel + "_" + scenario,
             "scenario": scenario,
             "phenology": phenology,
         }
@@ -652,6 +658,7 @@ def plot_aquacrop_season(
     ax_gdd, ax_canopy, ax_biomass, ax_inputs, ax_water, ax_totals = axes.flat
 
     parcel_order = list(dict.fromkeys(meta["parcel"] for meta in series_metadata.values()))
+
     scenario_order = list(dict.fromkeys(meta["scenario"] for meta in series_metadata.values()))
     default_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     parcel_colors = {

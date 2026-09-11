@@ -816,18 +816,26 @@ def _prepare_aquacrop_init(
     actual_sim_days : number of real forcing days to simulate
     """
     actual_sim_days = (sim_end - sim_start).days
-
     harvest_date_str = crop.harvest_date
+
     if harvest_date_str is not None:
-        init_end = pd.Timestamp(f"{sim_start.year}/{harvest_date_str}")
-        if init_end <= pd.Timestamp(sim_start):
-            init_end = pd.Timestamp(f"{sim_start.year + 1}/{harvest_date_str}")
-        extend_to = init_end + pd.Timedelta(days=30)
-        last_weather_date = weather["Date"].iloc[-1]
-        if extend_to > last_weather_date:
+        nominal_harvest = pd.Timestamp(f"{sim_start.year}/{harvest_date_str}")
+
+        if nominal_harvest <= pd.Timestamp(sim_start):
+            nominal_harvest = pd.Timestamp(f"{sim_start.year + 1}/{harvest_date_str}")
+
+        # Extra calendar-only weather so GDD maturity can be resolved.
+        init_end = nominal_harvest + pd.Timedelta(days=30)
+
+        last_weather_date = pd.Timestamp(weather["Date"].iloc[-1])
+
+        if init_end > last_weather_date:
             extra_dates = pd.date_range(
-                last_weather_date + pd.Timedelta(days=1), extend_to, freq="D"
+                last_weather_date + pd.Timedelta(days=1),
+                init_end,
+                freq="D",
             )
+
             fill = pd.DataFrame(
                 {
                     "MinTemp": weather["MinTemp"].tail(30).mean(),
@@ -837,13 +845,14 @@ def _prepare_aquacrop_init(
                     "Date": extra_dates,
                 }
             )
-            weather = pd.concat([weather, fill], ignore_index=True)
-            logger.debug(
-                "Extended weather to %s (+%d synthetic days) for crop calendar init",
-                extend_to.date(),
-                len(extra_dates),
+
+            weather = pd.concat(
+                [weather, fill],
+                ignore_index=True,
             )
+
         init_end_str = init_end.strftime("%Y/%m/%d")
+
     else:
         init_end_str = sim_end.strftime("%Y/%m/%d")
 

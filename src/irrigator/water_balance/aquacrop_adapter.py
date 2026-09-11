@@ -41,6 +41,7 @@ from irrigator.water_balance.et0 import compute_et0
 
 from irrigator.water_balance.aquacrop_stress import (
     dynamic_water_stress_thresholds,
+    first_water_stress_trigger_date,
 )
 
 logger = logging.getLogger(__name__)
@@ -542,7 +543,6 @@ def parcel_to_crop(parcel: ParcelConfig) -> Crop:
     overrides = _crop_overrides_from_config(crop_cfg)
 
     name = "MaizeGDD" if overrides["Maturity"] else "Maize"
-    print(name)
 
     return Crop(
         name,
@@ -580,7 +580,6 @@ def parcel_to_irrigation(parcel: ParcelConfig) -> IrrigationManagement:
         Schedule=schedule,
         MaxIrr=max_dose,
     )
-
 
 
 def soil_water_profile_to_aquacrop_iwc(
@@ -704,7 +703,6 @@ def soil_water_profile_to_aquacrop_iwc(
     )
 
 
-
 # ---------------------------------------------------------------------------
 # AquaCrop runner
 # ---------------------------------------------------------------------------
@@ -732,7 +730,7 @@ class AquaCropResult:
 
         n = min(len(cg), len(wf))
 
-        result = np.ones_like(wf["TrPot"].values[:n] , dtype=float)
+        result = np.ones_like(wf["TrPot"].values[:n], dtype=float)
 
         ks = np.divide(
             wf["Tr"].values[:n],
@@ -852,7 +850,6 @@ def _prepare_aquacrop_init(
             )
 
         init_end_str = init_end.strftime("%Y/%m/%d")
-
     else:
         init_end_str = sim_end.strftime("%Y/%m/%d")
 
@@ -928,13 +925,9 @@ def run_aquacrop(
         sim_end=sim_end,
     )
 
-    if (
-        initial_water_content is not None
-        and initial_soil_water_profile is not None
-    ):
+    if initial_water_content is not None and initial_soil_water_profile is not None:
         raise ValueError(
-            "Provide either initial_water_content or "
-            "initial_soil_water_profile, not both."
+            "Provide either initial_water_content or initial_soil_water_profile, not both."
         )
 
     if initial_water_content is not None:
@@ -947,8 +940,6 @@ def run_aquacrop(
     else:
         iwc = InitialWaterContent(value=["FC"])
 
-
-
     irr = irrigation_management or parcel_to_irrigation(parcel)
 
     model = AquaCropModel(
@@ -958,7 +949,6 @@ def run_aquacrop(
         soil=soil,
         crop=crop,
         initial_water_content=iwc,
-
         irrigation_management=irr,
     )
 
@@ -1071,9 +1061,13 @@ def run_ensemble_aquacrop(
     crop = parcel_to_crop(parcel)
     soil = _soil_for_crop(soil_profile, crop)
 
-    iwc = InitialWaterContent(value=["FC"]) if initial_soil_water_profile is None else soil_water_profile_to_aquacrop_iwc(
-        initial_soil_water_profile,
-        soil,
+    iwc = (
+        InitialWaterContent(value=["FC"])
+        if initial_soil_water_profile is None
+        else soil_water_profile_to_aquacrop_iwc(
+            initial_soil_water_profile,
+            soil,
+        )
     )
 
     # Base weather: historical + AROME (ET₀ computed once)
@@ -1672,102 +1666,187 @@ def _assert_compatible_member_time_spans(
             )
 
 
-
 _TWO_LEVEL_WORKER_CTX: dict[str, Any] = {}
 
 
 @dataclass(frozen=True)
 class YieldBranchMemberResult:
-    """Final dry yield and first water-stress date for one forecast member."""
+    """End-horizon crop state and first water-stress trigger for one member."""
 
     member_id: int
     dry_yield_t_ha: float
+    biomass_t_ha: float
+    canopy_cover: float
     first_stress_date: date | None
+    first_stress_process: str | None = None
 
 
 def _extract_yield_branch_metrics(
     model: AquaCropModel,
     *,
+    soil_profile: pd.DataFrame,
+    stress_trigger_mode: str,
+    stress_trigger_process: str,
+    stress_trigger_margin_fraction: float,
     stress_threshold_ks: float,
     stress_not_before: date | None,
-) -> tuple[float, date | None]:
-    """Read yield/stress directly from AquaCrop private output arrays.
+) -> tuple[float, float, float, date | None, str | None]:
+    """Read crop-state and trigger metrics from AquaCrop private arrays.
 
-    This deliberately avoids ``get_crop_growth``/``get_water_flux`` because the
-    event-driven optimizer calls this path many times.  The column positions are
-    the same ones already used by ``_extract_optimizer_metrics_from_private_outputs``.
-    In AquaCrop 3.x ``crop_growth[:, 12]`` is ``DryYield`` and water-flux columns
-    15/16 are actual/potential transpiration.
+    This path intentionally avoids converting the private arrays to complete
+    public DataFrames because the event-driven optimizer calls it many times.
+
+    AquaCrop 3.x crop-growth columns are::
+
+        0 time_step_counter   5 z_root
+        6 canopy_cover       8 biomass
+       12 DryYield
+
+    and water-flux columns include ``Wr`` at index 3, ``Tr`` at 15 and
+    ``TrPot`` at 16.
+
+    ``biomass`` is stored in g/m2, therefore division by 100 converts it to
+    t/ha (1 g/m2 = 0.01 t/ha).
     """
+    if stress_trigger_mode not in {"dynamic_depletion", "ks"}:
+        raise ValueError("stress_trigger_mode must be 'dynamic_depletion' or 'ks'.")
+
     cg = model._outputs.crop_growth
     wf = model._outputs.water_flux
 
     if isinstance(cg, pd.DataFrame):
-        dry = cg["DryYield"].to_numpy(dtype=float)
         counters = cg["time_step_counter"].to_numpy(dtype=float)
+        dap = cg["dap"].to_numpy(dtype=float)
+        gdd_cum = cg["gdd_cum"].to_numpy(dtype=float)
+        z_root = cg["z_root"].to_numpy(dtype=float)
+        canopy = cg["canopy_cover"].to_numpy(dtype=float)
+        biomass = cg["biomass"].to_numpy(dtype=float)
+        dry = cg["DryYield"].to_numpy(dtype=float)
     else:
         cg_arr = np.asarray(cg)
         if cg_arr.size == 0:
-            dry = np.asarray([], dtype=float)
-            counters = np.asarray([], dtype=float)
-        else:
-            counters = cg_arr[:, 0].astype(float)
-            dry = cg_arr[:, 12].astype(float)
+            return 0.0, 0.0, 0.0, None, None
+        counters = cg_arr[:, 0].astype(float)
+        dap = cg_arr[:, 2].astype(float)
+        gdd_cum = cg_arr[:, 4].astype(float)
+        z_root = cg_arr[:, 5].astype(float)
+        canopy = cg_arr[:, 6].astype(float)
+        biomass = cg_arr[:, 8].astype(float)
+        dry = cg_arr[:, 12].astype(float)
 
-    # AquaCrop preallocates trailing zero rows. Restrict to timesteps that have
-    # actually been completed, then use the largest finite DryYield.  DryYield
-    # is cumulative within the crop season, so this is robust to terminal rows.
     completed_stop = int(model._clock_struct.time_step_counter)
-    valid_yield = (
-        np.isfinite(counters) & np.isfinite(dry) & (counters >= 0) & (counters < completed_stop)
-    )
+    valid_growth = np.isfinite(counters) & (counters >= 0) & (counters < completed_stop)
+
+    valid_yield = valid_growth & np.isfinite(dry)
     yield_t_ha = float(np.nanmax(dry[valid_yield])) if np.any(valid_yield) else 0.0
+
+    # Canopy and biomass are state variables, not cumulative maxima: use the
+    # last completed model timestep rather than their maximum over the horizon.
+    state_valid = valid_growth & np.isfinite(canopy) & np.isfinite(biomass)
+    if np.any(state_valid):
+        state_rows = np.flatnonzero(state_valid)
+        last_row = state_rows[np.argmax(counters[state_rows])]
+        biomass_t_ha = float(biomass[last_row]) / 100.0
+        canopy_cover = float(canopy[last_row])
+    else:
+        biomass_t_ha = 0.0
+        canopy_cover = 0.0
 
     if isinstance(wf, pd.DataFrame):
         wf_counter = wf["time_step_counter"].to_numpy(dtype=float)
+        wr = wf["Wr"].to_numpy(dtype=float)
         tr = wf["Tr"].to_numpy(dtype=float)
         tr_pot = wf["TrPot"].to_numpy(dtype=float)
     else:
         wf_arr = np.asarray(wf)
         if wf_arr.size == 0:
-            return yield_t_ha, None
+            return yield_t_ha, biomass_t_ha, canopy_cover, None, None
         wf_counter = wf_arr[:, 0].astype(float)
+        wr = wf_arr[:, 3].astype(float)
         tr = wf_arr[:, 15].astype(float)
         tr_pot = wf_arr[:, 16].astype(float)
 
     model_dates = _model_dates(model)
-    valid = (
+    valid_flux = (
         np.isfinite(wf_counter)
-        & np.isfinite(tr)
-        & np.isfinite(tr_pot)
         & (wf_counter >= 0)
         & (wf_counter < completed_stop)
         & (wf_counter < len(model_dates))
     )
-    if not np.any(valid):
-        return yield_t_ha, None
+    if not np.any(valid_flux):
+        return yield_t_ha, biomass_t_ha, canopy_cover, None, None
 
-    counters_i = wf_counter[valid].astype(int)
-    tr_v = tr[valid]
-    tr_pot_v = tr_pot[valid]
+    wf_rows = np.flatnonzero(valid_flux)
+    counters_i = wf_counter[wf_rows].astype(int)
 
-    result = np.ones_like(tr_pot_v, dtype=float)
+    # Map crop-growth diagnostics onto the water-flux counters.  Both AquaCrop
+    # output arrays normally have identical row ordering, but the explicit map
+    # makes the trigger robust to any terminal/preallocated rows.
+    growth_by_counter = {
+        int(counter): i
+        for i, counter in enumerate(counters)
+        if np.isfinite(counter) and 0 <= counter < completed_stop
+    }
+    keep = np.asarray(
+        [counter in growth_by_counter for counter in counters_i],
+        dtype=bool,
+    )
+    if not np.any(keep):
+        return yield_t_ha, biomass_t_ha, canopy_cover, None, None
 
-    ks = np.divide(
-        tr_v,
-        tr_pot_v,
-        out=result,
-        where=tr_pot_v > 0.01,
+    wf_rows = wf_rows[keep]
+    counters_i = counters_i[keep]
+    cg_rows = np.asarray(
+        [growth_by_counter[counter] for counter in counters_i],
+        dtype=int,
+    )
+    dates = [model_dates[counter] for counter in counters_i]
+
+    if stress_trigger_mode == "ks":
+        tr_v = tr[wf_rows]
+        tr_pot_v = tr_pot[wf_rows]
+        ks = np.divide(
+            tr_v,
+            tr_pot_v,
+            out=np.ones_like(tr_pot_v, dtype=float),
+            where=tr_pot_v > 0.01,
+        )
+
+        for d, value in zip(dates, ks, strict=True):
+            if stress_not_before is not None and d < stress_not_before:
+                continue
+            if np.isfinite(value) and value < float(stress_threshold_ks):
+                return yield_t_ha, biomass_t_ha, canopy_cover, d, "ks"
+
+        return yield_t_ha, biomass_t_ha, canopy_cover, None, None
+
+    # ``forcing_to_weather`` always puts ReferenceET at private weather column 3.
+    et0 = np.asarray(
+        [float(model._weather[counter, 3]) for counter in counters_i],
+        dtype=float,
     )
 
-    for counter, value in zip(counters_i, ks):
-        d = model_dates[int(counter)]
-        if stress_not_before is not None and d < stress_not_before:
-            continue
-        if np.isfinite(value) and value < float(stress_threshold_ks):
-            return yield_t_ha, d
+    first_date, first_process = first_water_stress_trigger_date(
+        dates=dates,
+        crop=model.crop,
+        soil_profile=soil_profile,
+        wr_mm=wr[wf_rows],
+        z_root_m=z_root[cg_rows],
+        et0=et0,
+        gdd_cum=gdd_cum[cg_rows],
+        dap=dap[cg_rows],
+        not_before=stress_not_before,
+        process=stress_trigger_process,
+        margin_fraction=stress_trigger_margin_fraction,
+    )
 
-    return yield_t_ha, None
+    return (
+        yield_t_ha,
+        biomass_t_ha,
+        canopy_cover,
+        first_date,
+        first_process,
+    )
 
 
 _YIELD_BRANCH_WORKER_CTX: dict[str, Any] = {}
@@ -1779,6 +1858,10 @@ def _init_yield_branch_worker(
     candidate: IrrigationCandidate,
     today: date,
     max_dose: float,
+    soil_profile: pd.DataFrame,
+    stress_trigger_mode: str,
+    stress_trigger_process: str,
+    stress_trigger_margin_fraction: float,
     stress_threshold_ks: float,
     stress_not_before: date | None,
 ) -> None:
@@ -1789,6 +1872,10 @@ def _init_yield_branch_worker(
         "candidate": candidate,
         "today": today,
         "max_dose": float(max_dose),
+        "soil_profile": soil_profile,
+        "stress_trigger_mode": stress_trigger_mode,
+        "stress_trigger_process": stress_trigger_process,
+        "stress_trigger_margin_fraction": float(stress_trigger_margin_fraction),
         "stress_threshold_ks": float(stress_threshold_ks),
         "stress_not_before": stress_not_before,
     }
@@ -1819,15 +1906,29 @@ def _run_yield_branch_member_job(member_id: int) -> YieldBranchMemberResult:
             process_outputs=False,
         )
 
-    dry_yield, first_stress = _extract_yield_branch_metrics(
+    (
+        dry_yield,
+        biomass_t_ha,
+        canopy_cover,
+        first_stress,
+        first_process,
+    ) = _extract_yield_branch_metrics(
         model,
+        soil_profile=ctx["soil_profile"],
+        stress_trigger_mode=ctx["stress_trigger_mode"],
+        stress_trigger_process=ctx["stress_trigger_process"],
+        stress_trigger_margin_fraction=ctx["stress_trigger_margin_fraction"],
         stress_threshold_ks=ctx["stress_threshold_ks"],
         stress_not_before=ctx["stress_not_before"],
     )
+
     return YieldBranchMemberResult(
         member_id=int(member_id),
         dry_yield_t_ha=float(dry_yield),
+        biomass_t_ha=float(biomass_t_ha),
+        canopy_cover=float(canopy_cover),
         first_stress_date=first_stress,
+        first_stress_process=first_process,
     )
 
 
@@ -1870,9 +1971,14 @@ class AquaCropYieldBranchingEvaluator:
 
         crop = parcel_to_crop(parcel)
         soil = _soil_for_crop(soil_profile, crop)
-        iwc = InitialWaterContent(value=["FC"]) if initial_soil_water_profile is None else soil_water_profile_to_aquacrop_iwc(
-            initial_soil_water_profile,
-            soil,
+        self.trigger_soil_profile = soil.profile.copy()
+        iwc = (
+            InitialWaterContent(value=["FC"])
+            if initial_soil_water_profile is None
+            else soil_water_profile_to_aquacrop_iwc(
+                initial_soil_water_profile,
+                soil,
+            )
         )
 
         base_weather = forcing_to_weather(
@@ -2027,48 +2133,82 @@ class AquaCropYieldBranchingEvaluator:
             metric_start_idx=max(0, self.ensemble_start_idx - 1),
             metric_steps=self.branch_steps,
             branch_date=self.ensemble_start_date,
-            crop_finished=False
+            crop_finished=False,
         )
 
     def evaluate(
         self,
         candidate: IrrigationCandidate,
         *,
+        stress_trigger_mode: str = "dynamic_depletion",
+        stress_trigger_process: str = "auto",
+        stress_trigger_margin_fraction: float = 0.0,
         stress_threshold_ks: float = 0.98,
         stress_not_before: date | None = None,
     ) -> dict[int, YieldBranchMemberResult]:
+        """Evaluate one candidate for every ensemble member.
+
+        ``dynamic_depletion`` is the default trigger mode.  It detects the
+        first crossing of AquaCrop's process-specific root-zone depletion
+        threshold.  ``ks`` is retained only as a backwards-compatible
+        diagnostic mode.
+        """
+        metric_kwargs = {
+            "soil_profile": self.trigger_soil_profile,
+            "stress_trigger_mode": stress_trigger_mode,
+            "stress_trigger_process": stress_trigger_process,
+            "stress_trigger_margin_fraction": stress_trigger_margin_fraction,
+            "stress_threshold_ks": stress_threshold_ks,
+            "stress_not_before": stress_not_before,
+        }
+
         if self.crop_finished_before_today:
-            dry_yield, _ = _extract_yield_branch_metrics(
+            (
+                dry_yield,
+                biomass_t_ha,
+                canopy_cover,
+                _,
+                _,
+            ) = _extract_yield_branch_metrics(
                 self._today_model,
-                stress_threshold_ks=stress_threshold_ks,
-                stress_not_before=stress_not_before,
+                **metric_kwargs,
             )
             return {
                 member_id: YieldBranchMemberResult(
                     member_id=member_id,
                     dry_yield_t_ha=float(dry_yield),
+                    biomass_t_ha=float(biomass_t_ha),
+                    canopy_cover=float(canopy_cover),
                     first_stress_date=None,
+                    first_stress_process=None,
                 )
                 for member_id in self.member_ids
             }
 
         candidate_state = self._candidate_state(candidate)
         if candidate_state.crop_finished:
-            dry_yield, first_stress = _extract_yield_branch_metrics(
+            (
+                dry_yield,
+                biomass_t_ha,
+                canopy_cover,
+                first_stress,
+                first_process,
+            ) = _extract_yield_branch_metrics(
                 candidate_state.model,
-                stress_threshold_ks=stress_threshold_ks,
-                stress_not_before=stress_not_before,
+                **metric_kwargs,
             )
 
             return {
                 member_id: YieldBranchMemberResult(
                     member_id=member_id,
                     dry_yield_t_ha=float(dry_yield),
+                    biomass_t_ha=float(biomass_t_ha),
+                    canopy_cover=float(canopy_cover),
                     first_stress_date=first_stress,
+                    first_stress_process=first_process,
                 )
                 for member_id in self.member_ids
             }
-
 
         n_workers = min(self.workers, mp.cpu_count(), len(self.member_ids))
         initargs = (
@@ -2077,6 +2217,10 @@ class AquaCropYieldBranchingEvaluator:
             candidate,
             self.today,
             self.max_dose,
+            self.trigger_soil_profile,
+            stress_trigger_mode,
+            stress_trigger_process,
+            float(stress_trigger_margin_fraction),
             float(stress_threshold_ks),
             stress_not_before,
         )
@@ -2086,7 +2230,7 @@ class AquaCropYieldBranchingEvaluator:
             rows = [_run_yield_branch_member_job(m) for m in self.member_ids]
         else:
             # Fork is important here: candidate_state contains a live AquaCrop
-            # model.  On Windows/spawn this still works by pickling, but WSL/Linux
+            # model. On Windows/spawn this still works by pickling, but WSL/Linux
             # avoids that extra cost.
             mp_ctx = (
                 mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context()
@@ -2099,4 +2243,3 @@ class AquaCropYieldBranchingEvaluator:
                 rows = pool.map(_run_yield_branch_member_job, self.member_ids)
 
         return {row.member_id: row for row in rows}
-

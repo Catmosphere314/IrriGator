@@ -163,13 +163,39 @@ class ParcelConfig:
             raw=self.raw,
         )
 
-    def replace_future_irrigation_event(self, event: dict[str, Any]) -> ParcelConfig:
-        """Return a new ParcelConfig with only replacing future events."""
-        filtered_log = [
-            x
-            for x in self.irrigation_log
-            if x["date"] < min([irr["date"] for irr in event])
-        ]
+    def replace_future_irrigation_event(
+        self,
+        event: list[dict[str, Any]],
+        *,
+        from_date: date | str | None = None,
+    ) -> ParcelConfig:
+        """Replace the planned irrigation tail and return a new config.
+
+        ``from_date`` is the cleanest choice for rolling optimization: all
+        irrigation events on/after that date are removed, then ``event`` is
+        appended.  This also gives an unambiguous meaning to an empty new plan
+        (for example once H45 is reached).
+
+        For backward compatibility, when ``from_date`` is omitted and ``event``
+        is non-empty, the first date of the new plan is used as the cutoff.
+        """
+
+        def _as_date(value: date | str) -> date:
+            if isinstance(value, date):
+                return value
+            return date.fromisoformat(str(value)[:10])
+
+        if from_date is not None:
+            cutoff = _as_date(from_date)
+        elif event:
+            cutoff = min(_as_date(irr["date"]) for irr in event)
+        else:
+            raise ValueError(
+                "An empty future irrigation plan requires from_date so the "
+                "existing future tail can be removed unambiguously."
+            )
+
+        filtered_log = [x for x in self.irrigation_log if _as_date(x["date"]) < cutoff]
         new_log = [*filtered_log, *event]
         return ParcelConfig(
             id=self.id,
@@ -186,22 +212,22 @@ class ParcelConfig:
             raw=self.raw,
         )
 
-    def replace_irrigation(self, irrigation_log : list[dict[str, Any]]) -> ParcelConfig:
+    def replace_irrigation(self, irrigation_log: list[dict[str, Any]]) -> ParcelConfig:
         """Return the same parcel but with a replaced irrigation log."""
         return ParcelConfig(
-                    id=self.id,
-                    name=self.name,
-                    farmer=self.farmer,
-                    lat=self.lat,
-                    lon=self.lon,
-                    area_ha=self.area_ha,
-                    soil=self.soil,
-                    crop=self.crop,
-                    irrigation=self.irrigation,
-                    irrigation_log=irrigation_log,
-                    sensors=self.sensors,
-                    raw=self.raw,
-                )
+            id=self.id,
+            name=self.name,
+            farmer=self.farmer,
+            lat=self.lat,
+            lon=self.lon,
+            area_ha=self.area_ha,
+            soil=self.soil,
+            crop=self.crop,
+            irrigation=self.irrigation,
+            irrigation_log=irrigation_log,
+            sensors=self.sensors,
+            raw=self.raw,
+        )
 
 
 def load_parcel_config(path: str | Path) -> ParcelConfig:
@@ -225,7 +251,7 @@ def load_parcel_config(path: str | Path) -> ParcelConfig:
         soil=raw.get("soil", {}),
         crop=raw.get("crop", {}),
         irrigation=raw.get("irrigation", {}),
-        irrigation_log=raw.get("irrigation_log",{}),
+        irrigation_log=raw.get("irrigation_log", {}),
         sensors=raw.get("sensors", {}),
         raw=raw,
     )

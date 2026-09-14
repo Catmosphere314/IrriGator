@@ -13,6 +13,10 @@ depletion thresholds rather than from an arbitrary ``Tr / TrPot`` (Ks) value.
 The trigger is only a search heuristic; crop-state/yield preservation determines
 whether a candidate schedule is acceptable.
 
+Late in grain filling, an external ARVALIS/IRRINOV thermal-time layer manages
+the decision horizon: normal rolling optimization before H50, truncation to
+forecast H45 between H50 and H45, and no new irrigation at/after H45.
+
 Two workflows are provided:
 
 ``optimize_historical_irrigation_amounts``
@@ -32,6 +36,7 @@ import logging
 import multiprocessing as mp
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
@@ -40,6 +45,14 @@ import xarray as xr
 
 from irrigator.atmospheric.forcing import DailyForcing
 from irrigator.config import ParcelConfig
+from irrigator.crop.grain_moisture import (
+    DEFAULT_GRAIN_MOISTURE_TABLE,
+    GrainMoistureStage,
+    cumulative_gdd_on_date,
+    forecast_threshold_date,
+    grain_moisture_stage,
+    thresholds_for_crop,
+)
 from irrigator.static_layers.soil import SoilProfile
 from irrigator.static_layers.terrain import TerrainParams
 from irrigator.water_balance.aquacrop_adapter import (
@@ -310,6 +323,12 @@ class OperationalOptimizationResult:
     objective_mode: str
     feasible: bool
     reason: str
+    grain_moisture_stage: str | None = None
+    current_gdd: float | None = None
+    h50_gdd: float | None = None
+    h45_gdd: float | None = None
+    forecast_h45_date: date | None = None
+    forecast_h45_coverage: float | None = None
 
     @property
     def reference_yields_t_ha(self) -> dict[int, float]:
@@ -330,6 +349,8 @@ class OperationalOptimizationResult:
 
     @property
     def success_probability(self) -> float:
+        if self.objective_mode == "terminal":
+            return 1.0
         if self.objective_mode == "crop_state":
             return self.optimized_evaluation.crop_state_success_probability(
                 self.reference_metrics,
@@ -1272,6 +1293,55 @@ def optimize_historical_irrigation_amounts(
 # ---------------------------------------------------------------------------
 
 
+def _terminal_no_irrigation_result(
+    *,
+    today: date,
+    constraint: YieldConstraint,
+    grain_stage: GrainMoistureStage,
+    current_gdd: float,
+    h50_gdd: float,
+    h45_gdd: float,
+    reason: str,
+) -> OperationalOptimizationResult:
+    """Return a cheap terminal result once the H45 irrigation cutoff is reached.
+
+    No AquaCrop candidate search is required here: the agronomic policy is that
+    new irrigation events are no longer generated at/after H45.  Empty
+    evaluation containers preserve the existing result API for callers.
+    """
+    candidate = IrrigationCandidate(events=[], label="H45 terminal no irrigation")
+    empty_eval = YieldScheduleEvaluation(
+        candidate=candidate,
+        member_yield_t_ha={},
+        member_biomass_t_ha={},
+        member_canopy_cover={},
+        first_stress_date={},
+        first_stress_process={},
+    )
+    empty_reference = OperationalReferenceMetrics(
+        member_yield_t_ha={},
+        member_biomass_t_ha={},
+        member_canopy_cover={},
+    )
+    return OperationalOptimizationResult(
+        today=today,
+        recommended_events=[],
+        committed_dates=set(),
+        reference_evaluation=empty_eval,
+        no_irrigation_evaluation=empty_eval,
+        optimized_evaluation=empty_eval,
+        reference_metrics=empty_reference,
+        constraint=constraint,
+        objective_mode="terminal",
+        feasible=True,
+        reason=reason,
+        grain_moisture_stage=grain_stage.value,
+        current_gdd=float(current_gdd),
+        h50_gdd=float(h50_gdd),
+        h45_gdd=float(h45_gdd),
+    )
+
+
 def optimize_operational_irrigation(
     historical_forcing: DailyForcing,
     arome_forcing: DailyForcing,
@@ -1286,6 +1356,10 @@ def optimize_operational_irrigation(
     previous_plan: list[dict[str, Any]] | list[tuple[date, float]] | None = None,
     commitment_days: int = 2,
     constraint: YieldConstraint = YieldConstraint(),
+    use_grain_moisture_horizon: bool = True,
+    grain_moisture_table_path: str | Path = DEFAULT_GRAIN_MOISTURE_TABLE,
+    h45_date_quantile: float = 0.50,
+    h50_h45_max_relative_canopy_loss: float | None = None,
     stress_trigger_mode: str = "dynamic_depletion",
     stress_trigger_process: str = "auto",
     stress_trigger_margin_fraction: float = 0.0,
@@ -1312,6 +1386,18 @@ def optimize_operational_irrigation(
     process with phenology (canopy expansion, flowering/pollination, stomatal
     limitation, senescence).  The trigger proposes dates only; it does not
     determine candidate feasibility.
+
+    When ``use_grain_moisture_horizon=True``, late-season horizon management
+    follows the external ARVALIS/IRRINOV H50/H45 thermal-time table:
+
+    * before H50: keep the normal forecast horizon;
+    * H50 <= stage < H45: truncate the optimization horizon to the forecast
+      ensemble H45 date when that date is covered robustly;
+    * at/after H45: return immediately with no new irrigation event.
+
+    ``h50_h45_max_relative_canopy_loss`` optionally relaxes the canopy-loss
+    tolerance only inside the H50-H45 window. ``None`` keeps the normal
+    constraint unchanged.
 
     ``stress_trigger_mode='ks'`` retains the legacy Tr/TrPot trigger for
     sensitivity testing.  In that mode ``stress_trigger_ks`` is used; otherwise
@@ -1342,7 +1428,16 @@ def optimize_operational_irrigation(
         )
     if not 0 <= stress_trigger_margin_fraction < 1:
         raise ValueError("stress_trigger_margin_fraction must be in [0, 1).")
+    if not 0 <= h45_date_quantile <= 1:
+        raise ValueError("h45_date_quantile must be in [0, 1].")
+    if h50_h45_max_relative_canopy_loss is not None and not (
+        0 <= h50_h45_max_relative_canopy_loss < 1
+    ):
+        raise ValueError("h50_h45_max_relative_canopy_loss must be in [0, 1).")
 
+    # Full forcing available at decision time: observations through yesterday
+    # followed by the deterministic short-range forecast.  This prefix is also
+    # used to estimate today's ARVALIS base-6-30 thermal stage.
     base_forcing = historical_forcing.concat(arome_forcing)
 
     # Maximum date supported by every forecast member.
@@ -1355,7 +1450,72 @@ def optimize_operational_irrigation(
     sim_end = common_end if sim_end is None else min(sim_end, common_end)
     expected_harvest = _expected_harvest(parcel)
 
-    if require_harvest_horizon and expected_harvest is not None and sim_end < expected_harvest:
+    grain_stage: GrainMoistureStage | None = None
+    grain_thresholds = None
+    current_gdd: float | None = None
+    forecast_h45 = None
+    h45_horizon_applied = False
+
+    if use_grain_moisture_horizon:
+        grain_thresholds = thresholds_for_crop(
+            parcel.crop,
+            table_path=grain_moisture_table_path,
+        )
+        planting_date = pd.Timestamp(parcel.crop["planting_date"]).date()
+        current_gdd = cumulative_gdd_on_date(
+            base_forcing,
+            planting_date=planting_date,
+            on_date=today,
+            t_base=grain_thresholds.t_base_c,
+            t_upper=grain_thresholds.t_upper_c,
+        )
+        grain_stage = grain_moisture_stage(current_gdd, grain_thresholds)
+
+        if grain_stage == GrainMoistureStage.POST_H45:
+            return _terminal_no_irrigation_result(
+                today=today,
+                constraint=constraint,
+                grain_stage=grain_stage,
+                current_gdd=current_gdd,
+                h50_gdd=grain_thresholds.h50_gdd,
+                h45_gdd=grain_thresholds.h45_gdd,
+                reason=(
+                    f"H45 reached ({current_gdd:.0f} >= "
+                    f"{grain_thresholds.h45_gdd:.0f} degree-days base 6-30); "
+                    "no new irrigation is proposed."
+                ),
+            )
+
+        if grain_stage == GrainMoistureStage.H50_TO_H45:
+            forecast_h45 = forecast_threshold_date(
+                base_forcing,
+                future_member_forcings,
+                planting_date=planting_date,
+                threshold_gdd=grain_thresholds.h45_gdd,
+                t_base=grain_thresholds.t_base_c,
+                t_upper=grain_thresholds.t_upper_c,
+                quantile=h45_date_quantile,
+                min_member_fraction=constraint.min_member_probability,
+            )
+
+            if forecast_h45.date is not None:
+                sim_end = min(sim_end, forecast_h45.date)
+                h45_horizon_applied = True
+
+            if h50_h45_max_relative_canopy_loss is not None:
+                constraint = replace(
+                    constraint,
+                    max_relative_canopy_loss=float(h50_h45_max_relative_canopy_loss),
+                )
+
+    # Requiring a harvest horizon is bypassed only when H50-H45 policy has
+    # intentionally shortened the relevant irrigation horizon to H45.
+    if (
+        require_harvest_horizon
+        and not h45_horizon_applied
+        and expected_harvest is not None
+        and sim_end < expected_harvest
+    ):
         raise ValueError(
             f"Yield optimization needs weather through expected harvest "
             f"{expected_harvest}, but the common forecast horizon ends "
@@ -1364,25 +1524,32 @@ def optimize_operational_irrigation(
             "crop-state constraint."
         )
 
-    # Whether crop-state or final-yield preservation is scientifically meaningful
-    # is determined by the actual available horizon, not by the flag itself.
-    objective_mode = (
-        "crop_state" if expected_harvest is None or sim_end < expected_harvest else "yield"
-    )
-
     # There is no reason to simulate beyond the configured harvest date.
     if expected_harvest is not None:
         sim_end = min(sim_end, expected_harvest)
 
-    # Truncate ensemble scenarios to the useful horizon. This also keeps the
-    # private AquaCrop branching evaluator active because member_end == sim_end.
-    future_member_forcings = {
-        member: forcing.slice(
-            start=pd.Timestamp(forcing.dates[0]).date(),
-            end=sim_end,
-        )
-        for member, forcing in future_member_forcings.items()
-    }
+    # H50-H45 can occasionally put H45 inside the deterministic HRES segment.
+    # In that case the ensemble tail becomes empty and the evaluator naturally
+    # falls back to a single deterministic path.
+    arome_forcing = arome_forcing.slice(end=sim_end)
+    base_forcing = historical_forcing.concat(arome_forcing)
+
+    truncated_members: dict[int, DailyForcing] = {}
+    for member, forcing in future_member_forcings.items():
+        member_start = pd.Timestamp(forcing.dates[0]).date()
+        if member_start > sim_end:
+            continue
+        sliced = forcing.slice(start=member_start, end=sim_end)
+        if sliced.n_days:
+            truncated_members[int(member)] = sliced
+    future_member_forcings = truncated_members
+
+    # Whether crop-state or final-yield preservation is scientifically meaningful
+    # is determined by the actual active horizon. H50-H45 truncation therefore
+    # intentionally uses the crop-state objective through H45.
+    objective_mode = (
+        "crop_state" if expected_harvest is None or sim_end < expected_harvest else "yield"
+    )
 
     min_interval = int(parcel.irrigation.get("min_interval_days", 3))
     min_dose = float(parcel.irrigation.get("min_dose_mm", 0.0))
@@ -1483,7 +1650,20 @@ def optimize_operational_irrigation(
                 constraint=constraint,
                 objective_mode=objective_mode,
                 feasible=True,
-                reason=f"No future irrigation is needed to satisfy the {criterion}.",
+                reason=(
+                    f"No future irrigation is needed to satisfy the {criterion}."
+                    + (
+                        f" Optimization horizon truncated to forecast H45 ({forecast_h45.date})."
+                        if h45_horizon_applied and forecast_h45 is not None
+                        else ""
+                    )
+                ),
+                grain_moisture_stage=(grain_stage.value if grain_stage is not None else None),
+                current_gdd=current_gdd,
+                h50_gdd=(grain_thresholds.h50_gdd if grain_thresholds is not None else None),
+                h45_gdd=(grain_thresholds.h45_gdd if grain_thresholds is not None else None),
+                forecast_h45_date=(forecast_h45.date if forecast_h45 is not None else None),
+                forecast_h45_coverage=(forecast_h45.coverage if forecast_h45 is not None else None),
             )
 
         commitment_limit = today + timedelta(days=max(0, commitment_days))
@@ -1650,5 +1830,18 @@ def optimize_operational_irrigation(
         constraint=constraint,
         objective_mode=objective_mode,
         feasible=feasible,
-        reason=reason,
+        reason=(
+            reason
+            + (
+                f" Optimization horizon truncated to forecast H45 ({forecast_h45.date})."
+                if h45_horizon_applied and forecast_h45 is not None
+                else ""
+            )
+        ),
+        grain_moisture_stage=(grain_stage.value if grain_stage is not None else None),
+        current_gdd=current_gdd,
+        h50_gdd=(grain_thresholds.h50_gdd if grain_thresholds is not None else None),
+        h45_gdd=(grain_thresholds.h45_gdd if grain_thresholds is not None else None),
+        forecast_h45_date=(forecast_h45.date if forecast_h45 is not None else None),
+        forecast_h45_coverage=(forecast_h45.coverage if forecast_h45 is not None else None),
     )

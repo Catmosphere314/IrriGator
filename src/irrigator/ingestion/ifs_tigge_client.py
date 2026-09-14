@@ -300,41 +300,91 @@ def fetch_tigge_ifs_run(
     return control, perturbed
 
 
-def _slice_bbox(ds: xr.Dataset, bbox: BBoxWGS84) -> xr.Dataset:
-    """Defensive bbox slice; ECDS should already have performed this subset."""
+# def _slice_bbox(ds: xr.Dataset, bbox: BBoxWGS84) -> xr.Dataset:
+#     """Defensive bbox slice; ECDS should already have performed this subset."""
+#     if "latitude" not in ds.coords or "longitude" not in ds.coords:
+#         return ds
+
+#     north, south = bbox.north + 0.5, bbox.south - 0.5
+#     west, east = bbox.west - 0.5, bbox.east + 0.5
+
+#     lat = ds.latitude
+#     if lat.size > 1 and float(lat[0]) > float(lat[-1]):
+#         ds = ds.sel(latitude=slice(north, south))
+#     else:
+#         ds = ds.sel(latitude=slice(south, north))
+
+#     if float(ds.longitude.max()) > 180:
+#         west_360, east_360 = west % 360, east % 360
+#         if west_360 <= east_360:
+#             ds = ds.sel(longitude=slice(west_360, east_360))
+#         else:
+#             ds = xr.concat(
+#                 [
+#                     ds.sel(longitude=slice(west_360, 360)),
+#                     ds.sel(longitude=slice(0, east_360)),
+#                 ],
+#                 dim="longitude",
+#             )
+#             ds = ds.assign_coords(longitude=((ds.longitude + 180) % 360) - 180).sortby("longitude")
+#     else:
+#         lon = ds.longitude
+#         if lon.size > 1 and float(lon[0]) > float(lon[-1]):
+#             ds = ds.sel(longitude=slice(east, west))
+#         else:
+#             ds = ds.sel(longitude=slice(west, east))
+#     return ds
+
+def _slice_bbox(
+    ds: xr.Dataset,
+    bbox: BBoxWGS84,
+) -> xr.Dataset:
+    """Subset regular or reduced-Gaussian TIGGE grids."""
+
     if "latitude" not in ds.coords or "longitude" not in ds.coords:
         return ds
 
-    north, south = bbox.north + 0.5, bbox.south - 0.5
-    west, east = bbox.west - 0.5, bbox.east + 0.5
+    north = bbox.north + 0.5
+    south = bbox.south - 0.5
+    west = bbox.west - 0.5
+    east = bbox.east + 0.5
 
+    # Reduced Gaussian / unstructured representation:
+    #
+    # dimensions: values
+    # latitude(values)
+    # longitude(values)
+
+    if "values" in ds.dims:
+        lat = ds.latitude
+        lon = ds.longitude
+
+        # Normalize longitude to [-180, 180].
+        lon_normalized = ((lon + 180) % 360) - 180
+
+        mask = (lat >= south) & (lat <= north) & (lon_normalized >= west) & (lon_normalized <= east)
+
+        return ds.isel(values=np.flatnonzero(mask.values))
+
+    # Existing regular latitude/longitude grid path.
     lat = ds.latitude
+
     if lat.size > 1 and float(lat[0]) > float(lat[-1]):
         ds = ds.sel(latitude=slice(north, south))
     else:
         ds = ds.sel(latitude=slice(south, north))
 
     if float(ds.longitude.max()) > 180:
-        west_360, east_360 = west % 360, east % 360
-        if west_360 <= east_360:
-            ds = ds.sel(longitude=slice(west_360, east_360))
-        else:
-            ds = xr.concat(
-                [
-                    ds.sel(longitude=slice(west_360, 360)),
-                    ds.sel(longitude=slice(0, east_360)),
-                ],
-                dim="longitude",
-            )
-            ds = ds.assign_coords(longitude=((ds.longitude + 180) % 360) - 180).sortby("longitude")
-    else:
-        lon = ds.longitude
-        if lon.size > 1 and float(lon[0]) > float(lon[-1]):
-            ds = ds.sel(longitude=slice(east, west))
-        else:
-            ds = ds.sel(longitude=slice(west, east))
-    return ds
+        ds = ds.assign_coords(longitude=((ds.longitude + 180) % 360) - 180).sortby("longitude")
 
+    lon = ds.longitude
+
+    if lon.size > 1 and float(lon[0]) > float(lon[-1]):
+        ds = ds.sel(longitude=slice(east, west))
+    else:
+        ds = ds.sel(longitude=slice(west, east))
+
+    return ds
 
 def _open_cfgrib_group(
     path: Path,
@@ -354,7 +404,7 @@ def _open_cfgrib_group(
     except Exception as exc:
         logger.debug("cfgrib group %s not present in %s: %s", filter_by_keys, path, exc)
         return None
-
+    print(ds)
     ds = _slice_bbox(ds, bbox)
 
     # cfgrib exposes the TIGGE 6-hour extrema as `t2m`.
@@ -491,6 +541,37 @@ def load_albedo_for_tigge(
 
     return albedo
 
+# def load_albedo_for_tigge(
+#     albedo_path: str | Path,
+#     tigge_ds: xr.Dataset | xr.DataArray,
+# ) -> xr.DataArray:
+#     """Load ERA5 albedo for a TIGGE forecast."""
+
+#     with xr.open_dataset(albedo_path) as ds:
+#         albedo = ds["forecast_albedo"]
+
+#         # IMPORTANT: use bare values so coordinates attached to the
+#         # TIGGE valid_time indexer are not propagated into ERA5.
+#         albedo = albedo.sel(valid_time=tigge_ds.valid_time.values).load()
+
+#     albedo = albedo.sortby("latitude").sortby("longitude")
+
+#     lat = float(tigge_ds.latitude.values)
+#     lon = float(tigge_ds.longitude.values)
+
+#     # Normalize longitude convention if necessary.
+#     if float(albedo.longitude.max()) > 180:
+#         lon = lon % 360
+#     else:
+#         lon = ((lon + 180) % 360) - 180
+
+#     albedo = albedo.interp(
+#         latitude=lat,
+#         longitude=lon,
+#         method="linear",
+#     )
+
+#     return albedo
 
 def _interval_end_to_previous_day(
     da: xr.DataArray,

@@ -35,7 +35,6 @@ from irrigator.water_balance.state import WaterBalanceState
 logger = logging.getLogger(__name__)
 
 
-
 # ---------------------------------------------------------------------------
 # Forecast standardization (unchanged)
 # ---------------------------------------------------------------------------
@@ -177,8 +176,10 @@ class DailyEnsembleStats:
     depletion_p75: float
     # Precipitation
     precip_mean: float
+    precip_min: float
     precip_p25: float
     precip_p75: float
+    precip_max: float
     # ET
     etc_mean: float
     # Number of members showing stress
@@ -214,6 +215,8 @@ class DailyEnsembleStats:
                 "mean": round(self.precip_mean, 1),
                 "p25": round(self.precip_p25, 1),
                 "p75": round(self.precip_p75, 1),
+                "min": round(self.precip_min, 1),
+                "max": round(self.precip_max, 1),
             },
             "etc_mean_mm": round(self.etc_mean, 1),
             "stress_probability": round(self.stress_probability, 2),
@@ -319,7 +322,7 @@ def run_ensemble_forward_balance(
         taw_prev = ens_start.taw
         member_states = []
 
-        for i in range(ens_skip,forcing.n_days):
+        for i in range(ens_skip, forcing.n_days):
             current_date = pd.Timestamp(forcing.dates[i]).date()
             crop = advance_crop(
                 current_date,
@@ -375,6 +378,8 @@ def run_ensemble_forward_balance(
                     precip_mean=arome.precip,
                     precip_p25=arome.precip,
                     precip_p75=arome.precip,
+                    precip_min=arome.precip,
+                    precip_max=arome.precip,
                     etc_mean=arome.etc_act,
                     n_members_stressed=1 if arome.stress_coeff < stress_threshold else 0,
                     n_members_total=1,
@@ -426,6 +431,8 @@ def run_ensemble_forward_balance(
                 precip_mean=float(pr_arr.mean()),
                 precip_p25=float(np.percentile(pr_arr, 25)),
                 precip_p75=float(np.percentile(pr_arr, 75)),
+                precip_min=float(pr_arr.min()),
+                precip_max=float(pr_arr.max()),
                 etc_mean=float(etc_arr.mean()),
                 n_members_stressed=int((ks_arr < stress_threshold).sum()),
                 n_members_total=len(ks_arr),

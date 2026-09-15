@@ -365,19 +365,19 @@ def soil_to_aquacrop(
     soil.zSoil = round(float(sum(dz)), 2)
     soil.nComp = len(dz)
 
-    logger.info(
-        "AquaCrop soil: %.2fm depth, %d x %.2fm compartments, "
-        "FC range %.3f-%.3f, WP range %.3f-%.3f, Ksat range %.0f-%.0f mm/day",
-        soil.zSoil,
-        soil.nComp,
-        dz_comp_m,
-        float(prof["th_fc"].min()),
-        float(prof["th_fc"].max()),
-        float(prof["th_wp"].min()),
-        float(prof["th_wp"].max()),
-        float(prof["Ksat"].min()),
-        float(prof["Ksat"].max()),
-    )
+    # logger.info(
+    #     "AquaCrop soil: %.2fm depth, %d x %.2fm compartments, "
+    #     "FC range %.3f-%.3f, WP range %.3f-%.3f, Ksat range %.0f-%.0f mm/day",
+    #     soil.zSoil,
+    #     soil.nComp,
+    #     dz_comp_m,
+    #     float(prof["th_fc"].min()),
+    #     float(prof["th_fc"].max()),
+    #     float(prof["th_wp"].min()),
+    #     float(prof["th_wp"].max()),
+    #     float(prof["Ksat"].min()),
+    #     float(prof["Ksat"].max()),
+    # )
 
     return soil
 
@@ -1017,6 +1017,8 @@ class AquaCropEnsembleStats:
     wr_mean: float
     # Precipitation
     precip_mean: float
+    precip_min: float
+    precip_max: float
     # Members
     n_members_stressed: int
     n_members_total: int
@@ -1179,6 +1181,8 @@ def run_ensemble_aquacrop(
                 cc_mean=float(np.nanmean(cc_arr)),
                 wr_mean=float(np.nanmean(wr_arr)),
                 precip_mean=float(np.nanmean(pr_arr)),
+                precip_min=float(np.nanmin(pr_arr)),
+                precip_max=float(np.nanmax(pr_arr)),
                 n_members_stressed=int((ks_arr < stress_threshold).sum()),
                 n_members_total=len(ks_arr),
             )
@@ -1348,6 +1352,8 @@ def build_blended_stress_report(
                 precip_mean=float(arome_stress["precip_mm"].iloc[row_idx]),
                 precip_p25=float(arome_stress["precip_mm"].iloc[row_idx]),
                 precip_p75=float(arome_stress["precip_mm"].iloc[row_idx]),
+                precip_min=float(arome_stress["precip_mm"].iloc[row_idx]),
+                precip_max=float(arome_stress["precip_mm"].iloc[row_idx]),
                 etc_mean=float(arome_stress["tr_mm"].iloc[row_idx]),
                 n_members_stressed=1 if ks < 0.9 else 0,
                 n_members_total=1,
@@ -1373,6 +1379,8 @@ def build_blended_stress_report(
                 precip_mean=stat.precip_mean,
                 precip_p25=stat.precip_mean,
                 precip_p75=stat.precip_mean,
+                precip_min=stat.precip_min,
+                precip_max=stat.precip_max,
                 etc_mean=0.0,
                 n_members_stressed=stat.n_members_stressed,
                 n_members_total=stat.n_members_total,

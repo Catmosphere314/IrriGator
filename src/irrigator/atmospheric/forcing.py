@@ -177,7 +177,7 @@ def extract_parcel_forcing(
     parcel: ParcelConfig,
     terrain: TerrainParams,
     precip_correction: BiasCorrection | None = None,
-    silent: bool = False,
+    silent: bool = True,
 ) -> DailyForcing:
     """Extract and downscale daily forcing at a parcel location.
 
